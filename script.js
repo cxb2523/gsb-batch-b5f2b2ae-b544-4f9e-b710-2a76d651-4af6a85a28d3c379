@@ -102,8 +102,43 @@ function showPrompt(title, defaultValue = "", options = {}) {
   });
 }
 
+function createRecentId() {
+  return "rv-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+}
+
+// Every record gets a stable unique id. All progress write-back and resume
+// positioning go through this id, so records that happen to share a title or
+// an address never get cross-written.
+function normalizeRecent(list) {
+  const seen = new Set();
+  return list.map(item => {
+    const copy = { ...item };
+    if (typeof copy.id !== "string" || !copy.id || seen.has(copy.id)) {
+      copy.id = createRecentId();
+    }
+    seen.add(copy.id);
+    if (typeof copy.progress !== "number" || !Number.isFinite(copy.progress)) {
+      copy.progress = 0;
+    }
+    copy.progress = Math.max(0, Math.min(100, copy.progress));
+    return copy;
+  });
+}
+
 function getRecent() {
-  return JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.RECENT) || "[]");
+  let parsed;
+  try {
+    parsed = JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.RECENT) || "[]");
+  } catch {
+    parsed = [];
+  }
+  if (!Array.isArray(parsed)) parsed = [];
+  // Migrate legacy records (and imported data) that have no id yet.
+  if (parsed.some(item => !item || typeof item.id !== "string" || !item.id)) {
+    parsed = normalizeRecent(parsed);
+    setRecent(parsed);
+  }
+  return parsed;
 }
 
 function setRecent(data) {
@@ -159,6 +194,7 @@ const state = {
   currentSubtitle: "",
   currentSubtitleType: "url",
   currentTitle: "",
+  currentRecentId: null,
   videoLastTime: null,
   totalWatchTime: getWatchTime(),
   accumulatedWatchTime: 0
@@ -254,7 +290,7 @@ function truncateTitle(title, maxLength = CONFIG.LIMITS.TITLE_MAX_LENGTH) {
 }
 
 function playVideo(video, subtitle = "", title = null, videoType = "url", subtitleType = "url") {
-  revokeCurrentMedia();
+  revokeCurrentMedia(video, subtitle);
   DOM.player.innerHTML = "";
 
   const sourceElement = document.createElement("source");
@@ -284,31 +320,50 @@ function playVideo(video, subtitle = "", title = null, videoType = "url", subtit
 }
 
 
+// The same video may be recognized either by its address or by its title;
+// both resolve to one single record. Other records that merely share a title
+// or an address are left untouched.
+function findRecentIndex(recent, title, video) {
+  let idx = recent.findIndex(item => item.video === video);
+  if (idx === -1) {
+    idx = recent.findIndex(item => item.title === title);
+  }
+  return idx;
+}
+
 function saveRecent(title, video, videoType, subtitle="", subtitleType="url") {
   let recent = getRecent();
+  let id;
   let progress = 0;
-  const idx = recent.findIndex(item => item.title===title);
-  if(idx!==-1) {
+  const idx = findRecentIndex(recent, title, video);
+  if (idx !== -1) {
+    id = recent[idx].id;
     progress = recent[idx].progress;
+    recent.splice(idx, 1);
+  } else {
+    id = createRecentId();
   }
 
-  recent = recent.filter(item => !(item.title===title));
-
-  recent.unshift({title, video, videoType, subtitle, subtitleType, progress});
+  recent.unshift({id, title, video, videoType, subtitle, subtitleType, progress});
   if(recent.length>CONFIG.LIMITS.RECENT_SIZE) recent = recent.slice(0,CONFIG.LIMITS.RECENT_SIZE);
 
   setRecent(recent);
   renderRecent();
+  return id;
 }
 
-function removeRecent(title) {
+function removeRecent(id) {
   showConfirm(CONFIG.MESSAGES.CONFIRM_REMOVE, {
     confirmText: "Remove"
   }).then((result) => {
       if (result.isConfirmed) {
         let recent = getRecent();
-        recent = recent.filter(item => !(item.title===title));
+        recent = recent.filter(item => item.id !== id);
         setRecent(recent);
+        // The record being played was deleted: stop writing progress back.
+        if (state.currentRecentId === id) {
+          state.currentRecentId = null;
+        }
         renderRecent();
       }
     });
@@ -319,32 +374,33 @@ function removeAllVideos() {
   .then(result => {
     if (result.isConfirmed) {
       setRecent([]);
+      state.currentRecentId = null;
       renderRecent();
     }
   });
 }
 
 function updateProgress() {
-  if(!state.currentVideo || !DOM.player.duration) return;
+  if(!state.currentVideo || !DOM.player.duration || !state.currentRecentId) return;
   const percent = Math.min(100, Math.round((DOM.player.currentTime/DOM.player.duration)*100));
   let recent = getRecent();
-  const idx = recent.findIndex(item => item.video===state.currentVideo);
-  if(idx!==-1) {
-    recent[idx].progress = percent;
-    setRecent(recent);
-    renderRecent();
-  }
+  const idx = recent.findIndex(item => item.id === state.currentRecentId);
+  // Record was deleted (or replaced by an import): never fall back to a
+  // title/address match, that would corrupt another entry.
+  if(idx === -1) return;
+  recent[idx].progress = percent;
+  setRecent(recent);
+  renderRecent();
 }
 
 function loadPlayerTime() {
-  if(!state.currentVideo || !DOM.player.duration) return;
+  if(!state.currentVideo || !DOM.player.duration || !state.currentRecentId) return;
   let recent = getRecent();
-  const idx = recent.findIndex(item => item.video===state.currentVideo);
-  if(idx!==-1) {
-    const currentTime = (recent[idx].progress / 100) * DOM.player.duration
-    DOM.player.currentTime = currentTime;
-    
-  }
+  const item = recent.find(entry => entry.id === state.currentRecentId);
+  if(!item) return;
+  const progress = item.progress || 0;
+  if (progress <= 0 || progress >= 100) return;
+  DOM.player.currentTime = (progress / 100) * DOM.player.duration;
 }
 
 function createRecentItem(item, maxLimit) {
@@ -385,7 +441,7 @@ function createRecentItem(item, maxLimit) {
 
 function attachRecentEvents(item, spanTitle, spanRemove) {
   spanRemove.addEventListener("click", () => {
-    removeRecent(item.title);
+    removeRecent(item.id);
   });
 
   spanTitle.addEventListener("click", () => {
@@ -447,7 +503,7 @@ function getFormData() {
       showAlert(CONFIG.MESSAGES.SELECT_LOCAL_VIDEO, {icon: "warning"});
       return;
     }
-    videoSrc = URL.createObjectURL(file);
+    videoSrc = acquireLocalUrl(file);
     videoTitle = file.name;
   }
 
@@ -457,7 +513,7 @@ function getFormData() {
     subtitleSrc = DOM.subtitleUrl.value.trim();
   } else {
     const subtitleFile = DOM.subtitleFile.files[0];
-    if(subtitleFile) subtitleSrc = URL.createObjectURL(subtitleFile);
+    if(subtitleFile) subtitleSrc = acquireLocalUrl(subtitleFile);
   }
   return {
     videoSrc,
@@ -468,13 +524,47 @@ function getFormData() {
   };
 }
 
-function revokeCurrentMedia() {
-  if (state.currentVideoType === "local" && state.currentVideo) {
-    URL.revokeObjectURL(state.currentVideo);
+// Object URLs for local files are pooled by file identity (name/size/mtime),
+// so re-selecting the same file reuses the URL that is still in use instead
+// of creating a duplicate or revoking it from under the player.
+const localFileUrls = new Map();
+
+function localFileKey(file) {
+  return [file.name, file.size, file.lastModified].join(":");
+}
+
+function acquireLocalUrl(file) {
+  const key = localFileKey(file);
+  const existing = localFileUrls.get(key);
+  if (existing) {
+    existing.file = file;
+    return existing.url;
+  }
+  const url = URL.createObjectURL(file);
+  localFileUrls.set(key, { file, url });
+  return url;
+}
+
+function releaseLocalUrl(url) {
+  if (!url) return;
+  for (const [key, entry] of localFileUrls) {
+    if (entry.url === url) {
+      localFileUrls.delete(key);
+      break;
+    }
+  }
+  URL.revokeObjectURL(url);
+}
+
+// Revoke the previous local video/subtitle object URLs before a new source
+// is loaded — but never a URL the new source still uses.
+function revokeCurrentMedia(nextVideo = "", nextSubtitle = "") {
+  if (state.currentVideoType === "local" && state.currentVideo && state.currentVideo !== nextVideo) {
+    releaseLocalUrl(state.currentVideo);
   }
 
-  if (state.currentSubtitleType === "local" && state.currentSubtitle) {
-    URL.revokeObjectURL(state.currentSubtitle);
+  if (state.currentSubtitleType === "local" && state.currentSubtitle && state.currentSubtitle !== nextSubtitle) {
+    releaseLocalUrl(state.currentSubtitle);
   }
 }
 
@@ -498,7 +588,7 @@ DOM.form.addEventListener("submit", function(e) {
   const data = getFormData();
   if (!data) return;
   playVideo(data.videoSrc, data.subtitleSrc, data.videoTitle, data.videoType, data.subtitleType);
-  saveRecent(data.videoTitle, data.videoSrc, data.videoType, data.subtitleSrc, data.subtitleType);
+  state.currentRecentId = saveRecent(data.videoTitle, data.videoSrc, data.videoType, data.subtitleSrc, data.subtitleType);
 });
 
 DOM.watchLaterButton.addEventListener("click", () => {
@@ -520,6 +610,8 @@ DOM.player.addEventListener("timeupdate", () => {
   handleSkipButton();
 });
 DOM.player.addEventListener("loadedmetadata", loadPlayerTime);
+DOM.player.addEventListener("pause", updateProgress);
+DOM.player.addEventListener("seeked", updateProgress);
 window.addEventListener("DOMContentLoaded", () => {
   DOM.watchTime.textContent = formatTime(state.totalWatchTime);
   loadFromQuery();
@@ -530,6 +622,7 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 DOM.player.addEventListener("ended", () => {
   DOM.skipButton.style.display = "none";
+  updateProgress();
 });
 DOM.player.addEventListener("volumechange", () => {
   setVolume(DOM.player.volume);
@@ -608,7 +701,13 @@ DOM.recentFile.addEventListener("change", () => {
         item.progress <= 100
       );
       if (!isValid) throw new Error();
-      setRecent(parsed);
+      const normalized = normalizeRecent(parsed);
+      setRecent(normalized);
+      // The import replaced the whole list: drop the write-back target if
+      // the record it points to no longer exists.
+      if (state.currentRecentId && !normalized.some(item => item.id === state.currentRecentId)) {
+        state.currentRecentId = null;
+      }
       renderRecent();
       showAlert(CONFIG.MESSAGES.IMPORT_SUCCESS, {icon: "success"});
     } catch {
@@ -810,3 +909,29 @@ document.addEventListener("keydown", (event) => {
       break;
   }
 });
+
+// Exported only for the local acceptance tests (tests/run-tests.js);
+// harmless in the browser where `module` is undefined.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    CONFIG,
+    DOM,
+    state,
+    getRecent,
+    setRecent,
+    normalizeRecent,
+    findRecentIndex,
+    saveRecent,
+    removeRecent,
+    removeAllVideos,
+    updateProgress,
+    loadPlayerTime,
+    playVideo,
+    renderRecent,
+    getFormData,
+    acquireLocalUrl,
+    releaseLocalUrl,
+    revokeCurrentMedia,
+    localFileUrls,
+  };
+}

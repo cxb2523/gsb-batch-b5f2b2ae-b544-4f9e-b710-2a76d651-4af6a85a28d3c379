@@ -1,0 +1,8 @@
+{
+  "name": "neovid",
+  "private": true,
+  "description": "Neovid - pure front-end video player",
+  "scripts": {
+    "test": "node tests/run-tests.js"
+  }
+}
