@@ -21,6 +21,8 @@ export default class Sequencer {
     this.recording = false;
     this.metronomeOn = true;
     this.sequenceTimestamp = null;
+    this.sequence = null;
+    this.sequenceGeneration = 0;
     this.stepTriggers = {};
     this.triggerCallbacks = [];
     this.onStepSelectCallbacks = [];
@@ -59,6 +61,10 @@ export default class Sequencer {
 
   setBpm(bpm) {
     this.bpm = bpm;
+
+    if (this.playing) {
+      this.rescheduleStep();
+    }
   }
 
   setSteps(steps) {
@@ -118,8 +124,13 @@ export default class Sequencer {
   }
 
   quantizeStepTrigger() {
+    if (this.selectedStep === null) {
+      return null;
+    }
+
     const interval = this.getStepInterval();
-    const needsQuantize = (Date.now() - this.sequenceTimestamp) > (interval / 2);
+    const needsQuantize = this.sequenceTimestamp !== null
+      && (Date.now() - this.sequenceTimestamp) > (interval / 2);
 
     if (this.recording && needsQuantize) {
       return this.selectedStep === this.steps ? 1 : this.selectedStep + 1;
@@ -143,33 +154,88 @@ export default class Sequencer {
   }
 
   start() {
-    const { activeStep } = this;
-    const interval = this.getStepInterval();
+    // Ignore repeated calls while playing so a single set of step timers runs.
+    if (this.playing) {
+      return;
+    }
+
     this.playing = true;
+    this.sequenceGeneration += 1;
+
+    // Playback resumes from the current active step; stop() resets it to 1.
+    this.playStep(this.sequenceGeneration);
+  }
+
+  /**
+   * Fire the callbacks for the current step and schedule the next one.
+   * The step timestamp is recorded before user callbacks run so recording
+   * always quantizes against the most recent real step time.
+   */
+  playStep(generation) {
+    if (!this.playing || generation !== this.sequenceGeneration) {
+      return;
+    }
+
+    this.sequenceTimestamp = Date.now();
+
+    // Schedule first: callbacks may stop the sequencer (which cancels this
+    // timer) or change the BPM (which reschedules it). Either way the timer is
+    // owned by the current run only.
+    this.scheduleNextStep(generation, this.getStepInterval());
 
     if (this.recording) {
+      this.selectedStep = this.activeStep;
       this.triggerMetronome();
     }
 
     this.triggerStep();
+  }
 
-    this.sequenceTimestamp = Date.now();
+  advanceStep(generation) {
+    if (!this.playing || generation !== this.sequenceGeneration) {
+      return;
+    }
+
+    this.activeStep = this.activeStep >= this.steps ? 1 : this.activeStep + 1;
+    this.playStep(generation);
+  }
+
+  scheduleNextStep(generation, interval) {
+    this.cancelSequence();
 
     this.sequence = setTimeout(() => {
-      this.activeStep = activeStep === this.steps ? 1 : activeStep + 1;
-
-      if (this.recording) {
-        this.selectedStep = this.activeStep;
-      }
-
-      this.start();
+      this.advanceStep(generation);
     }, interval);
+  }
+
+  /**
+   * Re-time the pending step after the BPM changed. The next step still fires
+   * exactly once, using the new interval counted from the moment of the change.
+   */
+  rescheduleStep() {
+    if (!this.playing) {
+      return;
+    }
+
+    this.scheduleNextStep(this.sequenceGeneration, this.getStepInterval());
+  }
+
+  cancelSequence() {
+    // The pending handle may come from setTimeout, but clearInterval and
+    // clearTimeout share one id space in the browser and in Node, so a single
+    // clear is enough and keeps the handle type an implementation detail.
+    clearInterval(this.sequence);
   }
 
   stop() {
     this.playing = false;
+    this.sequenceGeneration += 1;
+    this.cancelSequence();
     this.activeStep = 1;
-    clearInterval(this.sequence);
+    this.selectedStep = null;
+    // Drop the step timestamp so quantization after stopping cannot be based
+    // on a step that is no longer running.
+    this.sequenceTimestamp = null;
   }
 
   record() {
@@ -195,6 +261,7 @@ export default class Sequencer {
     this.activeStep = 1;
     this.selectedStep = null;
     this.stepTriggers = {};
+    this.sequenceTimestamp = null;
     this.triggerCallbacks = [];
     this.onStepSelectCallbacks = [];
     this.onSetTriggerCallbacks = [];
