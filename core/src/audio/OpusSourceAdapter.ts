@@ -202,25 +202,69 @@ export interface CreateOpusAudioResourceOptions {
 	ownership?: "transfer" | "borrow";
 }
 
+/**
+ * Pipes `source` into `destination` while enforcing a single, unified ownership/lifecycle contract:
+ *
+ * - `ownership: "transfer"` — the destination owns the source. Destroying (or erroring) the
+ *   destination destroys the upstream source, so every cancellation path converges on one teardown.
+ * - `ownership: "borrow"` — the caller keeps the source. Destroying the destination only detaches
+ *   the pipe (which pauses the source and stops further consumption); the source is never destroyed.
+ *
+ * Regardless of ownership, the function guarantees:
+ * - a source that closes before its natural end, or a validation/stream error on either side, ends
+ *   the destination with an error, and the same reason is reported at most once;
+ * - after teardown no pipe-owned `error`/`close` listeners remain on either stream and no further
+ *   data is pulled from the source.
+ */
 function pipeWithOwnership(source: Readable, destination: Transform, ownership: "transfer" | "borrow"): Readable {
-	const onSourceError = (error: Error) => destination.destroy(error);
+	let settled = false;
+
+	const detach = () => {
+		source.unpipe(destination);
+	};
+
 	const cleanup = () => {
 		source.off("error", onSourceError);
 		source.off("close", onSourceClose);
 		destination.off("close", onDestinationClose);
 	};
-	const onSourceClose = () => {
-		source.unpipe(destination);
+
+	/**
+	 * Single convergence point for every teardown trigger. The `settled` guard makes the cleanup
+	 * idempotent so that racing close/error events (source error followed by destination close,
+	 * destination destroy followed by source close, ...) never report a reason twice.
+	 */
+	const settle = (error?: Error) => {
+		if (settled) return;
+		settled = true;
+		detach();
 		cleanup();
-		if (!source.readableEnded && !destination.destroyed) {
-			destination.destroy(new Error("Source closed before end"));
+		if (ownership === "transfer" && !source.destroyed) {
+			source.destroy();
+		}
+		if (error && !destination.destroyed) {
+			destination.destroy(error);
 		}
 	};
-	const onDestinationClose = () => {
-		source.unpipe(destination);
-		if (ownership === "transfer" && !source.destroyed) source.destroy();
-		cleanup();
+
+	const onSourceError = (error: Error) => {
+		settle(error);
 	};
+
+	const onSourceClose = () => {
+		if (source.readableEnded) {
+			// Natural end: let the destination flush and close on its own.
+			settle();
+			return;
+		}
+		settle(new Error("Source closed before end"));
+	};
+
+	const onDestinationClose = () => {
+		// Resource destroyed (manual stop/skip) or destroyed by a validation error.
+		settle();
+	};
+
 	source.on("error", onSourceError);
 	source.once("close", onSourceClose);
 	destination.once("close", onDestinationClose);
@@ -277,6 +321,8 @@ export function createOpusAudioResource(
 			},
 			destroy(error, callback) {
 				let cleanupError = error;
+				// transfer: any destruction before natural exhaustion returns the iterator exactly once
+				// (Node invokes this hook a single time). borrow: the caller keeps finalization rights.
 				if (ownership === "transfer" && !iteratorDone && typeof iterator.return === "function") {
 					try {
 						iterator.return();
