@@ -246,9 +246,12 @@ const GameController = {
                 UI.playSound('open');
                 // 修复：selectPlayerCase 后需要重新获取状态以得到 playerCaseValue
                 const newState = StateManager.getState();
+                const gen = this.generation;
                 this.selectingAnimating = true;
                 await UI.animatePlayerCaseSelection(caseNumber, newState.playerCaseValue);
                 this.selectingAnimating = false;
+                // 飞行动画期间若触发重开，上一局回调不得再渲染新局棋盘
+                if (gen !== this.generation) return;
                 UI.renderMoneyPanels(); // 更新金额面板（玩家箱子金额标记）
             }
             return;
@@ -265,11 +268,15 @@ const GameController = {
             const result = StateManager.openCase(caseNumber);
             if (!result) return;
 
+            // 捕获对局代次：开箱动画期间若重开，动画后的所有 UI 刷新必须作废
+            const gen = this.generation;
+
             // 播放开箱音效
             UI.playSound('open');
 
             // 触发翻转动画
             await UI.animateCaseOpen(caseNumber, result.value);
+            if (gen !== this.generation) return;
 
             // 高亮金额面板对应金额
             UI.highlightMoneyValue(result.value);
@@ -284,7 +291,6 @@ const GameController = {
                     ? TIMING.roundCompleteToBankerCall : 250;
                 // 修复 Bug C：捕获 generation，避免本轮结束→报价间隙内的“重新开始”让定时器
                 // 把报价作用到全新对局（对局代次防护前移）
-                const gen = this.generation;
                 setTimeout(() => { if (gen === this.generation) this.triggerBankerOffer(); }, gap);
             }
         }
@@ -311,6 +317,8 @@ const GameController = {
 
         // 显示报价弹窗（传递 isBait 标记用于正确显示银行家评语）
         await UI.showBankerOffer(offer, isBait);
+        // 弹窗动画/音效期间若重开，不得再改写新局阶段与决策锁
+        if (gen !== this.generation) return;
 
         // 更新阶段（getState 返回浅拷贝，必须用 StateManager.setPhase 才能真正改写）
         StateManager.setPhase(GAME_PHASE.BANKER_OFFER);
@@ -355,6 +363,8 @@ const GameController = {
         // 接受报价后的后续：翻转打开自己的箱子，揭晓里面到底是多少钱
         const playerCase = StateManager.getPlayerCase();
         await UI.animatePlayerCaseOpen(playerCase.value);
+        // 翻转动画期间若重开，不再安排上一局的结算弹窗
+        if (gen !== this.generation) return;
 
         // 短暂延迟后显示结果（重开后此回调作废，避免弹出"幽灵结算窗"）
         setTimeout(() => {
@@ -501,6 +511,7 @@ const GameController = {
 
         // 保留原箱子后，翻转打开自己的箱子
         await UI.animatePlayerCaseOpen(StateManager.getPlayerCase().value);
+        if (gen !== this.generation) return;
 
         // 短暂延迟后显示结果（重开后此回调作废，避免弹出“幽灵结算窗”）
         setTimeout(() => {
@@ -529,6 +540,8 @@ const GameController = {
             otherCaseEl.classList.add('switch-case__box--swapping');
 
             await new Promise(resolve => setTimeout(resolve, 600));
+            // 交换动画期间若重开，后续上一局 DOM 更新全部作废
+            if (gen !== this.generation) return;
 
             playerCaseEl.classList.remove('switch-case__box--swapping');
             otherCaseEl.classList.remove('switch-case__box--swapping');
@@ -542,6 +555,7 @@ const GameController = {
 
         // 交换后，翻转打开现在属于自己的箱子（即原另一个箱子内的金额）
         await UI.animatePlayerCaseOpen(playerCase.value);
+        if (gen !== this.generation) return;
 
         // 短暂延迟后显示结果（重开后此回调作废，避免弹出“幽灵结算窗”）
         setTimeout(() => {
@@ -554,13 +568,14 @@ const GameController = {
      * 处理重新开始
      */
     handleRestart() {
-        // 递增对局代次，使任何挂起的异步流程（银行家报价、还价延迟等）作废
+        // 递增对局代次，使任何挂起的异步流程（银行家报价、还价延迟等）作废。
+        // UI.resetUI() 内部会同步递增 UI 代次，让上一局全部延迟 DOM 回调失效，
+        // 两层代次在此处一同推进，保证旧回调无法改动新局的弹窗、遮罩、按钮与箱子。
         this.generation = (this.generation || 0) + 1;
         this.decisionLock = false;
-        UI.hideResult();
-
-        // 完全重置并重新开始
         this.selectingAnimating = false;
+
+        // 完全重置并重新开始（resetUI 统一收敛弹窗/遮罩/玩家箱/按钮，无需先 hideResult）
         StateManager.reset();
         StateManager.initializeCases();
         UI.resetUI();

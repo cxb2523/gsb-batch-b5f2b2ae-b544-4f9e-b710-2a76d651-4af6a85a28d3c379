@@ -14,6 +14,51 @@
 // ========================================
 const elements = {};
 
+// ========================================
+// 对局代次（UI 层）与统一调度器
+// ----------------------------------------------------------------
+// 所有会改动 DOM 的延迟回调（动画收尾、弹窗进出场、遮罩隐藏、揭示动画……）
+// 都必须经由 scheduleUI() 注册，并在执行前核对创建时的 epoch。
+// resetUI()（重开/初始化）会递增 epoch，使上一局残留的全部定时器立即失效，
+// 不再有任何旧回调能改动新局的弹窗、遮罩、按钮或箱子。
+// 该代次与 GameController.generation 在每次重开时同步递增，互为双保险。
+// ========================================
+let uiEpoch = 0;
+let activeUITimers = new Set();
+
+/**
+ * 注册一个受对局代次保护的延迟回调。
+ * @param {Function} fn - 回调；仅当回调触发时代次未变化才会执行
+ * @param {number} delay - 延迟毫秒数
+ * @returns {number} 定时器 id
+ */
+function scheduleUI(fn, delay) {
+    const epoch = uiEpoch;
+    const id = setTimeout(() => {
+        activeUITimers.delete(id);
+        // 重开/初始化后旧代次回调一律作废，绝不触碰新局 DOM
+        if (epoch !== uiEpoch) return;
+        fn();
+    }, delay);
+    activeUITimers.add(id);
+    return id;
+}
+
+/**
+ * 使当前所有挂起的 UI 定时器失效并清空登记。
+ * 注意：不 clearTimeout——让其到时自行空转返回，避免把动画 Promise 永远挂起
+ * （await 动画的控制器流程随后还会用 GameController.generation 再次拦截）。
+ */
+function invalidateUITimers() {
+    uiEpoch++;
+    activeUITimers.clear();
+}
+
+/** 当前 UI 代次（供动画函数捕获并在异步收尾时核对） */
+function currentUIEpoch() {
+    return uiEpoch;
+}
+
 // 缓存常用 DOM 元素
 function cacheElements() {
     elements.themeToggle = document.getElementById('theme-toggle');
@@ -122,11 +167,57 @@ function highlightMoneyValue(value) {
     const item = document.querySelector(selector);
     if (item) {
         item.classList.add('money-item--animating');
-        // 动画结束后移除高亮类，添加已开启类
-        setTimeout(() => {
-            item.classList.remove('money-item--animating');
-            item.classList.add('money-item--opened');
+        // 动画结束后移除高亮类，添加已开启类。
+        // 受对局代次保护：重开后金额面板已整体重渲染，旧回调不得再操作新面板节点。
+        scheduleUI(() => {
+            const stillItem = document.querySelector(selector);
+            if (!stillItem) return;
+            stillItem.classList.remove('money-item--animating');
+            stillItem.classList.add('money-item--opened');
         }, 1200);
+    }
+}
+
+// ========================================
+// 弹窗 / 遮罩统一管理
+// ----------------------------------------------------------------
+// 遮罩的显隐只能由“当前真正打开的弹窗”决定，杜绝各自计时导致的
+// “弹窗无背景”或“遮罩提前消失”。
+// ========================================
+
+// 弹窗 -> 其最外层容器的映射（开发者选项弹窗也纳入统一管理）
+function _modalRoots() {
+    return [
+        elements.bankerModal,
+        elements.switchModal,
+        elements.resultModal,
+        elements.devModal
+    ].filter(Boolean);
+}
+
+/** 当前是否还有任一弹窗处于打开状态（以 hidden 属性为准） */
+function isAnyModalOpen() {
+    return _modalRoots().some(modal => !modal.hidden);
+}
+
+/**
+ * 按当前真正打开的弹窗同步遮罩状态。
+ * - 有弹窗打开：遮罩必须显示（若此前被退场动画隐藏则重新拉起）；
+ * - 无弹窗打开：遮罩必须隐藏。
+ * 可被任意流程安全重复调用，是遮罩状态的唯一裁决点。
+ */
+function syncBackdrop() {
+    const backdrop = elements.modalBackdrop;
+    if (!backdrop) return;
+    if (isAnyModalOpen()) {
+        if (backdrop.hidden) {
+            backdrop.hidden = false;
+            backdrop.classList.remove('modal-backdrop-exit');
+            backdrop.classList.add('modal-backdrop-enter');
+        }
+    } else {
+        backdrop.hidden = true;
+        backdrop.classList.remove('modal-backdrop-enter', 'modal-backdrop-exit');
     }
 }
 
@@ -197,6 +288,9 @@ function animateCaseOpen(caseNumber, value) {
         const caseEl = document.querySelector(`.case[data-number="${caseNumber}"]`);
         if (!caseEl) { resolve(); return; }
 
+        // 捕获对局代次：重开后网格已整体重建，旧动画收尾不得再操作新棋盘的箱子
+        const epoch = currentUIEpoch();
+
         // 添加翻转类
         caseEl.classList.add('case--flipping');
         caseEl.classList.remove('case--unopened');
@@ -208,13 +302,18 @@ function animateCaseOpen(caseNumber, value) {
             valueEl.className = `case__value case--${getValueClass(value)}`;
         }
 
-        // 动画结束后更新类
+        // 动画结束后更新类。
+        // 直接使用裸定时器并始终 resolve：代次失效时仅放弃 DOM 操作，
+        // 避免 await 本动画的控制器协程被永久挂起（控制器侧还有 generation 二次拦截）。
         setTimeout(() => {
-            caseEl.classList.remove('case--flipping');
-            caseEl.classList.add('case--opened', `case--${getValueClass(value)}`);
-            caseEl.removeAttribute('role');
-            caseEl.removeAttribute('tabindex');
-            caseEl.style.cursor = 'default';
+            if (epoch !== currentUIEpoch()) { resolve(); return; }
+            const el = document.querySelector(`.case[data-number="${caseNumber}"]`);
+            if (!el) { resolve(); return; }
+            el.classList.remove('case--flipping');
+            el.classList.add('case--opened', `case--${getValueClass(value)}`);
+            el.removeAttribute('role');
+            el.removeAttribute('tabindex');
+            el.style.cursor = 'default';
             resolve();
         }, 800); // 与 CSS 动画时长一致
     });
@@ -260,6 +359,10 @@ async function animatePlayerCaseSelection(caseNumber, value) {
         window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     const sourceEl = elements.casesGrid.querySelector(`.case[data-number="${caseNumber}"]`);
+
+    // 捕获对局代次：飞行途中若重开，新局棋盘与玩家箱已重置，
+    // 旧动画的任何收尾都不得再写入新局 DOM
+    const epoch = currentUIEpoch();
 
     // 降级：无来源元素或用户偏好减少动画时，直接显示，不做飞行
     if (prefersReduced || !sourceEl) {
@@ -330,14 +433,22 @@ async function animatePlayerCaseSelection(caseNumber, value) {
             done = true;
             flying.removeEventListener('transitionend', finish);
 
+            // 重开/初始化使代次变化：新局已重置玩家箱与网格，
+            // 只清理本动画创建的飞行克隆体，不再触碰新局任何元素
+            if (epoch !== currentUIEpoch()) {
+                if (flying.parentNode) flying.parentNode.removeChild(flying);
+                resolve();
+                return;
+            }
+
             elements.playerCaseBox.innerHTML = `<span class="player-case__number">${caseNumber}</span>`;
             elements.playerCaseBox.classList.remove('player-case__box--incoming');
             elements.playerCaseBox.classList.add('player-case__box--arrived');
 
             if (flying.parentNode) flying.parentNode.removeChild(flying);
 
-            // 清理临时类，恢复基础发光/落位动画
-            setTimeout(() => {
+            // 清理临时类，恢复基础发光/落位动画（代次保护，防止重开后清理新局类名）
+            scheduleUI(() => {
                 elements.playerCaseBox.classList.remove('player-case__box--arrived');
                 elements.casesGrid.classList.remove('is-settling');
             }, 550);
@@ -354,14 +465,18 @@ async function animatePlayerCaseSelection(caseNumber, value) {
  */
 function animateBannerOut() {
     const b = elements.instructionBanner;
+    const epoch = currentUIEpoch();
     b.classList.add('instruction-banner--leaving');
     const onEnd = () => {
+        // 重开后横幅由 resetUI 复位显示，旧离场回调不得再隐藏新局横幅
+        if (epoch !== currentUIEpoch()) return;
         b.removeEventListener('animationend', onEnd);
         b.hidden = true;
         b.classList.remove('instruction-banner--leaving');
     };
     b.addEventListener('animationend', onEnd);
-    setTimeout(onEnd, 600); // 兜底
+    // 兜底（同样受代次保护）
+    scheduleUI(onEnd, 600);
 }
 
 /**
@@ -400,6 +515,8 @@ async function showBankerOffer(offer, isBait = false) {
     const state = StateManager.getState();
     const expectedValue = StateManager.calculateExpectedValue();
     const commentary = getOfferCommentary(offer, expectedValue, isBait);
+    // 捕获代次：await 铃声音效期间若重开，后续评语/还价 UI 不得写入新局
+    const epoch = currentUIEpoch();
 
     // 更新金额显示（带动画）
     elements.bankerOfferAmount.textContent = formatCurrency(offer);
@@ -410,13 +527,15 @@ async function showBankerOffer(offer, isBait = false) {
         elements.bankerExpectedValue.textContent = formatCurrency(expectedValue);
     }
 
-    // 显示背景遮罩
-    elements.modalBackdrop.hidden = false;
-    elements.modalBackdrop.classList.add('modal-backdrop-enter');
+    // 记录当前报价上下文，供语言切换时在不重建弹窗的前提下刷新动态文案
+    lastBankerOfferContext = { offer, isBait };
 
     // 显示弹窗（动画加在真正居中的内容层上）
     elements.bankerModal.hidden = false;
     elements.bankerModalContent.classList.add('modal-enter');
+
+    // 遮罩显隐统一由“当前打开的弹窗”裁决，杜绝无背景弹窗/遮罩提前消失
+    syncBackdrop();
 
     // 电话铃声动画：仅作装饰，不再阻塞流程
     // （此前这里 await 1500ms，导致弹窗已经出现却迟迟不能决策）
@@ -425,12 +544,15 @@ async function showBankerOffer(offer, isBait = false) {
         phoneIcon.classList.add('banker-modal__phone--ringing');
         const ringDuration = (typeof TIMING !== 'undefined' && TIMING.bankerRingDuration != null)
             ? TIMING.bankerRingDuration : 900;
-        setTimeout(() => phoneIcon.classList.remove('banker-modal__phone--ringing'), ringDuration);
+        scheduleUI(() => phoneIcon.classList.remove('banker-modal__phone--ringing'), ringDuration);
     }
 
     // 播放铃声音效（可选）。showBankerOffer 经由 setTimeout 触发、已脱离用户手势，
     // 但此时音频上下文应已在之前的点击中进入 running；await 确保 resume 完成后再播放
     await playSound('ring');
+
+    // await 期间若已重开，报价弹窗属于上一局：放弃后续 DOM 写入
+    if (epoch !== currentUIEpoch()) return;
 
     // 显示银行家评语（此前只 console.log，玩家看不到；现在写入弹窗，见 bug #5）
     if (elements.bankerCommentary) {
@@ -447,26 +569,29 @@ async function showBankerOffer(offer, isBait = false) {
 
 /**
  * 隐藏银行家报价弹窗
+ * @param {boolean} [keepBackdrop=false] 进入交换阶段时复用当前遮罩，
+ *   避免遮罩先隐后显的闪烁；隐藏完成后仍由 syncBackdrop() 按实际弹窗状态裁决
  */
 function hideBankerOffer(keepBackdrop) {
     elements.bankerModalContent.classList.add('modal-exit');
     elements.bankerModalContent.classList.remove('modal-enter');
     if (elements.bankerCommentary) elements.bankerCommentary.textContent = '';
     elements.bankerOfferAmount.classList.remove('banker-modal__amount--animating');
+    lastBankerOfferContext = null;
 
-    // 隐藏背景遮罩；进入交换阶段时复用当前遮罩（keepBackdrop=true），避免遮罩先隐后显的闪烁
+    // 过渡期间：非复用场景先播放遮罩退场动画；复用场景保持遮罩不动
     if (!keepBackdrop) {
         elements.modalBackdrop.classList.add('modal-backdrop-exit');
         elements.modalBackdrop.classList.remove('modal-backdrop-enter');
     }
 
-    setTimeout(() => {
+    scheduleUI(() => {
         elements.bankerModal.hidden = true;
         elements.bankerModalContent.classList.remove('modal-exit');
-        if (!keepBackdrop) {
-            elements.modalBackdrop.hidden = true;
-            elements.modalBackdrop.classList.remove('modal-backdrop-exit');
-        }
+        // 唯一裁决点：按当前真正打开的弹窗决定遮罩去留。
+        // 若交换弹窗紧接着出现（keepBackdrop 场景），遮罩保持显示且无闪烁；
+        // 若没有任何弹窗，则遮罩确定隐藏，不会提前消失也不会残留。
+        syncBackdrop();
     }, 250);
 }
 
@@ -481,12 +606,11 @@ function showSwitchCase() {
     elements.switchPlayerCaseNum.textContent = playerCase.number;
     elements.switchOtherCaseNum.textContent = otherCase.number;
 
-    // 显示背景遮罩
-    elements.modalBackdrop.hidden = false;
-    elements.modalBackdrop.classList.add('modal-backdrop-enter');
-
     elements.switchModal.hidden = false;
     elements.switchModalContent.classList.add('modal-enter');
+
+    // 遮罩由统一裁决点管理：银行家弹窗退场过渡期间也能保证背景不中断
+    syncBackdrop();
 }
 
 /**
@@ -496,22 +620,58 @@ function hideSwitchCase() {
     elements.switchModalContent.classList.add('modal-exit');
     elements.switchModalContent.classList.remove('modal-enter');
 
-    // 隐藏背景遮罩
+    // 遮罩退场动画（最终是否隐藏由 250ms 后的 syncBackdrop 裁决）
     elements.modalBackdrop.classList.add('modal-backdrop-exit');
     elements.modalBackdrop.classList.remove('modal-backdrop-enter');
 
-    setTimeout(() => {
+    scheduleUI(() => {
         elements.switchModal.hidden = true;
         elements.switchModalContent.classList.remove('modal-exit');
-        elements.modalBackdrop.hidden = true;
-        elements.modalBackdrop.classList.remove('modal-backdrop-exit');
+        syncBackdrop();
     }, 250);
 }
 
 /**
+ * 结算弹窗揭示状态
+ * - resultRevealed：本局结算是否已完成揭示（摘要/详情/按钮均已可见）
+ * - lastBankerOfferContext：当前报价弹窗的上下文，语言切换时用于原地刷新动态文案
+ */
+let resultRevealed = false;
+let lastBankerOfferContext = null;
+
+/**
+ * 施加结算揭示动画。
+ * @param {boolean} animate true=首次揭示，播放依次出现的动画；
+ *   false=已揭示后的重建（语言切换），直接定格在可见终态，按钮不得回退隐藏
+ */
+function applyResultReveal(animate) {
+    if (animate) {
+        // 首次揭示：延迟一帧后加类，确保弹窗入场与揭示动画衔接
+        scheduleUI(() => {
+            elements.resultSummary.classList.add('result-modal__summary--reveal');
+            elements.resultDetails.classList.add('result-modal__details--reveal');
+            elements.btnRestart.classList.add('btn--restart--reveal');
+            resultRevealed = true;
+        }, 100);
+    } else {
+        // 已揭示状态下重建（语言切换）：直接保持终态，按钮始终可见
+        elements.resultSummary.classList.add('result-modal__summary--reveal');
+        elements.resultDetails.classList.add('result-modal__details--reveal');
+        elements.btnRestart.classList.add('btn--restart--reveal');
+        resultRevealed = true;
+    }
+}
+
+/**
  * 显示游戏结果弹窗
+ *
+ * 幂等设计：语言切换时 applyI18n() 会再次调用本函数重建文案。
+ * - 首次展示：播放完整揭示动画（摘要 → 详情 → “再来一局”按钮依次出现）；
+ * - 已揭示后的重入（语言切换）：保持已揭示状态，按钮始终可见，不回退到隐藏态，
+ *   也不依赖可能被重开作废的 setTimeout 来补类（修复语言切换后揭示动画/按钮丢失）。
  */
 function showResult() {
+    const wasAlreadyRevealed = resultRevealed;
     const summary = StateManager.getResultSummary();
 
     // 构建结果摘要
@@ -569,23 +729,27 @@ function showResult() {
     elements.resultSummary.innerHTML = summaryHTML;
     elements.resultDetails.innerHTML = detailsHTML;
 
-    // 显示背景遮罩
-    elements.modalBackdrop.hidden = false;
-    elements.modalBackdrop.classList.add('modal-backdrop-enter');
+    // innerHTML 重建会清掉旧节点上的揭示类：按当前揭示状态决定重放动画还是定格终态
+    if (wasAlreadyRevealed) {
+        elements.resultSummary.classList.add('result-modal__summary--reveal');
+        elements.resultDetails.classList.add('result-modal__details--reveal');
+        elements.btnRestart.classList.add('btn--restart--reveal');
+    }
 
     elements.resultModal.hidden = false;
     elements.resultModalContent.classList.add('modal-enter');
 
-    // 播放结算音效：战胜期望值用 win，低于期望值用 lose（修复 win/lose 设计未实现的问题）
-    // showResult 本身在 setTimeout 中调用（脱离手势），但音频上下文此前已 running，playSound 会先 await resume
-    playSound(summary.beatExpected ? 'win' : 'lose');
+    // 遮罩显隐统一裁决，杜绝无背景弹窗
+    syncBackdrop();
 
-    // 触发揭示动画
-    setTimeout(() => {
-        elements.resultSummary.classList.add('result-modal__summary--reveal');
-        elements.resultDetails.classList.add('result-modal__details--reveal');
-        elements.btnRestart.classList.add('btn--restart--reveal');
-    }, 100);
+    // 结算音效仅在首次揭示时播放，语言切换重建不重复响铃
+    if (!wasAlreadyRevealed) {
+        // showResult 本身在 setTimeout 中调用（脱离手势），但音频上下文此前已 running，playSound 会先 await resume
+        playSound(summary.beatExpected ? 'win' : 'lose');
+    }
+
+    // 首次揭示走动画；已揭示后的重入直接保持可见终态
+    applyResultReveal(!wasAlreadyRevealed);
 
     // 揭示玩家箱子实际金额（若流程中尚未以翻转动画打开，则在此兜底揭示）
     if (!elements.playerCaseBox.classList.contains('case--opened')) {
@@ -602,16 +766,16 @@ function hideResult() {
     elements.resultSummary.classList.remove('result-modal__summary--reveal');
     elements.resultDetails.classList.remove('result-modal__details--reveal');
     elements.btnRestart.classList.remove('btn--restart--reveal');
+    resultRevealed = false;
 
-    // 隐藏背景遮罩
+    // 遮罩退场动画（最终隐藏由延时后的 syncBackdrop 统一裁决）
     elements.modalBackdrop.classList.add('modal-backdrop-exit');
     elements.modalBackdrop.classList.remove('modal-backdrop-enter');
 
-    setTimeout(() => {
+    scheduleUI(() => {
         elements.resultModal.hidden = true;
         elements.resultModalContent.classList.remove('modal-exit');
-        elements.modalBackdrop.hidden = true;
-        elements.modalBackdrop.classList.remove('modal-backdrop-exit');
+        syncBackdrop();
     }, 250);
 }
 
@@ -638,6 +802,8 @@ function animatePlayerCaseOpen(value) {
         const box = elements.playerCaseBox;
         if (!box) { resolve(); return; }
 
+        // 捕获对局代次：翻转期间重开则放弃收尾，绝不在新局玩家箱上残留金额/配色类
+        const epoch = currentUIEpoch();
         const num = StateManager.getPlayerCase().number;
         const valueClass = getValueClass(value);
 
@@ -664,8 +830,9 @@ function animatePlayerCaseOpen(value) {
         // 触发翻转动画
         box.classList.add('case--flipping');
 
-        // 动画结束后定格为已开启状态
+        // 动画结束后定格为已开启状态（代次失效则只 resolve，不触碰新局箱子）
         setTimeout(() => {
+            if (epoch !== currentUIEpoch()) { resolve(); return; }
             box.classList.remove('case--flipping');
             box.classList.add('case--opened', `case--${valueClass}`);
             resolve();
@@ -675,18 +842,37 @@ function animatePlayerCaseOpen(value) {
 
 /**
  * 重置 UI 到初始状态
+ *
+ * 重开/初始化的统一收敛点：
+ * 1. 先递增 UI 代次，使上一局所有延迟回调立即失效，不得再改动新局 DOM；
+ * 2. 弹窗/遮罩/按钮/箱子全部复位到未开局外观，不残留上一局金额与配色类。
  */
 function resetUI() {
+    // 1) 失效上一局全部挂起的 UI 定时器（动画收尾、弹窗进退场、揭示延时等）
+    invalidateUITimers();
+
+    // 清理选箱飞行可能残留在 body 上的克隆体
+    document.querySelectorAll('.case-fly').forEach(el => el.remove());
+
     // 重新渲染金额面板
     renderMoneyPanels();
 
     // 重新渲染箱子网格
     renderCasesGrid();
 
-    // 隐藏玩家箱子显示
+    // 隐藏玩家箱子显示，并彻底复位为“未开启”外观：
+    // 清空上一局翻转结构与金额，重建仅含编号占位的初始结构，移除全部配色/动画类
     elements.playerCaseDisplay.hidden = true;
-    elements.playerCaseBox.classList.remove('player-case__box--incoming', 'player-case__box--arrived');
-    elements.playerCaseBox.classList.remove('case--opened', 'case--flipping', 'case--low', 'case--high');
+    elements.playerCaseBox.classList.remove(
+        'player-case__box--incoming',
+        'player-case__box--arrived',
+        'case--opened',
+        'case--flipping',
+        'case--low',
+        'case--high'
+    );
+    elements.playerCaseBox.innerHTML = '<span class="player-case__number" id="player-case-number"></span>';
+    elements.playerCaseNumber = document.getElementById('player-case-number');
 
     // 隐藏轮次信息
     elements.roundInfo.hidden = true;
@@ -695,13 +881,37 @@ function resetUI() {
     elements.roundTarget.hidden = false;
     elements.roundProgress.hidden = false;
 
-    // 隐藏所有弹窗
+    // 隐藏所有弹窗（含开发者选项弹窗），复位内容层动画类
     elements.bankerModal.hidden = true;
     elements.switchModal.hidden = true;
     elements.resultModal.hidden = true;
+    if (elements.devModal) elements.devModal.hidden = true;
+    if (elements.bankerModalContent) elements.bankerModalContent.classList.remove('modal-enter', 'modal-exit');
+    if (elements.switchModalContent) elements.switchModalContent.classList.remove('modal-enter', 'modal-exit');
+    if (elements.resultModalContent) elements.resultModalContent.classList.remove('modal-enter', 'modal-exit');
+    if (elements.devModalContent) elements.devModalContent.classList.remove('modal-enter', 'modal-exit');
+    if (elements.bankerCommentary) elements.bankerCommentary.textContent = '';
+    if (elements.bankerModal && elements.bankerModal.querySelector('.banker-modal__phone')) {
+        elements.bankerModal.querySelector('.banker-modal__phone')
+            .classList.remove('banker-modal__phone--ringing');
+    }
 
-    // 隐藏背景遮罩
-    elements.modalBackdrop.hidden = true;
+    // 复位结算揭示状态与揭示类
+    resultRevealed = false;
+    lastBankerOfferContext = null;
+    elements.resultSummary.classList.remove('result-modal__summary--reveal');
+    elements.resultDetails.classList.remove('result-modal__details--reveal');
+    elements.btnRestart.classList.remove('btn--restart--reveal');
+
+    // 弹窗按钮恢复可用：新局首次报价出现时即可决策，不带上一局的 disabled 残留
+    setButtonDisabled('btn-deal', false);
+    setButtonDisabled('btn-no-deal', false);
+    setButtonDisabled('btn-keep', false);
+    setButtonDisabled('btn-switch', false);
+
+    // 遮罩复位并交由统一裁决点确认隐藏（此时已无任何弹窗打开）
+    elements.modalBackdrop.classList.remove('modal-backdrop-enter', 'modal-backdrop-exit');
+    syncBackdrop();
 
     // 显示指示横幅
     elements.instructionBanner.hidden = false;
@@ -710,16 +920,6 @@ function resetUI() {
     // 清理可能的动画残留类
     elements.casesGrid.classList.remove('is-settling');
     elements.playerCaseDisplay.classList.remove('player-case-display--fade');
-
-    // 移除所有动画类
-    if (elements.bankerModalContent) elements.bankerModalContent.classList.remove('modal-enter', 'modal-exit');
-    if (elements.bankerCommentary) elements.bankerCommentary.textContent = '';
-    if (elements.switchModalContent) elements.switchModalContent.classList.remove('modal-enter', 'modal-exit');
-    if (elements.resultModalContent) elements.resultModalContent.classList.remove('modal-enter', 'modal-exit');
-    elements.resultSummary.classList.remove('result-modal__summary--reveal');
-    elements.resultDetails.classList.remove('result-modal__details--reveal');
-    elements.btnRestart.classList.remove('btn--restart--reveal');
-    elements.modalBackdrop.classList.remove('modal-backdrop-enter', 'modal-backdrop-exit');
 
     // 修复: 重置还价 UI 状态（新游戏开始时复位，避免上一局已用还价导致按钮残留隐藏）
     updateHaggleUI();
@@ -896,10 +1096,10 @@ function showDevOptions() {
         elements.devResult.hidden = true;
         elements.devResult.classList.remove('dev-modal__result--show');
     }
-    elements.modalBackdrop.hidden = false;
-    elements.modalBackdrop.classList.add('modal-backdrop-enter');
     elements.devModal.hidden = false;
     elements.devModalContent.classList.add('modal-enter');
+    // 遮罩统一裁决：开发者弹窗打开期间背景必须存在
+    syncBackdrop();
 }
 
 /** 隐藏开发者选项弹窗 */
@@ -910,13 +1110,11 @@ function hideDevOptions() {
         elements.modalBackdrop.classList.add('modal-backdrop-exit');
         elements.modalBackdrop.classList.remove('modal-backdrop-enter');
     }
-    setTimeout(function () {
+    scheduleUI(function () {
         elements.devModal.hidden = true;
         elements.devModalContent.classList.remove('modal-exit');
-        if (!_anyOtherModalOpen()) {
-            elements.modalBackdrop.hidden = true;
-            elements.modalBackdrop.classList.remove('modal-backdrop-exit');
-        }
+        // 按当前真正打开的弹窗决定遮罩去留（其它弹窗仍开着则保留背景）
+        syncBackdrop();
     }, 250);
 }
 
@@ -1278,15 +1476,57 @@ function ensureElementsReady() {
 }
 
 /**
+ * 语言切换时原地刷新银行家报价弹窗的动态文案。
+ * 不重建/不隐藏弹窗，也不触碰遮罩与按钮状态，保证弹窗、遮罩、按钮始终一致。
+ */
+function refreshBankerOfferI18n() {
+    if (!elements.bankerModal || elements.bankerModal.hidden) return;
+    const ctx = lastBankerOfferContext;
+    if (ctx) {
+        const expectedValue = StateManager.calculateExpectedValue();
+        const commentary = getOfferCommentary(ctx.offer, expectedValue, ctx.isBait);
+        if (elements.bankerCommentary) {
+            elements.bankerCommentary.textContent = commentary;
+            // 保持评语可见态（不重新播放淡入，避免语言切换时闪烁）
+            elements.bankerCommentary.classList.add('banker-modal__commentary--show');
+        }
+        if (elements.bankerExpectedValue) {
+            elements.bankerExpectedValue.textContent = formatCurrency(expectedValue);
+        }
+    }
+    // 还价按钮/面板的可见性随当前局状态刷新，禁用态保持不变
+    updateHaggleUI();
+    // 重新应用当前按钮禁用态以外的状态后，确保按钮状态不被语言切换改变：
+    // updateHaggleUI 只按 haggleUsed 处理还价按钮，DEAL/NO DEAL 不受影响
+}
+
+/**
  * 切换语言时刷新"动态"文案（静态文案由全局 applyStaticI18n() 负责）。
  * - 轮次信息（若可见）
- * - 结算弹窗（若可见，按当前语言重建文本与揭示动画）
+ * - 银行家报价弹窗（若可见，原地刷新评语/期望值，不重建弹窗、不动遮罩与按钮）
+ * - 交换弹窗（若可见，刷新两个箱子编号展示）
+ * - 结算弹窗（若可见，按当前语言重建文本并保持已揭示状态与“再来一局”按钮可见）
  */
 function applyI18n() {
+    ensureElementsCached();
     if (elements.roundInfo && !elements.roundInfo.hidden) {
         updateRoundInfo();
     }
+    if (elements.bankerModal && !elements.bankerModal.hidden) {
+        refreshBankerOfferI18n();
+    }
+    if (elements.switchModal && !elements.switchModal.hidden) {
+        const playerCase = StateManager.getPlayerCase();
+        const otherCase = StateManager.getOtherCase();
+        if (elements.switchPlayerCaseNum && playerCase.number != null) {
+            elements.switchPlayerCaseNum.textContent = playerCase.number;
+        }
+        if (elements.switchOtherCaseNum && otherCase.number != null) {
+            elements.switchOtherCaseNum.textContent = otherCase.number;
+        }
+    }
     if (elements.resultModal && !elements.resultModal.hidden) {
+        // showResult 幂等：已揭示时重建文本并定格在可见终态，按钮不回退隐藏
         showResult();
     }
 }
@@ -1337,7 +1577,8 @@ function setOfferDisplay(offer) {
     if (!elements.bankerOfferAmount) return;
     elements.bankerOfferAmount.textContent = formatCurrency(offer);
     elements.bankerOfferAmount.classList.add('banker-modal__amount--animating');
-    setTimeout(() => {
+    // 代次保护：重开后不再操作新局报价元素
+    scheduleUI(() => {
         if (elements.bankerOfferAmount) elements.bankerOfferAmount.classList.remove('banker-modal__amount--animating');
     }, 600);
 }
@@ -1384,5 +1625,12 @@ const UI = {
     handleTitleClick,
     devRevealAllCases,
     devRevealRemainingCases,
-    devRevealPlayerCase
+    devRevealPlayerCase,
+    // 状态收敛辅助（供 window.DealOrNoDeal 控制台验收使用）
+    syncBackdrop,
+    isAnyModalOpen,
+    refreshBankerOfferI18n,
+    scheduleUI,
+    invalidateUITimers,
+    currentUIEpoch
 };
