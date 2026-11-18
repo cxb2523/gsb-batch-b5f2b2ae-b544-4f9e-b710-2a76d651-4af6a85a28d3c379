@@ -200,16 +200,50 @@ function geoLabelLayout(shape) {
 
 // ---- image assets ----------------------------------------------------------
 
-const imgCache = new Map() // assetId -> { img, ready }
+// Decoded images are cached per store, per asset id AND src: the same id
+// pointing at a new src is a new picture. The cache lives in a WeakMap keyed
+// by the store, so a discarded document takes its whole cache with it, and a
+// store listener drops each entry the moment its asset leaves the document —
+// deleted images don't squat in memory.
+const imgCaches = new WeakMap() // store -> Map<assetId, { img, ready, src }>
+
+function imgCacheFor(store) {
+  let cache = imgCaches.get(store)
+  if (cache) return cache
+  cache = new Map()
+  imgCaches.set(store, cache)
+  if (typeof store.listen === 'function') {
+    store.listen((diff) => {
+      for (const id of Object.keys(diff.removed || {})) cache.delete(id)
+      for (const [id, pair] of Object.entries(diff.updated || {})) {
+        const [from, to] = pair
+        if (to && to.typeName === 'asset' && (!from || from.src !== to.src)) cache.delete(id)
+      }
+    })
+  }
+  return cache
+}
+
 export function assetImage(store, assetId, onReady) {
-  let e = imgCache.get(assetId)
-  if (e) return e.ready ? e.img : null
+  if (!store) return null
+  const cache = imgCacheFor(store)
   const asset = store.asset(assetId)
-  if (!asset) return null
+  // the asset is gone from the document: the cached entry must go with it
+  if (!asset) { cache.delete(assetId); return null }
+  const hit = cache.get(assetId)
+  if (hit && hit.src === asset.src) return hit.ready ? hit.img : null
+  // new asset, or the id now points at a different source: (re)load
   const img = new Image()
-  e = { img, ready: false }
-  imgCache.set(assetId, e)
-  img.onload = () => { e.ready = true; onReady && onReady() }
+  const e = { img, ready: false, src: asset.src }
+  cache.set(assetId, e)
+  img.onload = () => {
+    // a slow onload can land after the asset was replaced or deleted; only
+    // the entry still current in the cache may resolve — a stale echo must
+    // neither write itself back nor trigger a redraw
+    if (cache.get(assetId) !== e) return
+    e.ready = true
+    onReady && onReady()
+  }
   img.src = asset.src
   return null
 }
