@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "es5",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "module": "esnext",
+    "baseUrl": "./src",
+    "removeComments": true,
+    "declarationDir": "types",
+    "sourceMap": true,
+    "outDir": "dist",
+    "moduleResolution": "node",
+    "emitDeclarationOnly": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "emitDecoratorMetadata": true,
+    "strictPropertyInitialization": false,
+    "preserveConstEnums": true,
+    "declaration": true,
+    "noImplicitAny": true,
+    "jsx": "react",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "typeRoots": [
+      "node_modules/@types",
+      "dist/types.d.ts"
+    ],
+    "paths": {
+      "@/*": ["lib/*"],
+      "@model/*": ["lib/models/*"],
+      "@enum/*": ["lib/enums/*"],
+      "@svg/*": ["lib/svg/*"],
+      "@decorator/*": ["lib/decorators/*"],
+      "@style/*": ["scss/*"],
+
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": [
+    "dist",
+    "examples",
+    "node_modules",
+    "src/**/*.test.tsx",
+    "src/**/*.stories.tsx"
+  ]
+}

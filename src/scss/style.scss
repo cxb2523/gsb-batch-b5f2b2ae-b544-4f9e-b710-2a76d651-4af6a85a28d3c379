@@ -1,0 +1,238 @@
+@use "lib";
+
+.multi-select-enable {
+  .seatmap-svg {
+    .stage {
+      .blocks {
+        .block {
+          cursor: crosshair;
+          .masks {
+            .venue-level-mask {
+
+            }
+            .block-level-mask {
+
+            }
+            .seat-level-mask {
+              cursor: crosshair!important;
+            }
+          }
+          .seats {
+            .seat {
+              cursor: crosshair;
+              &.selected {
+                cursor: crosshair;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+.seatmap-svg {
+  position: relative;
+  width: 100%;
+  height: 100%;
+
+  &.zoom-level-SEAT {
+    .stage {
+      .blocks {
+        .block {
+          .masks {
+            .venue-level-mask {
+
+            }
+            .block-level-mask {
+
+            }
+            .seat-level-mask {
+              cursor: none;
+            }
+          }
+        }
+      }
+    }
+  }
+  &.zoom-level-BLOCK {
+    .stage {
+      .blocks {
+        .block {
+          .masks {
+            .venue-level-mask {
+
+            }
+            .block-level-mask {
+
+            }
+            .seat-level-mask {
+              cursor: none;
+            }
+          }
+        }
+      }
+    }
+  }
+  &.zoom-level-VENUE {
+    .stage {
+      .blocks {
+        .block {
+          filter: drop-shadow(0px 0px 10px rgba(0, 0, 0, 0.61));
+          &:hover {
+            transform: scale(1.02);
+            filter: drop-shadow(0px 0px 14px rgba(0, 0, 0, 0.70));
+          }
+          .masks {
+            .venue-level-mask {
+
+            }
+            .block-level-mask {
+
+            }
+            .seat-level-mask {
+              cursor: none;
+            }
+          }
+        }
+      }
+
+    }
+  }
+
+  .zoom-out-bg {
+    cursor: zoom-out;
+    fill: transparent;
+
+  }
+  .stage {
+    .blocks {
+      .block {
+        cursor: pointer;
+        transition-property: transform, filter;
+        transition-duration: 0.17s;
+        transition-timing-function: ease-in-out;
+        filter: drop-shadow(0px 0px 3px rgba(0, 0, 0, 0));
+        .bounds {
+          .block-hull-border {
+            stroke-linejoin: round;
+            opacity: 0.5;
+          }
+          .block-hull {
+            stroke-linejoin: round;
+            cursor: move;
+          }
+        }
+        .masks {
+          .venue-level-mask {
+            @include lib.trans();
+            stroke-linejoin: round;
+            opacity: 1;
+
+          }
+          .block-level-mask {
+            @include lib.trans();
+            stroke-linejoin: round;
+            opacity: 0.7;
+          }
+          .seat-level-mask {
+            @include lib.trans();
+            stroke-linejoin: round;
+            opacity: 0;
+          }
+          .bound-hide {
+            @include lib.trans();
+            pointer-events: none;
+            opacity: 0;
+          }
+        }
+        .info {
+          .title {
+            text-anchor: middle;
+            dominant-baseline: central;
+            pointer-events: none;
+          }
+        }
+        .seats {
+
+          .seat {
+            cursor: copy;
+            &.selected {
+              cursor: pointer;
+            }
+            &.not-salable {
+              cursor: not-allowed;
+              opacity: 0.7;
+            }
+            .label-text {
+              text-anchor: middle;
+              dominant-baseline: central;
+            }
+          }
+        }
+        .labels {
+          .label {
+            circle {
+              stroke: rgba(0, 0, 0, .2);
+            }
+            .label-text {
+              text-anchor: middle;
+              dominant-baseline: central;
+            }
+          }
+        }
+        .zoom-layers-container {
+          .zoom-layer-hull {
+            stroke-width: 80px;
+            stroke-linejoin: round;
+          }
+        }
+        .block-info {
+          .block-text {
+          }
+        }
+      }
+      @media (any-pointer: coarse) {
+        .search-circle {
+          display: none;
+        }
+      }
+    }
+    .search-circle {
+      opacity: 0;
+      @include lib.trans(0.2s, 0);
+      .circle {
+        fill: rgba(0, 0, 0, 0);
+        pointer-events: none;
+        stroke: rgba(0, 0, 0, 0.4);
+        @include lib.stroke-width(4)
+      }
+      &.hide {
+        @include lib.trans(0.2s, 0);
+        opacity: 0;
+
+      }
+      &.show {
+        @include lib.trans(0.2s, 0);
+        opacity: 1;
+      }
+
+    }
+
+  }
+  .zoom-out-button {
+
+  }
+  .legend {
+    .legend-item {
+      circle {
+        stroke: #adadad;
+        @include lib.stroke-width(1);
+      }
+      text {
+        text-anchor: start;
+        dominant-baseline: central;
+      }
+    }
+  }
+}
