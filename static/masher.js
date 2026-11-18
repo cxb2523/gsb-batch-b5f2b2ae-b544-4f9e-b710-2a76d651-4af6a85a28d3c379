@@ -38,27 +38,42 @@ if (descElement) {
 }
 
 // ========== EMSCRIPTEN ==========
+// Single source of truth for playback state:
+//   playing === true  -> exactly one live audioCtx + scriptNode, button shows "playing"
+//   playing === false -> no audio resources, button shows "play"
 var playing = false;
-var gotError;
-var audioCtx = false;
-var scriptNode;
+var gotError = false;
+var audioCtx = null;
+var scriptNode = null;
 
-var cleanupStopAudio = function() {
-	if (audioCtx) {
-		audioCtx.suspend();
-		audioCtx.close();
+// Tear down the whole audio graph of the previous playback round.
+// Safe to call when nothing is playing and safe to call repeatedly.
+var teardownAudio = function() {
+	var oldNode = scriptNode;
+	var oldCtx = audioCtx;
+	// Drop the references first so an onaudioprocess callback already in
+	// flight and any rapid re-entry can never touch the dead graph.
+	scriptNode = null;
+	audioCtx = null;
+	if (oldNode) {
+		try { oldNode.onaudioprocess = null; } catch (e) {}
+		try { oldNode.disconnect(); } catch (e) {}
 	}
-	audioCtx = false;
+	if (oldCtx) {
+		try { oldCtx.close(); } catch (e) {}
+	}
 }
 
-var initStartAudio = function () {
-	audioCtx = new AudioContext({sampleRate: 44100});
-	// buf size, input channels, outpout channels
-	scriptNode = audioCtx.createScriptProcessor(4096, 0, 1);
-	console.log(scriptNode.bufferSize);
-	scriptNode.onaudioprocess = function(evt) {
+var createAudioGraph = function(numChannels) {
+	var ctx = new AudioContext({sampleRate: 44100});
+	// A context can start suspended until the user gesture is acknowledged.
+	if (ctx.state === "suspended")
+		ctx.resume();
+	var node = ctx.createScriptProcessor(4096, 0, numChannels);
+	var processFn = numChannels === 2 ? sporthem_process_stereo : sporthem_process;
+	node.onaudioprocess = function(evt) {
 		var num_frames = evt.outputBuffer.length;
-		var ptr = sporthem_process(num_frames);
+		var ptr = processFn(num_frames);
 		if (!ptr) return;
 		var num_channels = evt.outputBuffer.numberOfChannels;
 		for (var chidx = 0; chidx < num_channels; chidx++) {
@@ -68,57 +83,61 @@ var initStartAudio = function () {
 			}
 		}
 	}
-	scriptNode.connect(audioCtx.destination);
+	node.connect(ctx.destination);
+	audioCtx = ctx;
+	scriptNode = node;
 }
 
-var initStartAudioStereo = function () {
-	audioCtx = new AudioContext({sampleRate: 44100});
-	// buf size, input channels, outpout channels
-	scriptNode = audioCtx.createScriptProcessor(4096, 0, 2);
-	console.log(scriptNode.bufferSize);
-	scriptNode.onaudioprocess = function(evt) {
-		var num_frames = evt.outputBuffer.length;
-		var ptr = sporthem_process_stereo(num_frames);
-		if (!ptr) return;
-		var num_channels = evt.outputBuffer.numberOfChannels;
-		for (var chidx = 0; chidx < num_channels; chidx++) {
-			var ch = evt.outputBuffer.getChannelData(chidx);
-			for (var i = 0; i < num_frames; i++) {
-				ch[i] = HEAPF32[(ptr>>2) + ((num_channels*i)+chidx)]
-			}
-		}
-	}
-	scriptNode.connect(audioCtx.destination);
-}
-
-
-window.masher_stereo = false;
 var play = function () {
-	cleanupStopAudio();
+	if (typeof sporthem_compile !== "function")
+		return; // WASM runtime not ready yet
+	// 1. fully shut down the previous audio context and script processor
+	teardownAudio();
+	playing = false;
+	playButton.classList.remove("playing");
+	// 2. compile the new script. The wasm function returns 0 even on
+	//    failure; the only reliable signal is printErr setting gotError
+	//    synchronously during the call (see Module.printErr below).
 	gotError = false;
-	playButton.classList.add("playing");
 	sporthem_compile(editor.getValue().replace(/\t/g , " "));
-	parseParams();
-	if (editor.getValue().startsWith('# stereo'))
-		initStartAudioStereo();
-	else
-		initStartAudio();
-	playing = true;
-};
-var stop = function() {
-	if (playing) {
-		cleanupStopAudio();
+	if (gotError) {
+		// 3. never enter the playing state, and make sure nothing was left behind
+		teardownAudio();
 		playing = false;
 		playButton.classList.remove("playing");
+		return;
 	}
+	parseParams();
+	// 4. only now create and start the new audio graph
+	try {
+		if (editor.getValue().startsWith('# stereo'))
+			createAudioGraph(2);
+		else
+			createAudioGraph(1);
+	} catch (e) {
+		teardownAudio();
+		playing = false;
+		playButton.classList.remove("playing");
+		showError(e.message || String(e));
+		return;
+	}
+	playing = true;
+	playButton.classList.add("playing");
+};
+var stop = function() {
+	if (!playing)
+		return;
+	teardownAudio();
+	playing = false;
+	playButton.classList.remove("playing");
 };
 var Module = {
 	print: function(text) {
 	},
 	printErr: function(text) {
-		showError(text);
 		gotError = true;
-		playButton.classList.remove("playing");
+		showError(text);
+		stop();
 	},
 	onRuntimeInitialized: function () {
 		cwrap('sporthem_init', 'number')();
@@ -163,6 +182,10 @@ CodeMirror.defineSimpleMode("sporth", {
 });
 var editorArea, editor;
 var lastWord = "";
+// Set while the editor content is replaced programmatically (loading a
+// script from the URL, restoring an autosave) so that such replacements are
+// not mistaken for user edits that should trigger a new autosave.
+var suppressChange = false;
 var tipDiv = document.getElementById("tooltip");
 function updateTooltip() {
 	var cmWord = editor.findWordAt(editor.getCursor());
@@ -210,15 +233,19 @@ if (editorArea != null) {
 	editor.on("cursorActivity", updateTooltip);
 	editor.on("scroll", updateTooltipPos);
 	editor.on("changes", function(cm) {
-		changed = true;
+		if (!suppressChange)
+			changed = true;
 	});
 	editor.setSize("100%", "100%");
 	window.onresize = function() {editor.refresh();};
 }
 var url = new URL(window.location.href);
 var urlScript = url.searchParams.get("script");
-if (url.pathname == "/new" && urlScript != null)
+if (url.pathname == "/new" && urlScript != null) {
+	suppressChange = true;
 	editor.setValue(urlScript);
+	suppressChange = false;
+}
 
 
 // ========== CONTROLS ==========
@@ -264,21 +291,43 @@ if (editor) {
 
 
 // ========== AUTOSAVE ==========
+var AUTOSAVE_KEY = 'AudioMasher_last_patch';
 var restoreLink = document.querySelector('.restore_link');
-window.setInterval(autoSave, 10000);
 var changed = false;
-function autoSave() {
-	if (changed) {
-		localStorage.setItem('AudioMasher_last_patch', editor.getValue());
-		changed = false;
+
+// The restore link is visible exactly while a draft exists in localStorage.
+function refreshRestoreLink() {
+	if (!restoreLink)
+		return;
+	if (localStorage.getItem(AUTOSAVE_KEY) != null)
+		restoreLink.classList.add("on");
+	else
 		restoreLink.classList.remove("on");
-	}
 }
-if (localStorage.getItem('AudioMasher_last_patch') != null)
-	restoreLink.classList.add("on");
+refreshRestoreLink();
+
+// Only real user edits (see the editor "changes" handler) flip `changed`,
+// so a restore or a programmatic load is never overwritten by this timer.
+window.setInterval(function() {
+	if (!editor || !changed)
+		return;
+	localStorage.setItem(AUTOSAVE_KEY, editor.getValue());
+	changed = false;
+	refreshRestoreLink();
+}, 10000);
+
 function restoreAutosave() {
-	editor.setValue(localStorage.getItem('AudioMasher_last_patch'));
-	restoreLink.classList.remove("on");
+	var saved = localStorage.getItem(AUTOSAVE_KEY);
+	if (saved == null || !editor)
+		return;
+	// Replace the editor content without marking it as a user edit: the
+	// restored draft must survive until the user actually types something.
+	suppressChange = true;
+	editor.setValue(saved);
+	suppressChange = false;
+	changed = false;
+	// The draft is still stored, so the link stays visible to match storage.
+	refreshRestoreLink();
 }
 
 
