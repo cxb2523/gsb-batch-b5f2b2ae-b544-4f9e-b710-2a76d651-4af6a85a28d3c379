@@ -44,14 +44,19 @@ export class CacheManager {
  get closeToTray(){return this.value.closeToTray}
  private sync(){this.media.setLimits({maxBytes:toBytes(this.value.limits.maxGiB,1024**3),bytesPerSecond:toBytes(this.value.limits.bandwidthMiB,1024**2)});this.media.setBackgroundGroups(this.value.tasks.map(task=>({id:task.series.id,ids:task.series.episodes.map(e=>e.id),paused:task.paused,priority:task.priority})));this.media.setConcurrency(this.value.concurrency)}
  private async save(value:Settings){const file=path.join(this.profile,'cache-settings.json');try{await writeFile(file+'.tmp',JSON.stringify(value),'utf8');await rename(file+'.tmp',file)}catch{throw new AppError('CACHE_SETTINGS','缓存任务保存失败，请检查磁盘空间及目录权限')}}
- private mutate(fn:(draft:Settings)=>void){const operation=this.pending.then(async()=>{const draft=structuredClone(this.value);fn(draft);await this.save(draft);this.value=draft;this.sync();return this.snapshot()});this.pending=operation.catch(()=>{});return operation}
+ private mutate(fn:(draft:Settings)=>void,deferrable=false){
+  // Migration is an exclusive chain: cache-affecting mutations are rejected
+  // instead of being queued behind it. Neutral metadata may defer to after it.
+  if(this.migrating&&!deferrable)return Promise.reject(new AppError('CACHE_BUSY','缓存正在迁移，请等待完成'));
+  const operation=this.pending.then(async()=>{const draft=structuredClone(this.value);fn(draft);await this.save(draft);this.value=draft;this.sync();return this.snapshot()});this.pending=operation.catch(()=>{});return operation
+ }
  async snapshot():Promise<CacheOverview>{
   let freeBytes=0;try{freeBytes=await this.media.freeBytes()}catch{}
   const history=new Map(this.history().map(item=>[item.seriesId,item]));
   return {directory:this.media.location,freeBytes,usedBytes:this.media.usedBytes,migrating:this.migrating,closeToTray:this.closeToTray,message:this.message,concurrency:this.value.concurrency,limits:{...this.value.limits},bytesPerSecond:this.media.downloadBytesPerSecond,tasks:this.listedTasks().map(task=>({...structuredClone(task),watched:this.watched(task,history),state:this.media.stateFor(task.series.episodes.map(e=>e.id))}))};
  }
  private listedTasks(){return [...this.value.tasks.map(task=>({...task,registered:true})),...this.value.knownSeries.filter(series=>{if(this.value.tasks.some(task=>task.series.id===series.id))return false;const ids=series.episodes.map(e=>e.id),state=this.media.stateFor(ids);return state.ready>0||(state.cachedBytes||0)>0||this.media.hasDeletionPending?.(ids)}).map(series=>({series,paused:true,createdAt:0,registered:false}))]}
- remember(series:Series){const clean=cleanSeries(series);return this.mutate(draft=>{draft.knownSeries=[...draft.knownSeries.filter(item=>item.id!==clean.id),clean].slice(-100)})}
+ remember(series:Series){const clean=cleanSeries(series);return this.mutate(draft=>{draft.knownSeries=[...draft.knownSeries.filter(item=>item.id!==clean.id),clean].slice(-100)},true)}
  add(series:Series){const clean=cleanSeries(series);return this.mutate(draft=>{const task=draft.tasks.find(task=>task.series.id===clean.id);if(task){task.series=clean;return}if(draft.tasks.length>=100)throw new AppError('CACHE_LIMIT','最多添加 100 部缓存作品，请先移除已不需要的任务');draft.tasks.push({series:clean,paused:false,createdAt:Date.now(),priority:'normal'})})}
  private watched(task:{series:Series},history:Map<string,Progress>){const last=task.series.episodes.at(-1),progress=history.get(task.series.id);return !!(last&&progress&&progress.episodeId===last.id&&progress.order===last.order&&progress.duration>0&&progress.time/progress.duration>=.95)}
  async action(id:string,action:'pause'|'resume'|'retry'|'remove'|'delete'){
@@ -62,6 +67,7 @@ export class CacheManager {
   return result;
  }
  private deleteTask(id:string){
+  if(this.migrating)return Promise.reject(new AppError('CACHE_BUSY','缓存正在迁移，请等待完成再删除'));
   const operation=this.pending.then(async()=>{
    if(this.migrating)throw new AppError('CACHE_BUSY','缓存正在迁移，请等待完成再删除');
    const draft=structuredClone(this.value);let task=draft.tasks.find(item=>item.series.id===id);if(!task){const series=draft.knownSeries.find(item=>item.id===id);if(series)task={series,paused:true,createdAt:Date.now(),priority:'normal'}}if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');
@@ -81,7 +87,7 @@ export class CacheManager {
  async setConcurrency(value:number){if(![2,4,6].includes(value))throw new AppError('INVALID_INPUT','请选择 2、4 或 6 路并行准备');return this.mutate(draft=>{draft.concurrency=value})}
  async setLimits(value:CacheLimits){const limits=cleanLimits(value);return this.mutate(draft=>{draft.limits=limits})}
  async setPriority(id:string,priority:CachePriority){if(!validId(id)||!validPriority(priority))throw new AppError('INVALID_INPUT','缓存任务优先级无效');return this.mutate(draft=>{const task=draft.tasks.find(item=>item.series.id===id);if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');task.priority=priority})}
- setCloseToTray(enabled:boolean){if(typeof enabled!=='boolean')throw new AppError('INVALID_INPUT','关闭窗口设置无效');return this.mutate(draft=>{draft.closeToTray=enabled})}
+ setCloseToTray(enabled:boolean){if(typeof enabled!=='boolean')throw new AppError('INVALID_INPUT','关闭窗口设置无效');return this.mutate(draft=>{draft.closeToTray=enabled},true)}
  migrate(destination:string){
   if(this.migrating)return Promise.reject(new AppError('CACHE_BUSY','缓存正在迁移，请等待完成'));this.migrating=true;
   const operation=this.pending.then(async()=>{

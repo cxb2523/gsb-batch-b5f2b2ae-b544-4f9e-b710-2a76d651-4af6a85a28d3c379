@@ -106,7 +106,9 @@ export class MediaCache {
   this.pump();
  }
  retryBuffer(ids?:string[]){
-  if(this.closing)return this.bufferState();this.pausedMessage='';if(ids)for(const id of ids)this.failed.delete(id);else this.failed.clear();
+  if(this.closing)return this.bufferState();
+  if(this.suspended)throw new AppError('CACHE_MOVING','正在迁移缓存，请稍后再试');
+  this.pausedMessage='';if(ids)for(const id of ids)this.failed.delete(id);else this.failed.clear();
   if(!ids&&this.window[0]&&!this.entries.has(this.window[0])&&!this.jobs.has(this.window[0]))this.enqueue(this.window[0],false,true);
   this.pump();return this.bufferState();
  }
@@ -142,7 +144,7 @@ export class MediaCache {
  private get concurrency(){return Math.max(1,Math.min(6,this.options.concurrency||1))}
  get downloadConcurrency(){return this.concurrency}
  private cached(id:string){const entry=this.entries.get(id);return entry&&(entry.quality??'auto')===this.quality?entry:undefined}
- setQuality(value:VideoQuality){if(!['auto','1080p','720p','540p','480p','360p'].includes(value))throw new AppError('INVALID_INPUT','画质选项无效');if(value===this.quality)return;this.quality=value;this.failed.clear();this.pausedMessage='';for(const job of this.jobs.values())this.cancel(job);this.pump()}
+ setQuality(value:VideoQuality){if(!['auto','1080p','720p','540p','480p','360p'].includes(value))throw new AppError('INVALID_INPUT','画质选项无效');if(this.suspended)throw new AppError('CACHE_MOVING','正在迁移缓存，请稍后再切换画质');if(value===this.quality)return;this.quality=value;this.failed.clear();this.pausedMessage='';for(const job of this.jobs.values())this.cancel(job);this.pump()}
  setLimits(value:{maxBytes:number;bytesPerSecond:number}){if(!value||!Number.isSafeInteger(value.maxBytes)||value.maxBytes<0||!Number.isSafeInteger(value.bytesPerSecond)||value.bytesPerSecond<0)throw new AppError('INVALID_INPUT','缓存额度或限速无效');const changed=this.maxBytes!==value.maxBytes;this.maxBytes=value.maxBytes;this.limiter.setRate(value.bytesPerSecond);if(changed&&this.pausedMessage.includes('缓存额度')){this.pausedMessage='';this.pump()}}
  setConcurrency(value:number){
   if(![2,4,6].includes(value))throw new AppError('INVALID_INPUT','请选择 2、4 或 6 路并行准备');
@@ -211,9 +213,12 @@ export class MediaCache {
   if(nested(source,target)||nested(target,source))throw new AppError('CACHE_PATH','新旧缓存目录不能相互包含');
   this.suspended=true;const copied:string[]=[];
   try{
-   const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);await Promise.allSettled(pending.map(job=>job.completion??job.promise));
+   // Exclusive chain: cancel in-flight tasks, then wait for download handles to
+   // close, transcode children to exit and temporary files to be cleaned.
+   await this.quiesce();
    await mkdir(target,{recursive:true});if((await readdir(target)).length)throw new AppError('CACHE_PATH','目标专用缓存文件夹不是空文件夹，请选择其他位置');
    const info=await statfs(target);if(info.bavail*info.bsize<this.usedBytes+SPACE_RESERVE+2*FILE_LIMIT*this.concurrency)throw new AppError('DISK_SPACE','目标磁盘空间不足，原缓存及目录设置未更改');
+   const observed=await this.cacheFileNames(source);
    const hash=async(file:string)=>{const digest=createHash('sha256');for await(const chunk of createReadStream(file))digest.update(chunk);return digest.digest('hex')};
    for(const entry of this.entries.values())for(const suffix of ['.mp4','.json']){
     if(this.closing)throw cancelled();const from=path.join(source,entry.key+suffix),to=path.join(target,entry.key+suffix);
@@ -224,10 +229,31 @@ export class MediaCache {
     if(this.closing)throw cancelled();const from=path.join(source,file),to=path.join(target,file);const exists=await stat(from).catch(()=>null);if(!exists)continue;
     await copyFile(from,to,constants.COPYFILE_EXCL);copied.push(to);if(await hash(from)!==await hash(to))throw new AppError('CACHE_VERIFY','断点文件校验失败，继续使用原目录');
    }
+   if(this.closing)throw cancelled();
+   // A new partial or checkpoint in the source means a task survived the freeze;
+   // the copy would be incomplete, so fail and roll back instead of committing.
+   const current=await this.cacheFileNames(source);
+   if([...current].some(name=>!observed.has(name))||this.jobs.size||this.activeJobs.size)throw new AppError('CACHE_VERIFY','迁移期间原缓存目录出现新的分片或检查点，已回滚并保留原缓存');
    if(this.closing)throw cancelled();await commit();this.directory=target;
    for(const entry of this.entries.values())entry.file=path.join(target,entry.key+'.mp4');
   }catch(error){for(const file of copied)await unlink(file).catch(()=>{});if(error instanceof AppError)throw error;throw new AppError('CACHE_MOVE','缓存迁移失败，原缓存及目录设置未更改，请检查目标目录权限和空间')}
   finally{this.suspended=false;this.pump()}
+ }
+ // Cancel every job and wait until downloads, transcode children and temporary
+ // file cleanup have fully unwound. New work cannot start while suspended.
+ private async quiesce(){
+  for(let round=0;round<10;round++){
+   const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];
+   if(!pending.length)break;
+   for(const job of pending)this.cancel(job);
+   await Promise.allSettled(pending.map(job=>job.completion??job.promise));
+  }
+  // Processing slots must be released before copying; releases happen inside the
+  // job unwinding awaited above, so this loop normally exits immediately.
+  for(let n=0;n<200&&(this.processing>0||this.processingQueue.length);n++)await new Promise(resolve=>setTimeout(resolve,5));
+ }
+ private async cacheFileNames(directory:string){
+  return new Set((await readdir(directory)).filter(name=>/^[a-f0-9]{32}(?:\.partial|\.working|\.input)?\.(?:mp4|json)$/.test(name)));
  }
  private pump(){
   if(this.closing||this.suspended)return;
