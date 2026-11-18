@@ -11,11 +11,10 @@ import { images } from '../data/images.js'
 import {
   daysSinceJ2000, msFromDays, moonLongitude, moonLatitude, nextSolarEclipses,
 } from '../data/astro.js'
+import { createSolarSim, DEFAULT_SPEED } from './solarSim.js'
 
 const A = '#ffb938'
 const DEG = Math.PI / 180
-/* page-load instant — the simulation epoch and "today" for the eclipse list */
-const NOW_MS = Date.now()
 
 /* Visual model: distances/sizes compressed for the screen, motion uses real
    J2000 mean longitudes + mean motions so positions track the actual sky. */
@@ -76,7 +75,7 @@ function Planet({ p, sim }) {
   const group = useRef()
   const moon = useRef()
   useFrame(() => {
-    const t = sim.current.t
+    const t = sim.t
     group.current.position.set(...planetPos(p, t))
     if (moon.current) {
       const lam = moonLongitude(t) * DEG
@@ -140,51 +139,55 @@ const SPEEDS = [
 ]
 
 export default function SolarSystem() {
-  const sim = useRef({ t: daysSinceJ2000(NOW_MS), speed: 7, target: null })
-  const [speed, setSpeed] = useState(7)
-  const [dateMs, setDateMs] = useState(NOW_MS)
+  /* Mount instant — the simulation epoch and "today" for the eclipse list.
+     Computed per mount so leaving /solar and returning re-initializes from
+     the real current time instead of a stale module-level constant. */
+  const [nowMs] = useState(() => Date.now())
+  const [ctrl] = useState(() => createSolarSim(nowMs))
+  const { sim } = ctrl
+  const [speed, setSpeed] = useState(DEFAULT_SPEED)
+  const [dateMs, setDateMs] = useState(nowMs)
   const [eclipse, setEclipse] = useState(null)      // arrived-at eclipse (card shown)
   const [seeking, setSeeking] = useState(false)
-  const pending = useRef(null)
 
   useEffect(() => {
-    const id = setInterval(() => setDateMs(msFromDays(sim.current.t)), 120)
-    return () => clearInterval(id)
-  }, [])
+    const id = setInterval(() => setDateMs(msFromDays(sim.t)), 120)
+    return () => {
+      clearInterval(id)
+      ctrl.dispose() // release any in-flight fast-forward so nothing outlives the page
+    }
+  }, [ctrl, sim])
 
-  const setSpd = (v) => { sim.current.speed = v; sim.current.target = null; setSpeed(v); setSeeking(false) }
+  /* Manual speed/pause: cancels any fast-forward, drops the pending result
+     and any shown card, and re-enables the Predict button. */
+  const setSpd = (v) => {
+    ctrl.setSpeed(v)
+    setSeeking(false)
+    setEclipse(null)
+    setSpeed(v)
+  }
 
   const predict = () => {
-    const e = nextSolarEclipses(sim.current.t + 0.5, 1)[0]
-    pending.current = e
-    sim.current.target = e.t
-    setEclipse(null)
-    setSeeking(true)
+    if (ctrl.predict()) { // no-op while a fast-forward is already in flight
+      setEclipse(null)
+      setSeeking(true)
+    }
   }
 
   /* Advances simulated time; eases toward sim.target when fast-forwarding */
   const onTick = useCallback((delta) => {
-    if (sim.current.target != null) {
-      const remaining = sim.current.target - sim.current.t
-      const step = Math.min(Math.max(remaining * 2.2 * delta, 4 * delta), 130 * delta)
-      if (remaining <= step + 1e-4) {
-        sim.current.t = sim.current.target
-        sim.current.target = null
-        sim.current.speed = 0
-        setEclipse(pending.current)
-        setSeeking(false)
-        setSpeed(0)
-      } else {
-        sim.current.t += step
-      }
-    } else {
-      sim.current.t += sim.current.speed * delta
+    const arrived = ctrl.tick(delta)
+    if (arrived) {
+      setEclipse(arrived)
+      setSeeking(false)
+      setSpeed(0)
+      setDateMs(msFromDays(sim.t)) // land the date display on the target now
     }
-  }, [])
+  }, [ctrl, sim])
 
   const resume = () => { setEclipse(null); setSpd(7) }
 
-  const upcoming = useMemo(() => nextSolarEclipses(daysSinceJ2000(NOW_MS), 6), [])
+  const upcoming = useMemo(() => nextSolarEclipses(daysSinceJ2000(nowMs), 6), [nowMs])
 
   return (
     <div className="site" style={{ background: '#04060f' }}>
@@ -292,7 +295,7 @@ export default function SolarSystem() {
                 <div className={`ecl-row ${i === 0 ? 'next' : ''}`}>
                   <div className="ecl-when">
                     <strong>{fmtDate(e.dateMs)}</strong>
-                    <span>in {Math.max(1, Math.round((e.dateMs - NOW_MS) / 86400000))} days</span>
+                    <span>in {Math.max(1, Math.round((e.dateMs - nowMs) / 86400000))} days</span>
                   </div>
                   <div className={`ecl-type ${e.type.toLowerCase()}`}>{e.type}</div>
                   <div className="ecl-meta">
