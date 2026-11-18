@@ -1,0 +1,149 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+This file is not shipped in the npm package — the tarball root is `lib/`, which carries
+`README_NPM.md` as its readme.
+
+## [2.3.0]
+
+### Added
+
+-   `TSurfaceFromConfig` type, which maps a Builder API config type to its surface type.
+
+### Changed
+
+-   `SciChartDeclarative` infers the surface type passed to its callbacks from the `type` of the
+    `config` object (3D, pie, polar or 2D). A JSON string config gives the base surface type, and an
+    explicit type argument still works.
+
+### Fixed
+
+-   When `onInit` throws, the surface is now deleted, its `destructor` is called and the error goes
+    to `onInitError`, as with a failed init function. Previously the surface was never deleted.
+-   An init error handled by `onInitError`, of the chart or of its group, no longer also surfaces as
+    an unhandled promise rejection.
+
+## [2.2.0]
+
+### Added
+
+-   `SciChartReact` (and so `SciChartDeclarative` and `SciChartNestedOverview`) adds the
+    `scichart_initialized` class to its element once its chart is initialized, and
+    `scichart_rendered` once the chart has also rendered at least once. Its new `onRendered`
+    callback is called at that point.
+-   `ChartGroupLoader` does the same for the whole group, with `scichart_group_initialized` and
+    `scichart_group_rendered`, and forwards a new `onRendered` callback. `SciChartGroup` accepts
+    `onRendered` too.
+-   The class names can be overridden per state with the `stateClassNames` prop. The defaults are
+    exported as `defaultChartStateClassNames` and `defaultGroupStateClassNames`, and their type as
+    `IStateClassNames`.
+-   The init function may return a `destructor` along with the surface. It is called on
+    unmount, even if the init function has not resolved yet, before the surface is deleted.
+-   `onRendered` may return a cleanup function, like `onInit`.
+
+### Changed
+
+-   `onInit` is now always called while the fallback is still shown and before the children are
+    mounted. Apps mounted with `ReactDOM.render` previously got it after the fallback was removed.
+-   `onRendered` is now always called after the fallback has been removed and the children are
+    mounted.
+
+### Fixed
+
+-   `SciChartGroup` no longer passes a `null` init result to `onInit` and `onDelete` when a chart,
+    such as a nested overview, joins the group in the same render that initialized it.
+
+## [2.1.0]
+
+Built and verified against `scichart` 6.0.13.
+
+### Added
+
+-   `TChartGroupLoaderProps` is exported, matching every other component's props type.
+
+### Changed
+
+-   `scichart` peer dependency raised to `>=6.0.13`.
+-   `configureSciChartDefaults()` no longer resets `wasmUrl` to `"/scichart.wasm"` once the app has
+    configured wasm loading itself (`SciChartSurface.configure(...)`, `loadWasmFromCDN()`,
+    `loadWasmLocal()`). It still resets the loader and aspect defaults.
+-   The defaults module now imports `scichart/Charting/Visuals/sciChartConfig`. A bundler alias that
+    maps `scichart` to the package folder (`path.resolve("node_modules/scichart")`) bypasses the
+    package's `exports` map and can no longer resolve it; point the alias at `scichart/esm` instead.
+-   Surfaces returned from `initChart` are always marked as externally lifecycle-managed; the
+    guard for cores without the flag is gone now that the peer floor includes it.
+
+### Fixed
+
+-   The import-time `wasmUrl: "/scichart.wasm"` default could overwrite the app's own
+    `SciChartSurface.configure(...)` when chart code is lazy-loaded and `configureDefaults` is
+    evaluated after it. The default is now applied only while `SciChartSurface.isWasmConfigured`
+    is false, so the app's configuration wins in either order.
+-   `SciChartMemoryDebugWrapper` rendered its children inside a `position: fixed` box, which
+    collapsed percentage-based sizing and put anything below the fold out of reach of scrolling.
+    The controls are `sticky` now and the children render in normal flow.
+
+## [2.0.0]
+
+The 2.0 line targets SciChart.js v6 and is built and verified against `scichart` 6.0.1.
+
+### Breaking
+
+-   **`scichart` peer dependency is now v6+.** The engine ships one union `scichart.wasm` instead of
+    the `scichart2d.wasm` / `scichart3d.wasm` pair, and there are no more `.data` files. The WASM
+    payload to deploy is the whole `_wasm` **directory**, not a single file. Apps staying on
+    scichart 3.x–5.x should stay on scichart-react 1.x. When upgrading the core library, the
+    `scichart-migrate` codemod automates the renames.
+-   **The `config` prop moved to the new `SciChartDeclarative` component.** Replace
+    `<SciChartReact config={...} />` with `<SciChartDeclarative config={...} />` — one JSX rename,
+    all other props identical. `SciChartReact` now requires `initChart` and throws a pointer error
+    if it receives `config`.
+-   **`SciChartOverview` no longer mirrors** palette providers, animations or data labels onto the
+    overview's mini series. Set them on the overview series explicitly if you relied on that.
+-   **The Builder API registers nothing on import.** Since SciChart v6, types used by a JSON config
+    must be registered explicitly (`registerNumericAxis`, `registerXyDataSeries`, …), or via the
+    `registerAllTypes()` escape hatch. `SciChartDeclarative` calls `registerAllTypes()` internally,
+    so declarative users are unaffected.
+
+### Added
+
+-   `SciChartDeclarative` — the JSON-config component split out of `SciChartReact`.
+-   `configureSciChartDefaults` — the import-time global defaults, now also callable directly and
+    importable as `scichart-react/configureDefaults`.
+-   Exported types `IChartComponentPropsCore`, `TChartComponentPropsWithInit` and
+    `TChartComponentPropsWithConfig`.
+-   `SciChartMemoryDebugWrapper` gained a `defaultRenderChildren` prop, so the children can be
+    rendered on the first render instead of waiting for the checkbox. Its props are now typed
+    rather than `any`.
+
+### Changed
+
+-   **Dual ESM/CJS output** with an `exports` map, a `module` entry and subpath deep imports
+    (`scichart-react/SciChartGroup`), replacing the single flat CommonJS build.
+-   **`sideEffects` narrowed** to `configureDefaults.js` only, so bundlers can drop everything a
+    consumer does not import. An `initChart`-only bundle no longer drags in the Builder.
+-   `"use client"` directives added, so the components work in React Server Component setups.
+-   `react` peer dependency raised to `>=16.14.0`.
+-   Each surface returned from `initChart` is marked as externally lifecycle-managed, which
+    suppresses the core's "root detached before delete" and "surface already deleted"
+    memory-debug warnings. Both are expected here: the component removes the chart root before
+    the asynchronous delete, and a surface can be deleted twice (the nested overview). The flag
+    is only set when the core exposes it, so this is inert against scichart 6.0.1 and takes
+    effect with the core release that adds it.
+
+### Deprecated
+
+-   `TChartComponentProps` — use `TChartComponentPropsWithInit` or `TChartComponentPropsWithConfig`.
+
+## [1.0.0]
+
+First stable release of the 1.x line, targeting SciChart.js 3.x–5.x.
+
+[2.2.0]: https://github.com/ABTSoftware/scichart-react/releases/tag/v2.2.0
+[2.1.0]: https://github.com/ABTSoftware/scichart-react/releases/tag/v2.1.0
+[2.0.0]: https://github.com/ABTSoftware/scichart-react/releases/tag/v2.0.0
+[1.0.0]: https://github.com/ABTSoftware/scichart-react/releases/tag/v1.0.0

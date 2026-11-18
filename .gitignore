@@ -1,0 +1,28 @@
+node_modules
+/.idea
+/lib
+/storybook-static
+/demos/react18/*/build
+/demos/react18/basic/node_modules
+/demos/react16/node_modules
+/demos/features/*/node_modules
+/demos/features/*/build
+/demos/features/*/types
+packageNPM.json
+# wasm copied next to an entry point by a demo's build step - the v5 pair and its .data
+# files, plus the v6 core and the side modules it loads beside it
+scichart*.wasm
+scichart2d.data
+scichart3d.data
+# bundle-check harness artifacts
+/bundle-check/node_modules
+/bundle-check/build
+/bundle-check/dist
+/bundle-check/reports
+# playwright
+/playwright-report
+/test-results
+/blob-report
+# only CI's Linux baselines are committed; other platforms' runs stay local
+/tests/__screenshots__/*
+!/tests/__screenshots__/linux/

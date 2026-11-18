@@ -1,0 +1,39 @@
+{
+    // Check-only base config (IDE, `npm run tsc`, storybook editor experience).
+    // Emit happens via tsconfig.cjs.json / tsconfig.esm.json / tsconfig.types.json (see `buildJs`).
+    "compilerOptions": {
+        /* Language and Environment */
+        "target": "es6",
+        "jsx": "react-jsx",
+
+        /* Modules */
+        "module": "commonjs",
+        "typeRoots": ["./node_modules/@types"],
+        // Types for deep imports such as "scichart/Charting/Visuals/sciChartConfig". The package
+        // maps them through its exports field ("./*" -> types/*.d.ts), which the classic "node"
+        // resolution used here does not read. Type resolution only: emitted specifiers are unchanged.
+        "paths": { "scichart/*": ["./node_modules/scichart/types/*"] },
+
+        /* JavaScript Support */
+        "allowJs": true,
+        "checkJs": true,
+
+        /* Emit */
+        "noEmit": true,
+
+        /* Interop Constraints */
+        // required so the generated barrel and every module stay safe under single-file transpilers (babel/esbuild/swc)
+        "isolatedModules": true,
+        "allowSyntheticDefaultImports": true,
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+
+        /* Type Checking */
+        "strict": true,
+
+        /* Completeness */
+        "skipLibCheck": true
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules", ".storybook", "build", "storybook-static", "demos", "lib"]
+}

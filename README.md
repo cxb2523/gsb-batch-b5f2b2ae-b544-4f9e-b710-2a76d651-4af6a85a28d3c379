@@ -1,0 +1,305 @@
+# SciChart.React - Official React Component Wrapper for SciChart.js: High Performance [JavaScript Chart Library](https://www.scichart.com/javascript-chart-features/)
+
+scichart-react is the official React component for SciChart.js. See [React charts](https://www.scichart.com/react-charts/) for features and benchmarks, the [100+ React chart demos with source code](https://www.scichart.com/demo/react), and the [React tutorials](https://www.scichart.com/documentation/js/current/get-started/tutorials-react/tutorial-01-setting-up-project-with-scichart-react/).
+
+SciChart.React requires core [SciChart.js](https://www.npmjs.com/package/scichart) package to work and uses it as a peer dependency.
+
+The SciChartReact itself is MIT licensed, find the core library licensing info at [https://www.scichart.com/licensing-scichart-js/](https://www.scichart.com/licensing-scichart-js/).
+
+## What does SciChart.React do?
+
+-   Neatly wraps up the lifecycle of SciChart.js into a React component to ensure proper initialisation and memory cleanup.
+-   Provides a number of ways to configure a chart (via JSON config or initialization function)
+-   Can be used to create complex dashboards linking multiple charts, for example:
+    -   [Server Traffic Dashboard](https://www.scichart.com/demo/react/server-traffic-dashboard)
+    -   [Oil and Gas Dashboard](https://www.scichart.com/demo/react/oil-and-gas-dashboard-showcase)
+    -   [Semiconductors Dashboard](https://www.scichart.com/demo/react/semiconductors-dashboard)
+    -   [Polar Gauge FIFO Dashboard](https://www.scichart.com/demo/react/polar-gauge-fifo-dashboard)
+    -   [Multiple Chart Dashboard Performance Demo](https://www.scichart.com/demo/react/multiple-chart-dashboard-performance-demo)
+
+## Getting Started
+
+### Prerequisites
+
+-   `react` 16.14+
+-   `scichart` 6.0.13+ — for scichart 3.x-5.x use scichart-react 1.x
+
+### Installing
+
+```
+npm install scichart scichart-react
+```
+
+### Loading required WASM dependencies
+
+SciChart.js requires WebAssembly binaries to work. Since v6 the engine is modular — a core plus
+side modules it loads at runtime — so the payload is the whole `_wasm` **directory**, not a single
+file: the core (`scichart.wasm`, with `scichart-nosimd.wasm` and `scichart-64.wasm` picked per
+browser capability) is fetched for every chart, and `scichart-charting3d.wasm` for the first 3D
+chart. The library fetches them asynchronously at runtime, resolving each module relative to the
+configured `wasmUrl`, so copy the directory rather than naming individual files.
+
+```js
+// webpack — copy the directory so a new variant or module never breaks the build
+new CopyPlugin({ patterns: [{ from: "node_modules/scichart/_wasm/", to: "" }] });
+```
+
+Find detailed info at [Deploying Wasm Docs](https://www.scichart.com/documentation/js/current/2d-charts/surface/deploying-wasm/)
+
+By default scichart-react applies the equivalent of:
+
+```typescript
+SciChartSurface.configure({
+    wasmUrl: "/scichart.wasm"
+});
+```
+
+The core's own default is the page-relative `"scichart.wasm"`, which resolves to a different file on every route of a single-page app. The default is applied at import time by the `configureSciChartDefaults` module, which is bundled whenever your app uses the chart components.
+
+It is applied only while your app has not configured wasm loading itself (`SciChartSurface.configure(...)`, `loadWasmFromCDN()`, `loadWasmLocal()`), so your configuration wins whichever module is evaluated first.
+
+### Using
+
+There are two chart components:
+
+-   **`SciChartReact`** — takes an initialization function via the `initChart` prop. This is the primary component for code-first apps and produces the smallest bundles.
+-   **`SciChartDeclarative`** — takes a chart definition (object or JSON string) via the `config` prop and creates the chart with the [Builder API](https://www.scichart.com/documentation/js/current/2d-charts/builder-api/builder-api-overview/). The Builder API is only bundled by apps that use this component. It registers every built-in chart type, so any definition works with no setup.
+
+#### With Initialization Function (SciChartReact)
+
+Pass a function which should create a surface on the provided root element and resolve to it.
+
+```tsx
+import {
+    MouseWheelZoomModifier,
+    NumericAxis,
+    SciChartSurface,
+    SplineMountainRenderableSeries,
+    XyDataSeries,
+    ZoomExtentsModifier,
+    ZoomPanModifier
+} from "scichart";
+import { SciChartReact } from "scichart-react";
+
+// Call loadWasmFromCDN once before SciChart.js is initialised to load Wasm files from our CDN
+// Alternative methods for serving and resolving wasm are available on our website
+SciChartSurface.loadWasmFromCDN();
+
+function App() {
+    return (
+        <SciChartReact
+            style={{ width: 800, height: 600 }}
+            initChart={async function (rootElement) {
+                const { sciChartSurface, wasmContext } = await SciChartSurface.create(rootElement);
+
+                const xAxis = new NumericAxis(wasmContext);
+                const yAxis = new NumericAxis(wasmContext);
+
+                sciChartSurface.xAxes.add(xAxis);
+                sciChartSurface.yAxes.add(yAxis);
+
+                sciChartSurface.renderableSeries.add(
+                    new SplineMountainRenderableSeries(wasmContext, {
+                        dataSeries: new XyDataSeries(wasmContext, {
+                            xValues: [1, 2, 3, 4],
+                            yValues: [1, 4, 7, 3]
+                        }),
+                        fill: "#3ca832",
+                        stroke: "#eb911c",
+                        strokeThickness: 4,
+                        opacity: 0.4
+                    })
+                );
+
+                sciChartSurface.chartModifiers.add(
+                    new ZoomPanModifier({ enableZoom: true }),
+                    new MouseWheelZoomModifier(),
+                    new ZoomExtentsModifier()
+                );
+
+                return { sciChartSurface };
+            }}
+        />
+    );
+}
+```
+
+#### With Config (SciChartDeclarative)
+
+Alternatively, pass a config object that will be used to generate a chart via the [Builder API](https://www.scichart.com/documentation/js/current/2d-charts/builder-api/builder-api-overview/).
+
+```tsx
+import { EAxisType, EChart2DModifierType, ESeriesType, SciChartSurface } from "scichart";
+import { SciChartDeclarative } from "scichart-react";
+
+// Call loadWasmFromCDN once before SciChart.js is initialised to load Wasm files from our CDN
+// Alternative methods for serving and resolving wasm are available on our website
+SciChartSurface.loadWasmFromCDN();
+
+function App() {
+    return (
+        <SciChartDeclarative
+            style={{ width: 800, height: 600 }}
+            config={{
+                xAxes: [{ type: EAxisType.NumericAxis }],
+                yAxes: [{ type: EAxisType.NumericAxis }],
+                series: [
+                    {
+                        type: ESeriesType.SplineMountainSeries,
+                        options: {
+                            fill: "#3ca832",
+                            stroke: "#eb911c",
+                            strokeThickness: 4,
+                            opacity: 0.4
+                        },
+                        xyData: { xValues: [1, 2, 3, 4], yValues: [1, 4, 7, 3] }
+                    }
+                ],
+                modifiers: [
+                    { type: EChart2DModifierType.ZoomPan, options: { enableZoom: true } },
+                    { type: EChart2DModifierType.MouseWheelZoom },
+                    { type: EChart2DModifierType.ZoomExtents }
+                ]
+            }}
+        />
+    );
+}
+```
+
+The surface type in callbacks such as `onInit` follows the `type` of the `config` object: an
+`ESciChartSurfaceType.Default3D` definition gives a `SciChart3DSurface`, with no type argument needed.
+A JSON string config gives the base surface type; name the surface explicitly with
+`<SciChartDeclarative<SciChart3DSurface> config={json} />`.
+
+**NOTE** Make sure that in both cases `initChart` and `config` props do not change, as they should be only used for initial chart render.
+
+## Lifecycle callbacks and cleanup
+
+`SciChartReact` and `SciChartDeclarative` call these synchronous callbacks:
+
+| Callback     | When it is called                                       | Fallback shown | Children mounted |
+| ------------ | ------------------------------------------------------- | -------------- | ---------------- |
+| `onInit`     | the init function has resolved                          | yes            | no               |
+| `onRendered` | the chart is initialized and has rendered at least once | no             | yes              |
+| `onDelete`   | the component is unmounted                              | -              | -                |
+
+`onInit` and `onRendered` may return a cleanup function, called when the component is unmounted.
+
+`onInit` and `onDelete` are not called when the component is unmounted before the init function has
+resolved, so use `onDelete` only for what `onInit` set up.
+
+To release what the init function itself created besides the surface — subscriptions, objects holding
+the surface, timers — return a `destructor` with the surface. It is called on unmount, even if the init
+function has not resolved yet, before the surface is deleted:
+
+```tsx
+<SciChartReact
+    initChart={async rootElement => {
+        const { sciChartSurface } = await SciChartSurface.create(rootElement);
+
+        // ...
+
+        // create something that has to be released, e.g. a subscription
+        const subscription = subscribeToData(sciChartSurface);
+
+        return { sciChartSurface, destructor: () => subscription.unsubscribe() };
+    }}
+/>
+```
+
+On unmount, the steps run in this order:
+
+1. the cleanup returned by `onRendered`, if it was called
+2. the cleanup returned by `onInit`, if it was called
+3. `onDelete`, if `onInit` was called
+4. `destructor`
+5. the surface is deleted, along with everything added to it with `sciChartSurface.addDeletable()`
+
+`ChartGroupLoader` calls its `onInit` while its fallback is still shown, and its `onRendered` once the
+fallback has been removed.
+
+## Type registration (SciChart v6)
+
+A chart definition names its parts as strings — `{ type: "LineSeries" }`. A string cannot pull code
+into a bundle, so since SciChart v6 the Builder API registers nothing on import: the types a
+definition names have to be registered, or building it fails with
+`Nothing registered for RenderableSeries:LineSeries`.
+
+`SciChartDeclarative` handles this for you by registering every built-in type, so any definition
+works with no setup. The trade-off is bundle size: the whole type universe is included, which is
+most of why the `config` approach costs ~205 KB gzip more than an `initChart` chart. If that matters,
+use `SciChartReact` with an `initChart` function — types you construct yourself register
+automatically, because a class registers itself when its module is in your bundle.
+
+You can also use the Builder API directly from an `initChart` function, registering only the types
+your definition names. That keeps the `config` style without bundling the full registry:
+
+```tsx
+import { build2DChart, ESeriesType } from "scichart";
+import type { ISciChart2DDefinition } from "scichart";
+import { registerNumericAxis } from "scichart/Builder/register/axes";
+import { registerSplineMountainSeries } from "scichart/Builder/register/series";
+import { registerXyDataSeries } from "scichart/Builder/register/dataSeries";
+import { SciChartReact } from "scichart-react";
+
+// register the axis type even if the definition omits xAxes/yAxes — the Builder
+// creates the two default axes through the registry
+registerNumericAxis();
+registerSplineMountainSeries();
+registerXyDataSeries();
+
+const definition: ISciChart2DDefinition = {
+    series: [
+        {
+            type: ESeriesType.SplineMountainSeries,
+            xyData: { xValues: [1, 2, 3, 4], yValues: [1, 4, 7, 3] }
+        }
+    ]
+};
+
+function App() {
+    return (
+        <SciChartReact
+            style={{ width: 800, height: 600 }}
+            initChart={async rootElement => await build2DChart(rootElement, definition)}
+        />
+    );
+}
+```
+
+An unregistered type fails with an error naming the register function to call, so the message tells
+you what to add. `registerAllTypes()` from `scichart` is the one-line escape hatch if you would
+rather not maintain the list — that is exactly what `SciChartDeclarative` does internally.
+
+## Migrating from 1.x to 2.0
+
+Upgrading the wrapper means upgrading the core library too, so read
+[Breaking Changes in SciChart.js v6.0 from v5.2](https://www.scichart.com/documentation/js/v6/whats-new/breaking-changes-v5.2-v6.0/)
+alongside this list — it covers the wasm deployment change, the Builder API restructure and the
+type-registration change that the points below depend on. See also
+[What's New in SciChart.js SDK v6.0](https://www.scichart.com/documentation/js/v6/whats-new/sdk-6.0/).
+
+-   **`SciChartOverview` no longer mirrors** palette providers, animations or data labels onto the overview's mini series. Set them on the overview series explicitly if you relied on that.
+-   **`scichart` peer dependency is now v6+** (one union `scichart.wasm` file instead of the `scichart2d.wasm`/`scichart3d.wasm` pair, no more `.data` files). Apps staying on scichart 3.x-5.x should stay on scichart-react 1.x. When upgrading the core library, the `scichart-migrate` codemod automates the renames.
+-   **The `config` prop moved to the new `SciChartDeclarative` component**: replace `<SciChartReact config={...} />` with `<SciChartDeclarative config={...} />` (one JSX rename; all other props are identical). `SciChartReact` now requires `initChart` and throws a pointer error if it receives `config`.
+
+## Useful Links
+
+### Features & benefits
+
+-   [SciChart React charts: features, performance and 100+ demos](https://www.scichart.com/react-charts/)
+
+### Onboarding
+
+-   [React Tutorials](https://www.scichart.com/documentation/js/current/get-started/tutorials-react/tutorial-01-setting-up-project-with-scichart-react/)
+-   [Getting Started Guide](https://scichart.com/getting-started/scichart-javascript/)
+-   [100+ React Chart Demos](https://www.scichart.com/demo/react)
+-   [SciChart.js Documentation](https://www.scichart.com/documentation/js/current/intro/)
+-   [Component API (Storybook)](https://abtsoftware.github.io/scichart-react/?path=/docs/example-scichartreact--docs)
+-   [CodePen, JSFiddle support](https://www.scichart.com/blog/codepen-codesandbox-and-jsfiddle-support-in-scichart-js/)
+
+### Support
+
+-   [Community forums](https://scichart.com/questions)
+-   [Stackoverflow tag](https://stackoverflow.com/tags/scichart)
+-   [Contact Us (Technical support or sales)](https://scichart.com/contact-us)

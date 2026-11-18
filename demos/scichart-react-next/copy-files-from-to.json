@@ -1,0 +1,12 @@
+{
+    "copyFilesSettings": {
+        "whenFileExists": "overwrite"
+    },
+    "copyFiles": [
+        {
+            "from": "./node_modules/scichart/_wasm/*.wasm",
+            "to": "./public/",
+            "toFlat": true
+        }
+    ]
+}
