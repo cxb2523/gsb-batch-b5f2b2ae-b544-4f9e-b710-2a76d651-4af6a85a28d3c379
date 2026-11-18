@@ -312,16 +312,24 @@ function ThreeSceneSpriteInternal({
 
   const hitAreaRef = useRef<IHitArea | null>(null);
   const spriteRef = useRef<Sprite | null>(null);
+  // Latest logical size and resolution; hit-area normalization reads these so
+  // a resize takes effect without recreating the wrapper or the sprite
+  const sizeRef = useRef({ width, height, resolution });
   // Last attached mesh hit per live or captured pointer;
   // captured drags off that mesh extend its plane
   const lastHitsRef = useLazyRef(() => new Map<number, Mesh>());
+
+  // A new size rebuilds the render target at new pixel dimensions, so demand
+  // mode must render one frame to repaint it instead of waiting for input
+  useEffect(() => {
+    invalidate();
+  }, [width, height, resolution, invalidate]);
 
   // Single owner: create on mount / renderer change, destroy + null the ref
   // on cleanup. StrictMode/Activity effects-remounts destroy and recreate
   // within the same commit, so consumers never observe a destroyed sprite.
   useLayoutEffect(() => {
     const sprite = createSprite(app.renderer);
-    sprite.setSize(width, height);
     sprite.hitArea = hitAreaRef.current;
     spriteRef.current = sprite;
     // Request a frame to populate the ExternalSource: it starts at 1x1, and
@@ -333,10 +341,21 @@ function ThreeSceneSpriteInternal({
         sprite.destroy({ texture: true, textureSource: true });
       }
     };
-    // Size is re-applied on every texture update, so width/height changes
-    // must not recreate the sprite
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [app.renderer]);
+  }, [app.renderer, invalidate]);
+
+  // Keep the live sprite's display size tied to the latest props, and publish
+  // the size for hit-area normalization. The render target and ExternalSource
+  // change pixel dimensions separately; this keeps the sprite at logical
+  // width/height so the texture never looks stretched, without recreating the
+  // sprite itself. Declared after creation so mount sizing runs on the live
+  // sprite.
+  useLayoutEffect(() => {
+    sizeRef.current = { width, height, resolution };
+    const sprite = liveSprite(spriteRef);
+    if (sprite) {
+      sprite.setSize(width, height);
+    }
+  }, [width, height, resolution]);
 
   // Adopt the sprite into the (possibly remounted) container on every commit
   useLayoutEffect(() => {
@@ -353,8 +372,8 @@ function ThreeSceneSpriteInternal({
       return;
     }
     (sprite.texture.source as ExternalSource).updateGPUTexture(texture);
-    // Re-sync the scale: texture.orig tracks the render target's pixel size
-    // (width/height/resolution), and setSize no-ops when nothing changed
+    // The new GPU texture drives the source's pixel size; re-assert the
+    // logical display size so scale matches the current width/height
     sprite.setSize(width, height);
   }
 
@@ -443,7 +462,9 @@ function ThreeSceneSpriteInternal({
     // Keep the hit area in a ref so a recreated sprite can restore it
     hitAreaRef.current = hitArea && {
       contains(x: number, y: number): boolean {
-        // Local coords span the texture's pixel size (width * resolution)
+        // Local coords span the texture's pixel size (width * resolution);
+        // read the latest size so resizes update hit testing at once
+        const { width, height, resolution } = sizeRef.current;
         return hitArea.contains(
           x / width / resolution,
           y / height / resolution,

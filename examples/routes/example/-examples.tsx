@@ -39,6 +39,11 @@ export const EXAMPLES: readonly ExampleMeta[] = [
     description: "Save power on mobile devices",
   },
   {
+    label: "Scene Resize",
+    to: "/example/scene-resize",
+    description: "Sprite, texture and hit area resize together",
+  },
+  {
     label: "Context Bridge",
     to: "/example/context-bridge",
     description: "Textures redraw only for contexts they read",
