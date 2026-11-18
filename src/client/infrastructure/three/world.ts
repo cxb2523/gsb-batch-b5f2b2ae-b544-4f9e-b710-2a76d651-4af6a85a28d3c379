@@ -18,6 +18,7 @@ import type { StandupLine } from '../../domain/views.ts';
 import { Avatar, rand, type Goal } from './avatar.ts';
 import { mergeParts, takeParts } from './mergeStatics.ts';
 import { clearOf, findPath, nearestFree, passingPush } from './pathfinding.ts';
+import { convergeOnGrid, convergePositions, doorArrival, doorSlot } from './relayout.ts';
 import { isModalOpen } from './playerControls.ts';
 import { buildItemMesh, codeTexture, screenOn, screenIdle, screenOff, screenHeld } from './furniture.ts';
 
@@ -59,7 +60,7 @@ const SPOT_CLEARANCE = 0.75;
 const SLIP_PAST_MS = 2500;
 const COVERED_FRAME_MS = 200;
 const GTAO_LOOK = { radius: 0.45, distanceExponent: 1.5, thickness: 1, scale: 1.1 };
-const POSITIONS_KEY = 'agent-office:positions';
+export const POSITIONS_KEY = 'agent-office:positions';
 const POSITIONS_SAVE_MS = 2000;
 
 export class World {
@@ -108,15 +109,15 @@ export class World {
   playerInfo?: { name?: string; color?: string };
   perf?: { time: number; frames: number; slow: number };
   /** Idle spots (a sofa seat, a bed, a place in front of the coffee machine) held by one avatar each. */
-  private readonly spotClaims = new Map<string, string>();
+  readonly spotClaims = new Map<string, string>();
   /** Where each claimed spot is: two items' spots can lie side by side, and nobody stands in someone else's place. */
-  private readonly claimedPoints = new Map<string, { x: number; z: number }>();
+  readonly claimedPoints = new Map<string, { x: number; z: number }>();
   /** Since when two avatars have been pressed together, by pair. */
-  private readonly contacts = new Map<string, number>();
+  readonly contacts = new Map<string, number>();
   t: Translate = createT(DEFAULT_LOCALE);
 
   /** GitHub visitors at the door, by visitor id. */
-  private readonly visitors = new Map<string, Avatar>();
+  readonly visitors = new Map<string, Avatar>();
   private visitorList: Visitor[] = [];
   private morale: Record<string, number> = {};
   private weather: Weather = 'clear';
@@ -131,6 +132,8 @@ export class World {
   private positionsJson = '';
   private positionsSavedAt = 0;
   private storage?: KeyValueStorage;
+  /** True while setOffice() is rebuilding: no frame may write stale pre-rebuild coordinates into the cache. */
+  private rebuilding = false;
 
   constructor(container: HTMLElement, { storage, ...callbacks }: WorldCallbacks) {
     this.container = container;
@@ -233,6 +236,8 @@ export class World {
   setOffice(office: Office) {
     const first = !this.office;
     const sizeChanged = !first && (office.width !== this.office.width || office.depth !== this.office.depth);
+    // A rebuild is one state-convergence transaction: frames in between must not persist old coordinates.
+    this.rebuilding = true;
     this.office = structuredClone(office);
     const { width: W, depth: D } = office;
     const oldRoot = this.root.position.clone();
@@ -274,30 +279,87 @@ export class World {
     Object.assign(this.sun.shadow.camera, { left: -r, right: r, top: r, bottom: -r, near: 1, far: 80 });
     this.sun.shadow.camera.updateProjectionMatrix();
 
+    // Rebuild the solid grid first, so every convergence step below reasons about the NEW layout.
     this.rebuildItems();
+    // The old idle-point claims and contact records describe furniture that no longer exists: drop them all.
+    this.resetOccupancy();
     if (first) {
       this.camera.position.set(m * 0.42, m * 0.72, m * 0.82);
       this.controls.target.set(0, 0, 0);
-    } else if (sizeChanged) {
-      // When the office grows the root is re-centered; shift the camera the same amount so the view does not jump
-      const shift = this.root.position.clone().sub(oldRoot);
-      this.camera.position.add(shift);
-      this.controls.target.add(shift);
-    }
-    for (const av of this.allAvatars()) {
-      av.goalKey = '';
-      av.idleGoal = null;
-      if (av.x > W || av.z > D) av.group.position.set(W / 2, 0, D - 0.5);
-      // When the layout changes, step out to the nearest free cell if inside an item/wall
-      const cx = Math.floor(av.x), cz = Math.floor(av.z);
-      if (this.grid[cz * W + cx]) {
-        const free = nearestFree(this.grid, W, D, cx, cz);
-        if (free) av.group.position.set(free[0] + 0.5, 0, free[1] + 0.5);
+    } else {
+      if (sizeChanged) {
+        // When the office grows the root is re-centered; shift the camera the same amount so the view does not jump.
+        const shift = this.root.position.clone().sub(oldRoot);
+        this.camera.position.add(shift);
+        this.controls.target.add(shift);
       }
-      av.path = [];
+      // New furniture can cover the orbit target even without a size change: keep it on a walkable cell.
+      this.keepCameraOnFloor();
     }
-    if (!this.player) this.spawnPlayer();
+    // Everyone (agents and the player if already spawned) leaves their old plans and is lifted out of any new obstacle.
+    for (const av of this.allAvatars()) this.resetMovement(av);
+    convergeOnGrid(
+      this.allAvatars(),
+      this.office.items, W, D,
+      (av, x, z) => av.group.position.set(x, 0, z),
+    );
+    // The first build spawns the player at their seat; keep that spawn walkable in the current grid too.
+    if (!this.player) {
+      this.spawnPlayer();
+      const player: Avatar = this.player;
+      convergeOnGrid([player], this.office.items, W, D, (av, x, z) => av.group.position.set(x, 0, z));
+    }
+    // Visitors re-queue against the new entrance; their scene objects are reconciled (added/dismissed) here too.
     this.setVisitors(this.visitorList);
+    // On a rebuild the cache is rewritten from the coordinates roles hold AFTER convergence. On the very first build
+    // the agents have not been attached yet (setAgents follows setOffice), so the restored cache must be left alone.
+    if (!first) {
+      this.positions = convergePositions(
+        this.allAvatars().map(av => ({ id: av.id, x: av.x, z: av.z })),
+        this.office.items, W, D,
+      );
+      this.positionsJson = JSON.stringify(this.positions);
+      this.storage?.set(POSITIONS_KEY, this.positionsJson);
+    }
+    this.rebuilding = false;
+  }
+
+  /** Clears every idle-spot claim and avatar contact left over from the previous layout. */
+  private resetOccupancy() {
+    this.spotClaims.clear();
+    this.claimedPoints.clear();
+    this.contacts.clear();
+    for (const av of this.allAvatars()) av.spot = null;
+  }
+
+  /** Forgets the routes and idle/errand goals tied to the old floor; the next decide() re-chooses on the new grid. */
+  private resetMovement(av: Avatar) {
+    this.releaseSpot(av);
+    av.goalKey = '';
+    av.goal = null;
+    av.path = [];
+    av.idleGoal = null;
+    av.idleUntil = 0;
+    av.emojiShown = false;
+    av.errand = null;
+    av.running = false;
+    av.visit = null;
+  }
+
+  /** After a resize the orbit target can sit inside a new wall; pull it to the nearest walkable cell center. */
+  private keepCameraOnFloor() {
+    const { width: W, depth: D } = this.office;
+    const p = this.root.worldToLocal(this.controls.target.clone());
+    const cx = Math.max(0, Math.min(W - 1, Math.floor(p.x))), cz = Math.max(0, Math.min(D - 1, Math.floor(p.z)));
+    if (!this.grid[cz * W + cx]) return;
+    const free = nearestFree(this.grid, W, D, cx, cz);
+    if (!free) return;
+    const local = new THREE.Vector3(free[0] + 0.5, 0, free[1] + 0.5);
+    const world = this.root.localToWorld(local);
+    const delta = world.sub(this.controls.target);
+    delta.y = 0;
+    this.controls.target.add(delta);
+    this.camera.position.add(delta);
   }
 
   rebuildItems() {
@@ -735,16 +797,38 @@ export class World {
       let av = this.visitors.get(v.id);
       if (!av) {
         av = new Avatar({ id: VISITOR_PREFIX + v.id, name: `${v.kind === 'pr' ? 'PR' : 'Issue'} #${v.number}`, color: v.kind === 'pr' ? '#8b5cf6' : '#f59e0b', kind: 'visitor', status: 'idle' }, () => this.t);
-        av.group.position.set(W / 2 + rand(-0.5, 0.5), 0, D - 0.4);
+        const at = doorArrival(W, D, rand(-0.5, 0.5));
+        av.group.position.set(at.x, 0, at.z);
         av.group.rotation.y = Math.PI;
         this.visitors.set(v.id, av);
         this.agentGroup.add(av.group);
       }
       av.setAgent({ ...av.agent, sign: `${v.kind === 'pr' ? '🔀' : '🐞'} ${v.title.slice(0, 48)}` });
-      // They queue up beside the entrance, alternating sides
-      const side = i % 2 ? -1 : 1, slot = Math.floor(i / 2);
-      av.home = this.spotNear(W / 2 + side * (2.2 + slot * 0.8), D - 0.7, { face: Math.PI, key: 'door' });
+      // They queue up beside the entrance; the slot always follows the CURRENT office size.
+      const slot = doorSlot(W, D, i);
+      av.home = this.spotNear(slot.x, slot.z, { face: Math.PI, key: 'door' });
+      // During a rebuild the old route was planned against the old grid: force a fresh one on the new grid.
+      if (this.rebuilding) {
+        av.goalKey = '';
+        av.path = [];
+        av.leaving = undefined;
+      }
     });
+    if (this.rebuilding) {
+      // A visitor already walking out keeps leaving, but its exit point and route are re-derived on the new grid.
+      for (const av of this.visitors.values()) {
+        if (!av.leaving) continue;
+        av.leaving = this.spotNear(this.office.width / 2, this.office.depth - 0.3, { key: 'leave' });
+        av.goalKey = '';
+        av.path = [];
+      }
+    }
+    // The new layout may have grown a wall under a leaving/waiting visitor: lift them onto the nearest walkable cell.
+    convergeOnGrid(
+      [...this.visitors.values()],
+      this.office.items, W, D,
+      (av, x, z) => av.group.position.set(x, 0, z),
+    );
   }
 
   private dismissVisitor(id: string, av: Avatar, v?: Visitor) {
@@ -1102,8 +1186,18 @@ export class World {
     return free ? [free[0] + 0.5, free[1] + 0.5] : null;
   }
 
-  private savePositions() {
-    for (const av of this.allAvatars()) this.positions[av.id] = [Math.round(av.x * 100) / 100, Math.round(av.z * 100) / 100];
+  /** Persists the current floor positions; skips solid/out-of-bounds cells and any in-flight rebuild. */
+  savePositions() {
+    // During a rebuild the avatars still hold the previous layout's coordinates until setOffice()
+    // converges them; writing here would persist stale (possibly solid-cell) positions over the new cache.
+    if (this.rebuilding) return;
+    for (const av of this.allAvatars()) {
+      // Only walkable cells of the current office are cached.
+      const { width: W, depth: D } = this.office;
+      const cx = Math.floor(av.x), cz = Math.floor(av.z);
+      if (cx < 0 || cz < 0 || cx >= W || cz >= D || this.grid[cz * W + cx]) continue;
+      this.positions[av.id] = [Math.round(av.x * 100) / 100, Math.round(av.z * 100) / 100];
+    }
     const json = JSON.stringify(this.positions);
     if (json === this.positionsJson) return;
     this.positionsJson = json;
@@ -1130,7 +1224,7 @@ export class World {
     const t = this.clock.elapsedTime;
     const now = performance.now();
     this.adaptQuality(rawDt);
-    if (this.office && now - this.positionsSavedAt > POSITIONS_SAVE_MS) { this.positionsSavedAt = now; this.savePositions(); }
+    if (this.office && !this.rebuilding && now - this.positionsSavedAt > POSITIONS_SAVE_MS) { this.positionsSavedAt = now; this.savePositions(); }
     if (this.office) {
       for (const av of this.avatars.values()) {
         const goal = this.decide(av, now);
