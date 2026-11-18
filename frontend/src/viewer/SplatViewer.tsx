@@ -16,7 +16,13 @@ import {
   sceneYawForDevice,
 } from '../device/levelling';
 import type { StereoSettings, ViewerHandle } from '../types';
-import { computeOffAxisFrustum, computeStereoEye, effectiveBaseline, sanitizeEye } from './off-axis';
+import { computeStereoEye, effectiveBaseline } from './off-axis';
+import {
+  TrackedEyeGuard,
+  clampedBaseline,
+  eyeViewports,
+  planStereoRig,
+} from './stereo-rig';
 import {
   apexDistance,
   computeTrueWindowPlacement,
@@ -341,6 +347,10 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
   captureAspectHintRef.current = captureAspectHint;
   const subjectDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
   const anchorDistanceRef = useRef(DEFAULT_SUBJECT_DISTANCE);
+  // Head input can carry NaN or a lost-face reading. The guard keeps the last
+  // accepted eye and replays it for an invalid sample instead of building a
+  // degenerate frustum or throwing inside the render path.
+  const eyeGuardRef = useRef(new TrackedEyeGuard());
   const splatEntityRef = useRef<pc.Entity | null>(null);
   const assetRef = useRef<pc.Asset | null>(null);
   const orbitRef = useRef<OrbitState>(createOrbitState());
@@ -424,7 +434,6 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
 
     const width = app.graphicsDevice.width || 1;
     const height = app.graphicsDevice.height || 1;
-    const aspect = width / height;
 
     const tangent = captureTangentRef.current;
     // The whole head position is mapped so that a comfortable holding distance
@@ -451,15 +460,20 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
     // x motion. DeviceOrientation identifies the former, so it can be removed
     // without changing Reverse tracking, which is already correct for the
     // latter. Photo mode uses the same reference frame while Hold level is on.
-    const eye = sanitizeEye(eyeInYawReferenceFrame(
+    const candidate = eyeInYawReferenceFrame(
       gravityReferencedEye,
       pose.deviceYaw ?? 0,
-    ));
+    );
+    // Reject non-finite or in-front-only failures and replay the previous eye,
+    // so a single bad tracker frame cannot crash the frame or skew the view
+    // volume. A finite but implausible distance is clamped inside the guard.
+    const accepted = eyeGuardRef.current.update(candidate);
+    if (!accepted) return;
+    const eye = accepted.eye;
     // The window's size comes from the placement: it is whatever the
     // photograph's own field of view fills, seen from the calibrated eye. The
     // scene is fitted behind it when it loads.
     const halfHeight = windowHalfHeightRef.current;
-    const halfWidth = halfHeight * aspect;
 
     // The rig stays square to the window. True Window fuses the eye above into
     // the Hold-level reference frame. Scene attitude is resolved per axis:
@@ -488,25 +502,61 @@ export const SplatViewer = forwardRef<ViewerHandle, Props>(function SplatViewer(
       ),
     );
 
+    const settings = stereoRef.current;
+    const sbs = settings.mode === 'sbs';
+    // Each eye draws into its own half of the buffer in side-by-side, and into
+    // the whole buffer in mono. The halves are the same size, so one vertical
+    // field of view and one baseline serve both eyes.
+    const viewports = eyeViewports(width, height, sbs);
+    // Reach far enough to clear the scene from wherever the eye now is.
+    const farClip = Math.max(1000, eye.z * 4 + 1000);
+    // The pixel clamp is measured in one eye's current viewport width, so the
+    // baseline has to be recomputed here rather than remembered from an older
+    // window size. It caps the far-field separation only; near pop-out is
+    // unaffected.
+    const baseline = sbs
+      ? clampedBaseline({
+        baseline: settings.baseline,
+        compression: settings.compression,
+        clampPx: settings.clampPx,
+        eyeViewport: viewports.left,
+        // The virtual window is the zero-parallax plane: its points land on
+        // top of one another in both eyes by construction.
+        zeroParallaxDistance: eye.z,
+        // The window height sets the vertical field of view; the per-eye aspect
+        // then sets the horizontal extent, shared by both eyes.
+        fovYDeg: 2 * Math.atan(halfHeight / eye.z) * 180 / Math.PI,
+      })
+      : 0;
+
+    const stereoRig = planStereoRig({
+      centre: eye,
+      stereo: sbs,
+      baseline,
+      windowHalfHeight: halfHeight,
+      viewports,
+      near: eyes[0]?.camera?.nearClip ?? 0.05,
+      far: farClip,
+    });
+
     eyes.forEach((entity, index) => {
       const camera = entity.camera;
       if (!camera) return;
-      camera.enabled = index === 0;
+      camera.enabled = sbs || index === 0;
       if (!camera.enabled) return;
-      camera.rect = new pc.Vec4(0, 0, 1, 1);
+      const eyeRig = index === 0 ? stereoRig.left : stereoRig.right;
+      // Only the half of the frame each eye is drawn into is swapped. Swapping
+      // the eye positions instead would flip the sign of every off-axis shift
+      // and put the whole scene behind the screen, mirrored; this leaves the
+      // geometry alone and just exchanges where the two pictures land.
+      const rect = sbs && settings.swapLR
+        ? (index === 0 ? viewports.right.rect : viewports.left.rect)
+        : eyeRig.viewport.rect;
+      camera.rect = new pc.Vec4(rect.x, rect.y, rect.z, rect.w);
       // The window is at the origin, so the eye sits in front of it at eye.z.
-      entity.setLocalPosition(eye.x, eye.y, eye.z);
-      // Reach far enough to clear the scene from wherever the eye now is.
-      camera.farClip = Math.max(1000, eye.z * 4 + 1000);
-      const frustum = computeOffAxisFrustum({
-        eyeX: eye.x,
-        eyeY: eye.y,
-        eyeZ: eye.z,
-        screenHalfWidth: halfWidth,
-        screenHalfHeight: halfHeight,
-        near: camera.nearClip,
-        far: camera.farClip,
-      });
+      entity.setLocalPosition(eyeRig.position.x, eyeRig.position.y, eyeRig.position.z);
+      camera.farClip = farClip;
+      const frustum = eyeRig.frustum;
       camera.calculateProjection = (projectionMatrix: pc.Mat4) => {
         projectionMatrix.setFrustum(
           frustum.left, frustum.right, frustum.bottom, frustum.top, frustum.near, frustum.far);

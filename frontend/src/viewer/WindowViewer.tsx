@@ -315,6 +315,15 @@ export function WindowViewer() {
   // Two controls for the projection itself, so the difference can be judged on
   // a device rather than argued about. See HeadPose#trueWindow and #pushBack.
   const [trueWindow, setTrueWindow] = useState(true);
+  // Side-by-side stereo: the same head-tracked window rendered for two eyes
+  // with one shared vertical field of view. Off by default, since the ordinary
+  // phone page is monoscopic; switched on for a stereoscopic display or viewer.
+  const [sbs, setSbs] = useState(false);
+  // Eye separation in window units (one unit is half the screen height). The
+  // far-field clamp is in pixels of one eye's half-width viewport, and is
+  // recomputed against the live viewport whenever the window changes size.
+  const STEREO_BASELINE = 0.12;
+  const STEREO_CLAMP_PX = 20;
   // Sliding the miniature back settles how it sits behind the glass and how
   // wide it swings when a finger turns it; 25 mm was chosen on a device for
   // that. It does not make the scene look deeper -- moving a whole scene away
@@ -1000,13 +1009,13 @@ export function WindowViewer() {
           <SplatViewer
             ref={viewerRef}
             plyUrl={sceneUrl}
-            mode="mono"
-            baseline={0}
+            mode={sbs ? 'sbs' : 'mono'}
+            baseline={STEREO_BASELINE}
             fovDeg={geometry.viewing.verticalFovDeg}
             zeroParallaxMode="pivot"
             zeroParallaxDistance={geometry.viewing.baselineEyeZ}
             compression={1}
-            clampPx={0}
+            clampPx={STEREO_CLAMP_PX}
             swapLR={false}
             headPose={pose}
             captureTangentHint={captureProjection?.captureTangent}
@@ -1135,6 +1144,11 @@ export function WindowViewer() {
           title="Build the view from where your eye actually is. Faces stop stretching toward the edges; the frame is cropped with depth, as a window crops it."
           onClick={toggleTrueWindow}>
           True window {trueWindow ? 'on' : 'off'}
+        </button>
+        <button type="button" className={sbs ? 'on' : ''}
+          title="Draw the head-tracked window as a side-by-side stereo pair: both eyes share the vertical field of view and differ only by horizontal parallax, with the far-field separation clamped per eye viewport."
+          onClick={() => setSbs((v) => !v)}>
+          Side-by-side {sbs ? 'on' : 'off'}
         </button>
         <button type="button" className={pushMm ? 'on' : ''}
           title="Slide the whole miniature further behind the glass. More of it fits and it swings less when you turn it, at the cost of apparent size. It does not make the scene deeper."
