@@ -23,19 +23,15 @@ export const filterByName = (name) => (list) =>
 
 /**
  * Get the maximum counter of the objects with the given name.
+ * The counter is the full trailing number of the name, so it works
+ * also for counters greater than 9.
  * @param {Array} list
  * @returns {Number} The highest counter of the given list
  */
-export const getMaxCounter = (list) => list.map((item) => item.name[item.name.length - 1]).reduce((a, b) => (a > b ? a : b), 0);
+export const getMaxCounter = (list) =>
+  list.reduce((max, item) => {
+    const match = /(\d+)$/.exec(item.name || "");
+    return match ? Math.max(max, parseInt(match[1], 10)) : max;
+  }, 0);
 
 export const filterObjectByName = (name) => (list) => list.filter((item) => item.objectName.startsWith(name));
-
-export const groupByMeasure = (array, key) => {
-  return array.reduce(function (r, a, i) {
-    if (!i || r[r.length - 1][0][key].substring(0, 8) !== a[key].substring(0, 8)) {
-      return r.concat([[a]]);
-    }
-    r[r.length - 1].push(a);
-    return r;
-  }, []);
-};

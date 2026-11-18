@@ -15,8 +15,9 @@ import { TrackballControls } from "three/examples/jsm/controls/TrackballControls
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { CSS2DRenderer } from "three/examples/jsm/renderers/CSS2DRenderer.js";
 import { setLoading } from "../features/loading/loadingSlice";
-import { filterObjectByName, filterStartsWithName, getMaxCounter, groupByMeasure } from "../utils/common-utils";
-import { createLabel, createLabelMeasure } from "../utils/functions/objectLabel";
+import { filterObjectByName, filterStartsWithName, getMaxCounter } from "../utils/common-utils";
+import { createLabel } from "../utils/functions/objectLabel";
+import { createMeasureLabel, getMeasureGroupName, getMeasureNumber, groupMeasureObjects } from "../utils/functions/measureUtils";
 import { setOpenMeausurePanel } from "../features/measurements/measurementsSlice";
 import { setCommentCounter, setMeasureCounter, setPlaneCounter, setScrewCounter } from "../features/counters/countersSlice";
 import { negativeVector } from "../utils/functions/objectCalc";
@@ -161,33 +162,23 @@ export const useCreateScene = () => {
   const recreateScene = async (scene, group, objects) => {
     const loader = new THREE.ObjectLoader();
 
-    let measureGroups = [];
-
-    const measureGroupsSorted = filterObjectByName("Measure")(objects).sort(function (a, b) {
-      if (a.objectName < b.objectName) {
-        return -1;
-      }
-      if (b.objectName < a.objectName) {
-        return 1;
-      }
-      return 0;
-    });
-
-    measureGroups = groupByMeasure(measureGroupsSorted, "objectName");
+    // Groups the saved measure objects by measure, sorted by measure number
+    const measureGroups = groupMeasureObjects(filterObjectByName("Measure")(objects));
 
     if (measureGroups.length > 0) {
+      // The counter continues from the highest saved measure index,
+      // so the numbering stays sequential also with more than 9 measures
+      let maxMeasureNumber = 0;
+
       for (const measureGroup of measureGroups) {
-        // Define two points to calculate the distance
-        let point1 = new THREE.Vector3();
-        let point2 = new THREE.Vector3();
+        const groupName = getMeasureGroupName(measureGroup[0].objectName);
+        const measureNumber = getMeasureNumber(groupName);
+        maxMeasureNumber = Math.max(maxMeasureNumber, measureNumber);
+
         // Create a 3D group for each measure
         const groupMeasure = new THREE.Group();
-        groupMeasure.name = measureGroup[0].objectName;
+        groupMeasure.name = groupName;
         scene.add(groupMeasure);
-
-        // Save the counter for the measure name
-        const measureCounter = measureGroup[0].objectName.slice(-1);
-        dispatch(setMeasureCounter(Number(measureCounter)));
 
         for (const measure of measureGroup) {
           const object = await loader.loadAsync(ENDPOINT + measure.objectPath).catch((error) => {
@@ -197,20 +188,24 @@ export const useCreateScene = () => {
           groupMeasure.add(object);
         }
 
-        // set the points with the position of the point objects of the measure
-        point1 = groupMeasure.children.filter((item) => item.name.includes("start"))[0].position;
-        point2 = groupMeasure.children.filter((item) => item.name.includes("end"))[0].position;
+        // The start and end points of the measure define the distance
+        const startPoint = groupMeasure.children.find((item) => item.name === groupName + "start");
+        const endPoint = groupMeasure.children.find((item) => item.name === groupName + "end");
 
-        const distance = point1.distanceTo(point2).toFixed(2);
+        if (startPoint && endPoint) {
+          const distance = startPoint.position.distanceTo(endPoint.position);
 
-        // create the label with the distance
-        for (const mesh of groupMeasure.children) {
-          if (mesh.type === "LineSegments") {
-            mesh.children = [];
-            createLabelMeasure(mesh, distance, measureCounter, point1, point2);
+          // Recreate the label with the same rule used for a new measure
+          for (const mesh of groupMeasure.children) {
+            if (mesh.type === "LineSegments") {
+              mesh.children = [];
+              mesh.add(createMeasureLabel(groupName, measureNumber, distance, startPoint.position, endPoint.position));
+            }
           }
         }
       }
+
+      dispatch(setMeasureCounter(maxMeasureNumber));
       dispatch(setOpenMeausurePanel(true));
     }
 
