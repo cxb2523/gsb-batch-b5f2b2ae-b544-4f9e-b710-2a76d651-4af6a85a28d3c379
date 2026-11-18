@@ -192,6 +192,7 @@ test("a chart's onInit throwing in ChartGroupLoader deletes the chart and report
     await settle(page);
 
     expect(await getSteps(page)).toEqual(["onInit", "destructor", "surface deleted", "group onInitError"]);
+    // the failed chart leaves the group; with no charts left there is nothing to initialize or render
     await expect(page.getByTestId("fallback")).toBeVisible();
     expect(pageErrors).toEqual([]);
 });

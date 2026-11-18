@@ -218,6 +218,13 @@ On unmount, the steps run in this order:
 `ChartGroupLoader` calls its `onInit` while its fallback is still shown, and its `onRendered` once the
 fallback has been removed.
 
+The group tracks its current set of charts: each time a chart is added or removed, the group callbacks
+(`onInit`, `onRendered`, `onDelete`) can fire once more for the new set, but never twice for the same
+set of charts. A chart whose initialization throws is removed from the group and reported through
+`onInitError`, so it does not keep the fallback up forever — the remaining charts still initialize and
+render the group. Likewise, unmounting a chart before it has initialized makes the group stop waiting
+for it. When every chart leaves, the group returns to its initial, not-initialized state.
+
 ## Type registration (SciChart v6)
 
 A chart definition names its parts as strings — `{ type: "LineSeries" }`. A string cannot pull code

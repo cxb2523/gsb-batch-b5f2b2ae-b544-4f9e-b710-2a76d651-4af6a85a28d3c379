@@ -23,8 +23,7 @@ const STORIES_THAT_ANIMATE = new Set([
 
 /** Never finish loading on purpose; settled once their overlay shows this text */
 const STORIES_THAT_STAY_LOADING = new Map([
-    ["example-scichartreact--chart-with-fallback", "Loading..."],
-    ["example-chartgrouploader--custom-chart-group-loader", "This is a custom Error Message"]
+    ["example-scichartreact--chart-with-fallback", "Loading..."]
 ]);
 
 /** Opens a story in isolation and waits until every chart in it has rendered */

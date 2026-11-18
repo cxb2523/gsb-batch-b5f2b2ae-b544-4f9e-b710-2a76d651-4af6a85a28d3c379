@@ -9,7 +9,8 @@ export type TGroupChartState = { isInitialized: boolean; isRendered: boolean; in
 type TSciChartGroupContext = {
     groupInitialized: boolean;
     groupRendered: boolean;
-    charts: Map<any, TGroupChartState>;
+    /** the current members and their states; mutate it only through the callbacks below */
+    charts: ReadonlyMap<any, TGroupChartState>;
     addChartToGroup: (chart: any, isInitialized: boolean, initResult: IInitResult | null) => void;
     setChartRendered: (chart: any) => void;
     removeChartFromGroup: (chart: any) => void;

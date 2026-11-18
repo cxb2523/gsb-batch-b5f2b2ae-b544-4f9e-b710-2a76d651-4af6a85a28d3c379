@@ -131,6 +131,10 @@ export function useChartLifecycle<TSurface extends ISciChartSurfaceBase, TInitRe
                     onInitError(error);
                 }
 
+                // A failed initialization can never satisfy the group: leave it so the remaining
+                // charts can still reach the initialized and rendered states and the fallback is removed.
+                groupContext?.removeChartFromGroup(chartId);
+
                 const isHandledByGroup = groupContext?.notifyError(error) ?? false;
 
                 // leave an unhandled error visible unless an onInitError handled it
@@ -181,6 +185,14 @@ export function useChartLifecycle<TSurface extends ISciChartSurfaceBase, TInitRe
 
         return () => {
             rootElement!.removeChild(chartRoot);
+
+            // Init has not settled successfully: this chart can never satisfy the group, so leave it
+            // now instead of keeping the group waiting for a chart that is being unmounted. A settled
+            // init removes itself through performCleanup below, preserving the existing cleanup order.
+            if (!initResultRef.current) {
+                groupContext?.removeChartFromGroup(chartId);
+            }
+
             // wait for init to finish before deleting it; a failed init has nothing left to delete
             initPromise.then(
                 result => result && performCleanup(result),

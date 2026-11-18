@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file is not shipped in the npm package — the tarball root is `lib/`, which carries
 `README_NPM.md` as its readme.
 
+## [Unreleased]
+
+### Fixed
+
+-   A chart whose initialization fails inside a `ChartGroupLoader` is now removed from the group and
+    reported through `onInitError` instead of keeping the group waiting forever: the remaining charts
+    still initialize and render the group and remove the fallback.
+-   Unmounting a chart before its initialization finishes makes the group stop waiting for it.
+-   Group `onInit`, `onRendered` and `onDelete` now fire at most once for each set of charts. Adding
+    or removing charts can fire them again for the new set; previously batched membership changes
+    could fire a callback twice for the same charts, and `onDelete` could report a stale set.
+
 ## [2.3.0]
 
 ### Added
