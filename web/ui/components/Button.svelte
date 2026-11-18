@@ -1,0 +1,23 @@
+<script lang="ts">
+  import clsx from "clsx"
+
+  type Props = {
+    onclick: () => void
+    iconSrc: string
+    altText: string
+    text: string
+    type?: "clear" | "default"
+  }
+  const { onclick, iconSrc, altText, text, type = "default" }: Props = $props()
+</script>
+
+<button
+  class={clsx(
+    "grow-1 active:scale-105 cursor-pointer flex justify-center items-center p-3 min-w-max max-h-fit overflow-hidden shadow text-text-color",
+    type == "clear" ? "bg-clear" : "bg-accent-dark",
+  )}
+  {onclick}
+>
+  <img class="h-8 mx-1" src={iconSrc} alt={altText} />
+  <span class="text-2xl text-center mx-1">{text}</span>
+</button>

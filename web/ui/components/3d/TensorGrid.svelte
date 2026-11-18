@@ -1,0 +1,71 @@
+<script lang="ts">
+  import {
+    TENSOR_FONT_SIZE,
+    TENSOR_TEXT_COLOR,
+    TENSOR_ZOOM_CONSTANT,
+  } from "@constants/graphics"
+  import type { LayerName } from "@constants/mnist"
+  import { Align, Text } from "@threlte/extras"
+  import type { OutputNode } from "bridge"
+  import Tensor2D from "./Tensor2D.svelte"
+
+  type Props = OutputNode & {
+    layerName: LayerName
+    z: number
+    numberOfColumns: number
+    gap: number
+    pointSize: number
+    previousOutputNode: OutputNode | null
+  }
+
+  let {
+    layerName,
+    z,
+    pointSize,
+    numberOfColumns,
+    gap,
+    dimension,
+    activationMaps,
+    previousOutputNode,
+  }: Props = $props()
+
+  const tensorWidth = dimension[2] * TENSOR_ZOOM_CONSTANT * pointSize
+
+  /**
+    Calculate midpoint for rendering ActivationMap's name
+    because <Align> isn't working for <Text> 🤷
+   */
+  const rightBound = gap * (numberOfColumns / 2)
+  const leftBound = gap * (numberOfColumns / 2 - 1) + tensorWidth
+  const midPoint = rightBound + (leftBound - rightBound) / 2
+</script>
+
+<Align x={0} y={0} z={false}>
+  <Text
+    position={[midPoint, 3, z]}
+    text={layerName}
+    color={TENSOR_TEXT_COLOR}
+    fontSize={TENSOR_FONT_SIZE}
+    anchorX="center"
+    anchorY="bottom"
+  />
+  {#each { length: dimension[1] }, i}
+    <Tensor2D
+      {layerName}
+      position={[
+        gap * (i % numberOfColumns),
+        -gap * Math.floor(i / numberOfColumns),
+        z,
+      ]}
+      {pointSize}
+      rows={dimension[2]}
+      columns={dimension[3]}
+      tensorData={activationMaps.subarray(
+        i * dimension[2] * dimension[3],
+        (i + 1) * dimension[2] * dimension[3],
+      )}
+      tensorIndex={i}
+      {previousOutputNode}
+    />
+  {/each}
+</Align>
