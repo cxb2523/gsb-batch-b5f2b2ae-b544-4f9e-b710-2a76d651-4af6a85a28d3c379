@@ -107,7 +107,31 @@ export class Engine {
   }
 
   setPreset(preset) {
+    // The new preset only governs notes started after this point. Release what
+    // the old one left sounding first, so the two palettes never stack: held
+    // voices fade over their preset's release time, ringing voices damp over
+    // `RING_RELEASE` instead of carrying their whole tail into the new sound,
+    // and the sustain set is emptied so nothing can outlive its preset.
+    this.releaseAllVoices();
     this.applyPreset(preset);
+  }
+
+  /**
+   * Let every sounding voice run its own release tail, then forget it. The
+   * voices leave the map immediately, so the polyphony count is honest again
+   * and note-on stealing starts from a clean pool.
+   *
+   * Key state belongs to the app: a key that is still physically down stays
+   * down here — it just stops sounding, and its later note-off is a no-op.
+   */
+  releaseAllVoices() {
+    if (!this.ctx) {
+      this.voices.clear();
+      this.sustained.clear();
+      return;
+    }
+    for (const id of [...this.voices.keys()]) this.releaseVoice(id);
+    this.sustained.clear();
   }
 
   get maxVoices() {

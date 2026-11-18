@@ -44,7 +44,9 @@ level that drives the VU meter, the screen glow, and the pet's energy.
 finish, with the oscillator stop time scheduled at build time. Bells, plucks,
 drums and marimbas behave like real instruments — hammering the keys sounds
 right instead of choked. The engine schedules a timer to drop them from the
-voice map.
+voice map. When something *other* than the key stops one — a preset switch —
+its `release` fades the tail over `RING_RELEASE` (120 ms) instead, so a six
+second bowl doesn't ring straight through the sound that replaced it.
 
 **Held voices** (`heldVoice`) sustain until release, then ramp down over the
 preset's release time.
@@ -57,6 +59,19 @@ drops ringing voices before held ones.
 
 Sustain moves released ids into a `sustained` set instead of freeing them;
 turning sustain off releases the whole set.
+
+## Switching presets
+
+`Engine.setPreset` releases every sounding voice through its own release tail
+*before* ramping the shared bus and sends to the new preset's values. Nothing
+from the old sound survives into the new one: `releaseAllVoices` calls
+`releaseVoice` on each entry (clearing any ring timers), drops them from the map
+so `voiceCount` is immediately honest again, and empties `sustained`. Because
+the voices leave the map at once, `noteOn`'s stealing loop sees a clean pool.
+
+Key state is the app's, not the engine's. A key that is still physically down
+stays down in `App.keyState` — it simply stops sounding, and its later note-off
+is a harmless no-op. Its highlight stays lit because the finger is still on it.
 
 `pitchGain` rolls high notes off above MIDI 72 (about −6 dB per two octaves) so
 the top of a pentatonic keyboard doesn't bite.
@@ -176,6 +191,13 @@ renders.
 `Engine.tick` plays a short filtered noise burst plus a triangle blip for knob
 detents, sustain, and petting. Its one argument is pitch, so a knob *click* ticks
 lower than a detent: a button should feel heavier than a notch. Scale changes
-also trigger a
-three-note arpeggio of the new scale (`App.audition`), which doubles as a
-preview and lights up the corresponding keys.
+also trigger a three-note arpeggio of the new scale (`App.audition`), which
+doubles as a preview and lights up the corresponding keys. Preset switches play
+a single `preview` note.
+
+Both previews live under fixed voice ids (`preview`, `aud0`–`aud2`) and their
+timers are tracked in `App.previewTimers`. `App.cancelPreview` clears every
+pending timer and releases any preview voice; `App.applyPreset` drops the timers
+before `Engine.setPreset` and `audition`/`auditionNote` cancel first, so running
+the knob quickly through the packs can't stack previews or fire a stale note-off
+into the next sound. `App.panic` clears the timers too.

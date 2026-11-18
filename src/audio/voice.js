@@ -3,9 +3,16 @@
 //
 // A voice is `{ release(t) -> endTime, kill(t) -> endTime }`. Presets built with
 // `ringVoice` ignore key release and let their own envelope finish, which makes
-// hammering the keys feel like a real toy instrument.
+// hammering the keys feel like a real toy instrument. The engine can still ask
+// one to stop — a preset swap does — and then it fades instead of ringing on
+// into the next sound.
 
 import { filter, gain, fadeOut, noiseBuffer, osc, stopAll } from './dsp.js';
+
+// How long a ringing voice takes to fade when something other than the key
+// makes it stop. Long enough to avoid a click, short enough that a six-second
+// bowl doesn't bleed through the preset that replaced it.
+const RING_RELEASE = 0.12;
 
 export function ringVoice(nodes, tail, t0, length) {
   const end = t0 + length;
@@ -13,8 +20,13 @@ export function ringVoice(nodes, tail, t0, length) {
   return {
     ring: true,
     endTime: end,
-    release() {
-      return end;
+    release(t) {
+      // Key-up is ignored while ringing, but a preset switch uses this path:
+      // damp the tail and stop the sources rather than let the old sound keep
+      // decaying under the new preset.
+      const stop = fadeOut(tail.gain, t, RING_RELEASE);
+      stopAll(nodes, stop + 0.02);
+      return stop;
     },
     kill(t) {
       const e = fadeOut(tail.gain, t, 0.02);

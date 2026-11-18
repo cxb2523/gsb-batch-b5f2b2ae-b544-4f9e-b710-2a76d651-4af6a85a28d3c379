@@ -28,6 +28,10 @@ const HINTS = [
 
 const KNOB_DRAG_STEP = 9;
 
+// Voices the audition helpers play into. They are keyed separately from the
+// pads so a preview can be cancelled without touching anything the user holds.
+const PREVIEW_IDS = ['preview', 'aud0', 'aud1', 'aud2'];
+
 class App {
   constructor() {
     this.canvas = document.getElementById('panel');
@@ -77,6 +81,10 @@ class App {
     this.pointerDown = false;
     this.knobDrag = null;
     this.lastPetAt = -99;
+    // Timers for audition notes and the note-off calls that follow them, so a
+    // fast run through the packs can't stack previews or fire a stale callback
+    // into the voice that replaced it.
+    this.previewTimers = [];
 
     this.state = {
       time: 0,
@@ -487,6 +495,9 @@ class App {
   }
 
   panic() {
+    // A pending audition timer would otherwise restart the noise just after
+    // everything was silenced.
+    this.cancelPreviewTimers();
     this.releaseAll();
     this.engine.panic();
     for (const st of this.keyState) {
@@ -556,6 +567,10 @@ class App {
   }
 
   applyPreset() {
+    // Any preview still pending belongs to the sound being replaced. Drop its
+    // timers before the switch so a stale note-off can't land on the new
+    // preset; whatever is actually sounding is released by `setPreset`.
+    this.cancelPreviewTimers();
     this.engine.setPreset(this.preset);
     this.state.theme = themeFor(this.preset.accent);
     this.shellDirty = true;
@@ -565,13 +580,14 @@ class App {
 
   /** Little arpeggio that shows off the new scale and ripples across the keys. */
   audition() {
+    this.cancelPreview();
     const degrees = [10, 12, 14];
     degrees.forEach((degree, i) => {
-      setTimeout(() => {
+      this.previewTimeout(() => {
         const midi = degreeToMidi(this.scale, degree);
         const id = `aud${i}`;
         this.engine.noteOn(id, midi, 0.4);
-        setTimeout(() => this.engine.noteOff(id), 320);
+        this.previewTimeout(() => this.engine.noteOff(id), 320);
         const pad = PADS.find((q) => q.degree === degree);
         if (pad) this.keyState[pad.index].glow = 0.85;
         this.pet.gazeTarget.x = (degree / (PADS.length - 1) - 0.5) * 2;
@@ -580,9 +596,35 @@ class App {
   }
 
   auditionNote() {
+    this.cancelPreview();
     const midi = degreeToMidi(this.scale, 12);
     this.engine.noteOn('preview', midi, 0.45);
-    setTimeout(() => this.engine.noteOff('preview'), 420);
+    this.previewTimeout(() => this.engine.noteOff('preview'), 420);
+  }
+
+  /** A preview timer that forgets itself once it has fired. */
+  previewTimeout(fn, ms) {
+    const timer = setTimeout(() => {
+      const i = this.previewTimers.indexOf(timer);
+      if (i !== -1) this.previewTimers.splice(i, 1);
+      fn();
+    }, ms);
+    this.previewTimers.push(timer);
+  }
+
+  cancelPreviewTimers() {
+    for (const timer of this.previewTimers) clearTimeout(timer);
+    this.previewTimers.length = 0;
+  }
+
+  /**
+   * Drop every pending preview timer and release any preview voice already
+   * sounding. Called before a new audition, so a note started on the old sound
+   * can't ring under the new one or be retriggered by its stale timer.
+   */
+  cancelPreview() {
+    this.cancelPreviewTimers();
+    for (const id of PREVIEW_IDS) this.engine.releaseVoice(id);
   }
 
   petTouch() {

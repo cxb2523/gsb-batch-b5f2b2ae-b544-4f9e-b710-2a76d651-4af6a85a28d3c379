@@ -50,6 +50,12 @@ comes back up without having moved past the drag threshold, it counts as a click
 instead (`App.pressKnob`) — which is how the sound knob steps through the presets
 in the current pack.
 
+Switching a preset (`App.applyPreset`) cancels any pending audition timer, then
+calls `Engine.setPreset`, which releases every sounding voice and empties the
+sustain set before applying the new preset's gains. Held keys keep their
+`keyState.down` and highlight; they just stop sounding until pressed again. This
+is why voice count and key glow agree after a switch.
+
 Keyboard input is bound on `window` and uses `event.code`, so the mapping
 follows physical key positions rather than the user's layout.
 
