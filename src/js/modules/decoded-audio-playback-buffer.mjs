@@ -5,6 +5,9 @@
  * Grows exponentally to faciliate less-needed immediacy of playback and
  * fewer AudioBuffer objects created.
  * maxFlushSize and maxGrows are most likely the vals to tweak
+ *
+ * reset() is a hard session boundary: it empties the pending samples so a
+ * previous stream's tail can never be flushed into a later stream.
  */
 export class DecodedAudioPlaybackBuffer {
   // use a 128K buffer
@@ -48,10 +51,19 @@ export class DecodedAudioPlaybackBuffer {
     this.reset();
   }
 
+  get pendingLength() {
+    return this._bufferPos;
+  }
 
   reset() {
     this._bufferPos = 0;
     this._flushCount = 0;
+
+    // Drop references to the previous stream's samples.  Not strictly needed
+    // because flush() only reads up to _bufferPos, but it guarantees no stale
+    // sample can be observed by mistake.
+    this._bufferL.fill(0);
+    this._bufferR.fill(0);
   }
 
 
@@ -71,7 +83,7 @@ export class DecodedAudioPlaybackBuffer {
       bufferPos += len;
       this._bufferPos = bufferPos;
       if (bufferPos === bufferLen) {
-        this.flush(bufferPos);
+        this.flush();
         bufferPos = 0;
       }
     }
@@ -80,6 +92,13 @@ export class DecodedAudioPlaybackBuffer {
 
   flush() {
     const bufferPos = this._bufferPos;
+
+    // Nothing buffered (e.g. the tail timer fired after a reset): do not emit
+    // an empty playback buffer.
+    if (!bufferPos) {
+      return;
+    }
+
     this._onFlush({ left: this._bufferL.slice(0, bufferPos), right: this._bufferR.slice(0, bufferPos)});
     this._flushCount++;
     this._bufferPos = 0;

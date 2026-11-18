@@ -4,6 +4,11 @@
  * Users must wait too long to hear audio if buffer is too large.
  *
  * Returns Promise that resolves when entire stream is read and bytes queued for decoding
+ *
+ * abort() is terminal for this reader instance: the in-flight download is
+ * aborted, callbacks scheduled after the abort are ignored, and any bytes
+ * still waiting in the read buffer (not yet handed to the decoder) are
+ * discarded.  A new playback session always creates a new reader.
  */
 export class BufferedStreamReader {
   onRead;        // callback on every read. useful for speed calcs
@@ -13,6 +18,7 @@ export class BufferedStreamReader {
   bufferPos = 0; // last filled position in buffer
   isRunning;
   abortController;
+  isAborted = false;
 
   constructor(request, readBufferSize) {
     if (!(parseInt(readBufferSize) > 0))
@@ -23,15 +29,26 @@ export class BufferedStreamReader {
   }
 
   abort() {
+    this.isAborted = true;
+
     if (this.abortController) {
       this.abortController.abort();
     }
+
+    // Drop bytes read from the network but never sent to the decoder.  They
+    // belong to the closing session and must not leak into a later one.
+    this.bufferPos = 0;
+    this.buffer = null;
     this.request = null;
   }
 
   async read() {
     if (this.isRunning) {
       return console.warn('cannot start - read in progess.');
+    }
+
+    if (this.isAborted) {
+      return;
     }
 
     this.isRunning = true;
@@ -48,10 +65,13 @@ export class BufferedStreamReader {
   }
 
   async _start() {
+    if (this.isAborted || !this.request) return;
+
     this.abortController = ('AbortController' in window)? new AbortController() : null;
     const signal = this.abortController? this.abortController.signal : null;
 
     const response = await fetch(this.request, { signal });
+    if (this.isAborted) return;
     if (!response.ok) throw Error(response.status+' '+response.statusText);
     if (!response.body) throw Error('ReadableStream not yet supported in this browser - <a href="https://developer.mozilla.org/en-US/docs/Web/API/Body/body#Browser_Compatibility">browser compatibility</a>');
 
@@ -59,10 +79,17 @@ export class BufferedStreamReader {
           contentLength = response.headers.get('content-length'), // requires CORS access-control-expose-headers: content-length
           totalBytes = contentLength? parseInt(contentLength, 10) : 0;
 
-    let totalRead = 0, byte, readBufferPos = 0;
+    let totalRead = 0;
 
     const read = async () => {
       const { value, done } = await reader.read();
+
+      // Session was torn down while this read was in flight
+      if (this.isAborted) {
+        try { reader.cancel(); } catch (e) { /* already closed */ }
+        return;
+      }
+
       const byteLength = value? value.byteLength : 0;
       totalRead+= byteLength;
 
@@ -72,8 +99,6 @@ export class BufferedStreamReader {
 
       // avoid blocking read()
       setTimeout(_ => this._readIntoBuffer({ value, done, request: this.request }));
-      // console.log(this.request);
-      // this._readIntoBuffer({ value, done });
 
       if (!done) {
         return read();
@@ -84,12 +109,12 @@ export class BufferedStreamReader {
   }
 
   _requestIsAborted({ request }) {
-    return this.request !== request;
+    return this.isAborted || this.request !== request;
   }
 
   _flushBuffer({ end, done, request }) {
     if (this._requestIsAborted({ request })) {
-      return
+      return;
     }
 
     this.onBufferFull({ bytes: this.buffer.slice(0, end), done });

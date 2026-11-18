@@ -9,6 +9,13 @@ export default function MohayonaoWavDecoder(opts) {
   this.opts = opts || {};
 }
 
+/* Forget parsed RIFF/fmt metadata so the next chunk is treated as the start
+ * of a new stream and its header is re-parsed.  Used when a playback session
+ * is torn down or replaced. */
+MohayonaoWavDecoder.prototype.reset = function() {
+  this.readerMeta = false;
+}
+
 MohayonaoWavDecoder.prototype.decodeChunk = function(arrayBuffer) {
   return new Promise(resolve => {
     resolve(this.decodeChunkSync(arrayBuffer));
