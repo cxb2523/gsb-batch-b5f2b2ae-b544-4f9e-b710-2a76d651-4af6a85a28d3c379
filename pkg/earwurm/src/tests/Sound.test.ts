@@ -2,7 +2,11 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 
 import {Sound} from '../Sound';
 import {tokens} from '../tokens';
-import type {SoundEventMap, SoundState} from '../types';
+import type {
+  SoundEventMap,
+  SoundProgressEvent,
+  SoundState,
+} from '../types';
 
 type SoundConstructor = ConstructorParameters<typeof Sound>;
 
@@ -543,6 +547,129 @@ describe('Sound component', () => {
       // This test should cover a combination of:
       // changing speeds during playback, looping, and pausing.
       it.todo('calculates progress values at various points in playback');
+    });
+  });
+
+  describe('progress + pause + speed chain', () => {
+    const mockDurationSec = 2;
+
+    // `MockAudioBuffer` hardcodes `duration` to `0` and
+    // `MockBaseAudioContext` hardcodes `currentTime` to `0`,
+    // so we must provide our own controllable values.
+    function soundWithDuration(id: string) {
+      const buffer = new AudioBuffer({
+        length: 44100 * mockDurationSec,
+        numberOfChannels: 2,
+        sampleRate: 44100,
+      });
+
+      Object.defineProperty(buffer, 'duration', {
+        configurable: true,
+        value: mockDurationSec,
+      });
+
+      const context = new AudioContext();
+
+      let mockCurrentTime = 0;
+
+      Object.defineProperty(context, 'currentTime', {
+        configurable: true,
+        get: () => mockCurrentTime,
+      });
+
+      const sound = new Sound(id, buffer, context, new AudioNode());
+
+      return {
+        sound,
+        setCurrentTime: (value: number) => {
+          mockCurrentTime = value;
+        },
+      };
+    }
+
+    it('emits a final `progress` with correct `iterations` when a looping Sound is paused, re-sped, then stopped', async () => {
+      const {sound, setCurrentTime} = soundWithDuration('TestLoopFinal');
+      const progressEvents: SoundProgressEvent[] = [];
+
+      sound.on('progress', (event) => progressEvents.push(event));
+
+      sound.loop = true;
+      sound.play();
+
+      // Play past one full `duration` (2s): the first read clamps
+      // at the end of the iteration, the next read "rolls over".
+      setCurrentTime(2.2);
+      const endOfFirstIteration = sound.progress;
+
+      expect(endOfFirstIteration.elapsed).toBe(mockDurationSec);
+      expect(endOfFirstIteration.iterations).toBe(0);
+
+      setCurrentTime(2.4);
+      expect(sound.progress.iterations).toBe(1);
+
+      // Pause partway through the second iteration.
+      setCurrentTime(2.7);
+      sound.pause();
+
+      expect(sound.state).toBe('paused');
+      expect(progressEvents).toHaveLength(1);
+      expect(progressEvents[0].iterations).toBe(1);
+      expect(progressEvents[0].elapsed).toBeCloseTo(0.3);
+
+      // Changing `speed` while `paused` must not unpause,
+      // nor advance the frozen `progress`.
+      setCurrentTime(3.1);
+      sound.speed = 2;
+
+      expect(sound.state).toBe('paused');
+      expect(sound.progress.elapsed).toBeCloseTo(0.3);
+      expect(sound.progress.iterations).toBe(1);
+      expect(progressEvents).toHaveLength(1);
+
+      // Stopping must emit a final `progress` (for both the
+      // `stopping` and `ending` states) with terminal values.
+      setCurrentTime(3.6);
+      sound.stop();
+
+      expect(sound.state).toBe('ending');
+      expect(progressEvents).toHaveLength(3);
+
+      const finalProgress = progressEvents.at(-1);
+
+      expect(finalProgress?.iterations).toBe(1);
+      expect(finalProgress?.elapsed).toBeCloseTo(0.3);
+      expect(finalProgress?.remaining).toBeCloseTo(1.7);
+      expect(finalProgress?.percentage).toBeCloseTo(15);
+    });
+
+    it('does not advance `progress` while paused and resumes accumulation at the new `speed`', async () => {
+      const {sound, setCurrentTime} = soundWithDuration('TestPauseSpeed');
+
+      sound.play();
+
+      setCurrentTime(1);
+      sound.pause();
+
+      expect(sound.state).toBe('paused');
+      expect(sound.progress.elapsed).toBeCloseTo(1, 3);
+
+      // Changing `speed` while `paused` retains the pause semantics.
+      sound.speed = 2;
+
+      expect(sound.state).toBe('paused');
+      expect(sound.speed).toBe(2);
+
+      // Time passing while `paused` must not advance `progress`.
+      setCurrentTime(5);
+      expect(sound.progress.elapsed).toBeCloseTo(1, 3);
+
+      // Resuming continues to accumulate from the paused
+      // position, now at the new `speed`.
+      sound.play();
+
+      setCurrentTime(5.4);
+      expect(sound.progress.elapsed).toBeCloseTo(1.8, 3);
+      expect(sound.progress.iterations).toBe(0);
     });
   });
 });

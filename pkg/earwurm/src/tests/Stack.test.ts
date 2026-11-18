@@ -5,7 +5,7 @@ import {mockData} from '@earwurm/mocks';
 import {Stack} from '../Stack';
 import {Sound} from '../Sound';
 import {tokens} from '../tokens';
-import type {SoundEventMap, StackEventMap} from '../types';
+import type {SoundEventMap, SoundId, StackEventMap} from '../types';
 
 type StackConstructor = ConstructorParameters<typeof Stack>;
 
@@ -539,6 +539,115 @@ describe('Stack component', () => {
 
       expect(testStack.keys).toHaveLength(tokens.maxStackSize);
       expect(spyEnded).toBeCalledTimes(additionalSoundsCount);
+    });
+
+    it('only removes the expired Sound when using duplicate custom ids', async () => {
+      const testStack = new Stack(
+        'TestDuplicates',
+        'to/no/file.mp3',
+        defaultContext,
+        defaultAudioNode,
+      );
+
+      const duplicateId = 'Duplicate';
+      const sounds: Sound[] = [];
+
+      // Fill the `queue` to capacity, all sharing the same custom `id`.
+      for (let index = 0; index < tokens.maxStackSize; index++) {
+        // Sequential `prepare()` calls guarantee a deterministic queue order.
+
+        sounds.push(await testStack.prepare(duplicateId));
+      }
+
+      expect(testStack.keys).toHaveLength(tokens.maxStackSize);
+      expect(testStack.keys.every((key) => key === duplicateId)).toBe(true);
+
+      const spyEndedFirst: SoundEventMap['ended'] = vi.fn((_event) => {});
+      sounds[0].once('ended', spyEndedFirst);
+
+      // Exceed `maxStackSize` by one, expiring only the oldest Sound.
+      const additionalSound = await testStack.prepare(duplicateId);
+
+      // The expired Sound was stopped and removed...
+      expect(spyEndedFirst).toBeCalledTimes(1);
+      expect(sounds[0].state).toBe('ending');
+
+      // ...while every surviving Sound remains in the queue,
+      // despite sharing the same `id` as the expired Sound.
+      expect(testStack.keys).toHaveLength(tokens.maxStackSize);
+      expect(testStack.keys.every((key) => key === duplicateId)).toBe(true);
+      expect(testStack.get(duplicateId)).toBe(sounds[1]);
+
+      sounds.slice(1).forEach((sound) => {
+        expect(sound.state).toBe('created');
+      });
+      expect(additionalSound.state).toBe('created');
+
+      // Ending a surviving Sound removes only that instance.
+      sounds[1].stop();
+
+      expect(testStack.keys).toHaveLength(tokens.maxStackSize - 1);
+      expect(testStack.get(duplicateId)).toBe(sounds[2]);
+    });
+  });
+
+  describe('queue event', () => {
+    it('emits `newKeys` and `oldKeys` that always match the actual queue', async () => {
+      const testStack = new Stack(
+        'TestQueueKeys',
+        'to/no/file.mp3',
+        defaultContext,
+        defaultAudioNode,
+      );
+
+      interface QueueEventRecord {
+        newKeys: SoundId[];
+        oldKeys: SoundId[];
+      }
+
+      const queueEvents: QueueEventRecord[] = [];
+
+      testStack.on('queue', (newKeys, oldKeys) => {
+        // At the moment the event fires, `keys` must already
+        // reflect the new queue.
+        expect(testStack.keys).toStrictEqual(newKeys);
+
+        queueEvents.push({newKeys: [...newKeys], oldKeys: [...oldKeys]});
+      });
+
+      await testStack.prepare('A');
+      await testStack.prepare('B');
+      await testStack.prepare('C');
+
+      expect(queueEvents).toStrictEqual([
+        {newKeys: ['A'], oldKeys: []},
+        {newKeys: ['A', 'B'], oldKeys: ['A']},
+        {newKeys: ['A', 'B', 'C'], oldKeys: ['A', 'B']},
+      ]);
+
+      // Removing a Sound from the middle of the queue.
+      const soundB = testStack.get('B');
+      soundB?.stop();
+
+      expect(queueEvents.at(-1)).toStrictEqual({
+        newKeys: ['A', 'C'],
+        oldKeys: ['A', 'B', 'C'],
+      });
+      expect(testStack.keys).toStrictEqual(['A', 'C']);
+
+      // Expire Sounds by exceeding `maxStackSize`.
+      for (let index = 0; index < tokens.maxStackSize; index++) {
+        await testStack.prepare(`Extra-${index}`);
+      }
+
+      expect(testStack.keys).toHaveLength(tokens.maxStackSize);
+      expect(queueEvents.at(-1)?.newKeys).toStrictEqual(testStack.keys);
+
+      // Every `oldKeys` must equal the previous event's `newKeys`.
+      queueEvents.forEach((event, index) => {
+        if (index === 0) return;
+        expect(event.oldKeys).toStrictEqual(queueEvents[index - 1].newKeys);
+      });
     });
   });
 

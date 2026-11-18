@@ -127,25 +127,22 @@ export class Sound extends EmittenCommon<SoundEventMap> {
 
     if (oldSpeed === newSpeed) return;
 
+    // Capture progress at the OLD `speed` before making any
+    // changes, so that `elapsed` accumulation remains accurate.
+    if (this._state === 'playing') this.#captureProgress();
+
     this._speed = newSpeed;
     this.emit('speed', newSpeed);
 
     // Must return if `paused`, because the way we currently
-    // "pause" is by slowing `playbackRate` to a halt.
+    // "pause" is by slowing `playbackRate` to a halt. The new
+    // `speed` will instead be applied when playback resumes.
     if (this._state === 'paused') return;
-
-    if (this._state !== 'playing') {
-      this.#source.playbackRate.value = newSpeed;
-      return;
-    }
-
-    const {currentTime} = this.context;
-    this.#timestamp = Math.max(currentTime, tokens.minStartTime);
-    this.#elapsedSnapshot = this.#progress.elapsed;
 
     // TODO: Not transitioning to new `speed` for now...
     // this will be complicated given our `progress` calculations.
     /*
+    const {currentTime} = this.context;
     linearRamp(
       this.#source.playbackRate,
       {from: oldSpeed, to: newSpeed},
@@ -177,8 +174,13 @@ export class Sound extends EmittenCommon<SoundEventMap> {
     // Not yet sure how to resolve this.
     this.#incrementLoop();
 
+    // Progress only accumulates while `playing`. In every other
+    // state (`paused`, `stopping`, `ending`) we rely upon the
+    // most recently captured `#elapsedSnapshot`.
     const timeSince
-      = Math.max(this.context.currentTime - this.#timestamp, 0) * this.speed;
+      = this._state === 'playing'
+        ? Math.max(this.context.currentTime - this.#timestamp, 0) * this.speed
+        : 0;
 
     this.#progress.elapsed = clamp(
       0,
@@ -212,8 +214,9 @@ export class Sound extends EmittenCommon<SoundEventMap> {
       this.#source.playbackRate.value = this._speed;
     }
 
+    // The `#elapsedSnapshot` is already accurate: it was captured
+    // when transitioning out of the `playing` state.
     this.#timestamp = Math.max(this.context.currentTime, tokens.minStartTime);
-    this.#elapsedSnapshot = this.#progress.elapsed;
 
     this.#setState('playing');
 
@@ -226,6 +229,11 @@ export class Sound extends EmittenCommon<SoundEventMap> {
     // https://github.com/WebAudio/web-audio-api-v2/issues/105
     if (this._state !== 'playing') return this;
 
+    // Freeze the `progress` calculations at their current values,
+    // otherwise `elapsed` (and loop `iterations`) would continue
+    // to advance while `paused`.
+    this.#captureProgress();
+
     // Directly setting `playbackRate` instead of `speed`,
     // as we do not want to trigger an `event` or `ramp`.
     this.#source.playbackRate.value = tokens.pauseSpeed;
@@ -237,6 +245,10 @@ export class Sound extends EmittenCommon<SoundEventMap> {
   }
 
   stop() {
+    // Guarantee that any `progress` subscribers receive a final
+    // and accurate value once we transition to `stopping/ending`.
+    if (this._state === 'playing') this.#captureProgress();
+
     // This state is useful to distinguish between
     // an explicit "stop" and a natural "end".
     this.#setState('stopping');
@@ -264,11 +276,29 @@ export class Sound extends EmittenCommon<SoundEventMap> {
       cancelAnimationFrame(this.#intervalId);
       this.#intervalId = 0;
 
-      // TODO: We may not get a final `100%` value, as
-      // `ended > empty()` might be clearing subscriptions
-      // before they get a chance to execute one last time.
+      // Since `progress` is only emitted each animation frame while
+      // `playing`, we must emit one final update so that subscribers
+      // receive the terminal values (`paused`, `stopping`, `ending`).
       if (this.hasProgressSub) this.#updateProgress();
     }
+  }
+
+  // Captures the current `elapsed` value and resets the "clock",
+  // so that future calculations accumulate from this moment.
+  // Calculated inline (rather than via the `progress` getter) to
+  // avoid triggering a `#incrementLoop()` or an event emission.
+  #captureProgress() {
+    const timeSince
+      = this._state === 'playing'
+        ? Math.max(this.context.currentTime - this.#timestamp, 0) * this.speed
+        : 0;
+
+    this.#elapsedSnapshot = clamp(
+      0,
+      this.#elapsedSnapshot + timeSince,
+      this.duration,
+    );
+    this.#timestamp = Math.max(this.context.currentTime, tokens.minStartTime);
   }
 
   #incrementLoop() {
@@ -284,7 +314,7 @@ export class Sound extends EmittenCommon<SoundEventMap> {
       this.#progress.percentage = 0;
       this.#progress.iterations++;
 
-      this.#timestamp = this.context.currentTime;
+      this.#timestamp = Math.max(this.context.currentTime, tokens.minStartTime);
       this.#elapsedSnapshot = 0;
     }
   }
@@ -300,6 +330,10 @@ export class Sound extends EmittenCommon<SoundEventMap> {
   };
 
   readonly #handleEnded = () => {
+    // A natural "end" occurs while `playing`, so we capture the
+    // terminal `progress` values before transitioning state.
+    if (this._state === 'playing') this.#captureProgress();
+
     this.#setState('ending');
 
     // TODO: Include a boolean property to indicate if this

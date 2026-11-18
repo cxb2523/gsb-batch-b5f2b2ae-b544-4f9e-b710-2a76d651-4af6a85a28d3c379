@@ -187,20 +187,17 @@ export class Stack extends EmittenCommon<StackEventMap> {
     });
 
     newSound.on('state', this.#handleSoundState);
-    newSound.once('ended', this.#handleSoundEnded);
+    newSound.once('ended', () => this.#handleSoundEnded(newSound));
 
-    // TODO: We do not filter out identical `id` values,
-    // so duplicate custom ids are possible... which means
-    // identical ids could get wrongfully captured by any
-    // `queue/key` filtering.
+    // Duplicate custom `id` values are possible, so we must
+    // always add/remove Sounds by instance — never by `id`.
     const newQueue = [...this.#queue, newSound];
 
     const upperBound = newQueue.length - tokens.maxStackSize;
     const outOfBounds = upperBound > 0 ? newQueue.slice(0, upperBound) : [];
-    const outOfBoundsIds = outOfBounds.map(({id}) => id);
 
     const filteredQueue = newQueue.filter(
-      ({id}) => !outOfBoundsIds.includes(id),
+      (sound) => !outOfBounds.includes(sound),
     );
 
     outOfBounds.forEach((expiredSound) => expiredSound.stop());
@@ -235,10 +232,13 @@ export class Stack extends EmittenCommon<StackEventMap> {
     this.#handleStateFromQueue();
   };
 
-  readonly #handleSoundEnded: SoundEventMap['ended'] = (event) => {
-    this.#setQueue(this.#queue.filter(({id}) => id !== event.id));
+  #handleSoundEnded(sound: Sound) {
+    // Remove only the Sound that actually ended. Filtering by `id`
+    // would wrongfully remove any surviving Sounds that happen to
+    // share a duplicate custom `id`.
+    this.#setQueue(this.#queue.filter((queued) => queued !== sound));
     // We only set `stopping` state when `.stop()` is called.
     // There is an `ending` value, but it is redundant with the `ended` event.
     this.#handleStateFromQueue();
-  };
+  }
 }
