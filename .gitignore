@@ -1,0 +1,6 @@
+data/
+__pycache__/
+dist/
+deploy/
+_backup/
+CLAUDE.md

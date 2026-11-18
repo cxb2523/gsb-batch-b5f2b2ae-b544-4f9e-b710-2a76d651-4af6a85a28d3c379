@@ -1,0 +1,19 @@
+name: Tests
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Server and dictionary tests
+        run: python3 -m unittest discover -s tests
+      - name: Model and geometry tests (headless browser)
+        run: |
+          MPM_PORT=8099 MPM_DATA=/tmp/mpm python3 server/server.py &
+          sleep 2
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 --dump-dom http://localhost:8099/prove.html > esito.html
+          grep -o '<pre id="riassunto">[^<]*' esito.html
+          grep -q 'TUTTE OK' esito.html

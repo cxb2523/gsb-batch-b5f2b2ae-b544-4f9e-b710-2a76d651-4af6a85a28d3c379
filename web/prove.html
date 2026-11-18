@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="it"><head><meta charset="utf-8"><title>MyPlanMaker — prove</title>
+<style>body{font:14px system-ui;padding:20px} .ok{color:#2f7d4f} .ko{color:#c0392b;font-weight:600}</style></head>
+<body><h1>Prove del modello</h1><ul id="esiti"></ul><pre id="riassunto">in corso…</pre>
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+<script type="module">
+import { aggiornaIntagli, avviaGeometria, formeLavorazioni, geometriaPezzo, lavorazioneDa } from './js/geometria.js';
+import * as mod from './js/modello.js';
+import { Vector3 } from './vendor/three.module.js';
+import { mobilettoLeggio, tavoloRotondo } from './js/esempi.js';
+import { righeDistinta } from './js/distinta.js';
+import { schemaDiTaglio } from './js/taglio.js';
+import { daFile, versoFile } from './js/archivio.js';
+import { unioni } from './js/unioni.js';
+import { cerniere, maniglia } from './js/ferramenta.js';
+import { controlli, freccia } from './js/controlli.js';
+import { MODELLI, valoriDefault } from './js/modelli.js';
+import { creaCassetti } from './js/cassetti.js';
+import { listaSpesa } from './js/spesa.js';
+import { normalizza, FORME } from './js/sagome.js';
+import { foriDelPezzo, htmlDima, htmlDisegno, htmlEtichette } from './js/disegni.js';
+import { contornoSagoma, puntiArco } from './js/geometria.js';
+import { csvDistinta, dxfPezzi, stlProgetto } from './js/esporta.js';
+import { istruzioni } from './js/montaggio.js';
+
+const esiti = [];
+const vicino = (a, b, tol = 0.6) => Math.abs(a - b) <= tol;
+function prova(nome, cond, dettaglio = '') { esiti.push({ nome, ok: !!cond, dettaglio }); }
+
+await avviaGeometria();
+
+// 1. Mobiletto: fianchi e schienale adattati al piano inclinato di 16,7°
+{
+  const pr = mobilettoLeggio(), righe = righeDistinta(pr), r = n => righe.find(x => x.nome === n);
+  const f = r('Fianco sinistro'), s = r('Schienale');
+  prova('fianco: misura finita 900 × 500', vicino(f.L, 900, 1) && vicino(f.W, 500, 1), `${f.L} × ${f.W}`);
+  prova('fianco: testa obliqua 16,7°', f.tagli[0] === 'Testa B: obliquo 16,7°', f.tagli.join('; '));
+  prova('schienale: lama inclinata 16,7°', s.tagli[0] === 'Testa B: lama inclinata 16,7°', s.tagli.join('; '));
+  prova('schienale: lunghezza finita ~850', vicino(s.L, 850, 1.5), `${s.L}`);
+  prova('nessun pezzo vuoto', righe.every(x => !x.vuoto));
+}
+
+// 2. Adatta allunga: un listello corto sotto un ripiano arriva fino al ripiano con taglio a squadra
+{
+  const pr = mod.nuovoProgetto();
+  const gamba = mod.nuovoPezzo(pr, 'listello'); gamba.L = 300; gamba.pos = [100, 0, 0];
+  const piano = mod.nuovoPezzo(pr, 'pannello'); piano.pos = [0, 700, 100];
+  const r = mod.adatta(gamba, piano), g = geometriaPezzo(gamba);
+  prova('adatta allunga fino a 700', r.ok && vicino(g.max[0] - g.min[0], 700), `${r.msg} · L=${g.max[0] - g.min[0]}`);
+  prova('taglio a squadra', r.msg === 'Testa B: a squadra', r.msg);
+}
+
+// 3. Adatta su un piano inclinato di 30° di lato (taglio obliquo + direzione corretta)
+{
+  const pr = mod.nuovoProgetto();
+  const gamba = mod.nuovoPezzo(pr, 'listello'); gamba.L = 1200; gamba.pos = [400, 0, 0];
+  const piano = mod.nuovoPezzo(pr, 'pannello'); piano.L = 1200; piano.pos = [0, 600, 200]; piano.rot = [-90, 0, 30];
+  const r = mod.adatta(gamba, piano), g = geometriaPezzo(gamba);
+  prova('taglio obliquo di 30°', r.ok && /30°/.test(r.msg), r.msg);
+  prova('la gamba resta sotto il piano', g && g.max[0] < 1200, g && `${g.max[0]}`);
+}
+
+// 4. Paralleli: Adatta rifiuta
+{
+  const pr = mod.nuovoProgetto();
+  const a = mod.nuovoPezzo(pr, 'pannello'), b = mod.nuovoPezzo(pr, 'pannello'); b.pos = [0, 300, 0];
+  prova('pezzi paralleli: Adatta dice di usare Accosta', !mod.adatta(a, b).ok);
+}
+
+// 5. Accosta: un pannello appoggiato sopra un altro
+{
+  const pr = mod.nuovoProgetto();
+  const a = mod.nuovoPezzo(pr, 'pannello'), b = mod.nuovoPezzo(pr, 'pannello'); b.pos = [0, 300, 0];
+  const { Vector3 } = await import('./vendor/three.module.js');
+  mod.accosta(b, { normale: new Vector3(0, 1, 0), punto: new Vector3(0, 18, 0) });
+  prova('accosta: appoggiato a 18 mm', vicino(b.pos[1], 18, 0.01), `${b.pos[1]}`);
+}
+
+// 6. Tavolo rotondo
+{
+  const pr = tavoloRotondo(), righe = righeDistinta(pr), p = righe.find(x => x.nome === 'Piano rotondo');
+  prova('piano rotondo Ø 1000', vicino(p.L, 1000, 1) && /^rotondo Ø 1\.?000$/.test(p.forma[0]), `${p.L} · ${p.forma}`);
+  prova('tavolo: 9 pezzi', righe.length === 9);
+}
+
+// 7. Schema di taglio
+function controllaLastre(gruppi, lama) {
+  for (const g of gruppi) for (const f of g.fogli) {
+    if (!f.H) continue;
+    for (const [i, a] of f.pezzi.entries()) {
+      if (a.x < 0 || a.y < 0 || a.x + a.w > f.L + 1e-6 || a.y + a.h > f.H + 1e-6) return `n° ${a.n} esce dalla lastra`;
+      for (const b of f.pezzi.slice(i + 1)) {
+        const staccati = a.x + a.w + lama <= b.x + 1e-6 || b.x + b.w + lama <= a.x + 1e-6 || a.y + a.h + lama <= b.y + 1e-6 || b.y + b.h + lama <= a.y + 1e-6;
+        if (!staccati) return `n° ${a.n} e n° ${b.n} si sovrappongono (o manca la lama)`;
+      }
+    }
+  }
+  return '';
+}
+{
+  const pr = mobilettoLeggio(), g = schemaDiTaglio(pr);
+  const posati = g.reduce((s, x) => s + x.fogli.reduce((t, f) => t + f.pezzi.length, 0), 0);
+  prova('mobiletto: tutti i 7 pezzi sulle lastre', posati === 7 && g.every(x => !x.fuori.length), `${posati}`);
+  const err = controllaLastre(g, 3.2);
+  prova('mobiletto: nessuna sovrapposizione, lama rispettata', !err, err);
+  prova('multistrato: venatura rispettata (nessun pezzo ruotato)', g.find(x => x.materiale.id === 'mb18').fogli.every(f => f.pezzi.every(p => !p.ruotato)));
+}
+{
+  const pr = tavoloRotondo(), g = schemaDiTaglio(pr), gambe = g.find(x => x.materiale.id === 'ro6060');
+  prova('tavolo: 4 gambe da 723 in 2 barre da 2500', gambe.fogli.length === 2, `${gambe.fogli.length}`);
+  const piano = g.find(x => x.materiale.id === 'ro27');
+  prova('tavolo: il piano Ø 1000 entra in una lastra 2500×1200', piano.fuori.length === 0 && piano.fogli.length === 1, `${piano.fuori.length}`);
+  const pr2 = tavoloRotondo(); pr2.pezzi[0].D = 1400;
+  prova('piano Ø 1400 troppo grande: viene segnalato', schemaDiTaglio(pr2).find(x => x.materiale.id === 'ro27').fuori.length === 1);
+}
+{
+  const pr = mod.nuovoProgetto();
+  for (let i = 0; i < 30; i++) { const p = mod.nuovoPezzo(pr, 'pannello'); p.mat = 'tn18'; p.L = 300 + (i * 97) % 700; p.W = 200 + (i * 53) % 400; }
+  const g = schemaDiTaglio(pr), err = controllaLastre(g, 3.2);
+  const posati = g[0].fogli.reduce((t, f) => t + f.pezzi.length, 0);
+  prova('30 pezzi misti: tutti posati senza sovrapposizioni', posati === 30 && !err, `${posati} ${err} · ${g[0].fogli.length} lastre`);
+}
+
+// 8. File di progetto
+{
+  const pr = mobilettoLeggio(); pr.id = 'x';
+  const p2 = daFile(versoFile(pr));
+  prova('esporta → importa: stessi pezzi e tagli', JSON.stringify(p2.pezzi) === JSON.stringify(pr.pezzi));
+  let errore = '';
+  try { daFile('{"ciao": 1}'); } catch (e) { errore = e.message; }
+  prova('file sbagliato: messaggio chiaro', /non contiene/.test(errore), errore);
+}
+
+// 9. Unioni e viti
+{
+  const pr = mobilettoLeggio(), u = unioni(pr);
+  const trova = (x, y) => u.giunti.find(g => [g.a.nome, g.b.nome].sort().join('|') === [x, y].sort().join('|'));
+  const g1 = trova('Fianco sinistro', 'Fondo');
+  prova('fianco → fondo: 3 viti 4×40 dal fianco', g1 && g1.passa.nome === 'Fianco sinistro' && g1.viti.length === 3 && g1.vite.misura === '4×40', g1 && `${g1.tipo} · ${g1.viti.length} × ${g1.vite?.misura}`);
+  const g2 = trova('Fianco destro', 'Ripiano');
+  prova('fianco destro → ripiano: viti', g2 && g2.viti.length === 3, g2 && g2.tipo);
+  const g3 = trova('Piano inclinato', 'Fianco sinistro');
+  prova('piano inclinato sui fianchi: viti con avviso "in vista"', g3 && g3.viti.length >= 2 && g3.note.some(n => /in vista/.test(n)), g3 && `${g3.tipo} · ${g3.note.join(' ')}`);
+  const g4 = trova('Schienale', 'Fianco sinistro');
+  prova('schienale da 3 mm: chiodini, niente viti', g4 && g4.chiodini, g4 && g4.note.join(' '));
+  const g5 = trova('Anta', 'Fondo');
+  prova('anta con cerniere: niente viti', !g5 || g5.tipo === 'cerniere', g5 && g5.tipo);
+  prova('nessuna collisione nel mobiletto', u.avvisi.length === 0, u.avvisi.join(' '));
+  const v = g1.viti[0], lungo = v.testa.distanceTo(v.punta);
+  prova('vite: parte fuori dal fianco e entra nel fondo', Math.abs(v.testa.x - 0) < 0.5 && Math.abs(v.punta.x - 40) < 0.5 && Math.abs(lungo - 40) < 0.5, `${v.testa.x.toFixed(1)} → ${v.punta.x.toFixed(1)}`);
+  const anta = pr.pezzi.find(p => p.nome === 'Anta'), c = cerniere(anta), m = maniglia(anta);
+  prova('anta 330 mm: 2 cerniere a 22,5 mm dal bordo', c.n === 2 && c.punti.every(p => Math.abs(p[0] - 22.5) < 0.01), JSON.stringify(c.punti));
+  prova('maniglia dal lato opposto alle cerniere, interasse 128', m.lato === 'B' && Math.abs(m.fori[1].c[1] - m.fori[0].c[1] - 128) < 0.01 && !m.avvisi.length, JSON.stringify(m.fori.map(f => f.c)));
+  const g = geometriaPezzo(anta);
+  prova('scodelle e fori scavati nell\'anta', g.volume < 796 * 330 * 18 - 2 * Math.PI * 17.5 ** 2 * 12, `${Math.round(g.volume)}`);
+}
+{
+  const pr = tavoloRotondo(), u = unioni(pr);
+  const g = u.giunti.find(g => /Gamba 1/.test(g.a.nome + g.b.nome) && /Piano/.test(g.a.nome + g.b.nome));
+  prova('tavolo: gamba sotto il piano → avviso viti in vista e massello', g && g.note.some(n => /in vista/.test(n)), g && `${g.tipo} · ${g.note.join(' ')}`);
+  const f = u.giunti.find(g => /Fascia davanti/.test(g.a.nome + g.b.nome) && /Gamba/.test(g.a.nome + g.b.nome));
+  prova('tavolo: fascia contro gamba trovata', !!f, f && `${f.tipo} · ${f.note.join(' ')}`);
+}
+
+// 10. Dividi
+{
+  const pr = mobilettoLeggio(), { Vector3 } = await import('./vendor/three.module.js');
+  const vm = p => { const g = geometriaPezzo(p), m = mod.matrice(p); return g.vertici.map(v => new Vector3(...v).applyMatrix4(m)); };
+  const fondo = pr.pezzi.find(p => p.nome === 'Fondo'), rip = pr.pezzi.find(p => p.nome === 'Ripiano');
+  const s = mod.spazioTra(fondo, rip, vm(fondo), vm(rip), 2);
+  prova('dividi fondo-ripiano: spazio 318, 2 pezzi, luce 94', s.ok && Math.abs(s.luce - 318) < 0.01 && Math.abs(s.passo - 94) < 0.01, s.msg || `${s.luce} ${s.passo}`);
+  const nuovi = mod.dividi(pr, fondo, s, 2);
+  prova('dividi: ripiani a 68+94 e 68+94+18+94', Math.abs(nuovi[0].pos[1] - 162) < 0.01 && Math.abs(nuovi[1].pos[1] - 274) < 0.01, nuovi.map(p => p.pos[1]).join(', '));
+  const u = unioni(pr), g = u.giunti.filter(g => nuovi.includes(g.a) || nuovi.includes(g.b));
+  prova('dividi: i nuovi pezzi prendono le viti dai fianchi', g.filter(x => x.viti.length === 3).length === 4, `${g.length}`);
+  const fs = pr.pezzi.find(p => p.nome === 'Fianco sinistro'), piano = pr.pezzi.find(p => p.nome === 'Piano inclinato');
+  prova('dividi tra pezzi non paralleli: rifiuta', !mod.spazioTra(fs, piano, vm(fs), vm(piano), 1).ok);
+}
+
+// 11. Controlli
+{
+  const pr = mobilettoLeggio(), c = controlli(pr);
+  const r = c.frecce.find(f => f.p.nome === 'Ripiano');
+  prova('freccia del ripiano 764×490×18 multistrato con 30 kg/m: ~0,6 mm subito', r && Math.abs(r.subito - 0.61) < 0.05 && r.giudizio === 'ottimo', r && `${r.subito.toFixed(2)} / ${r.nelTempo.toFixed(2)} ${r.giudizio}`);
+  prova('mobiletto: peso plausibile (25-40 kg) e stabile', c.peso > 25 && c.peso < 40 && !c.avvisi.length, `${c.peso.toFixed(1)} kg · ${c.avvisi.join(' ')}`);
+  const lungo = mod.nuovoProgetto(); const p = mod.nuovoPezzo(lungo, 'pannello'); p.mat = 'tn18'; p.L = 1200; p.W = 300;
+  const f = freccia(p, 40);
+  prova('ripiano truciolare 1200×300 con 40 kg/m: troppo', f.giudizio === 'troppo', `${f.nelTempo.toFixed(1)} mm`);
+}
+{
+  const pr = tavoloRotondo(), c = controlli(pr);
+  prova('tavolo a 4 gambe: stabile con 25 kg sul bordo', !c.avvisi.length, c.avvisi.join(' ') + c.note.join(' '));
+  for (const g of pr.pezzi.filter(p => p.nome.startsWith('Gamba'))) { g.pos[0] = 500 + (g.pos[0] - 500) * 0.25; g.pos[2] = -500 + (g.pos[2] + 500) * 0.25; }
+  pr.pezzi = pr.pezzi.filter(p => !p.nome.startsWith('Fascia'));
+  const c2 = controlli(pr);
+  prova('gambe strette al centro: si ribalta appoggiandosi', c2.avvisi.some(a => /ribalta/.test(a)), c2.avvisi.join(' '));
+}
+
+// 12. Gizmo, calamita, copia specchiata
+{
+  const T = await import('./vendor/three.module.js');
+  const pr = mod.nuovoProgetto(), a = mod.nuovoPezzo(pr, 'pannello'); a.pos = [0, 0, 0];
+  mod.trasforma(a, new T.Matrix4().makeTranslation(100, 50, -20));
+  prova('sposta col gizmo: +100, +50, -20', a.pos.join() === '100,50,-20', a.pos.join());
+  const b = mod.nuovoPezzo(pr, 'pannello'); b.pos = [0, 0, 0]; b.rot = [-90, 0, 0];
+  mod.trasforma(b, new T.Matrix4().makeRotationY(Math.PI / 2));
+  const asseL = new T.Vector3(1, 0, 0).applyMatrix4(new T.Matrix4().extractRotation(mod.matrice(b)));
+  prova('ruota di 90° in pianta: la lunghezza va verso -Z', Math.abs(asseL.z + 1) < 1e-6, `${asseL.toArray().map(v => v.toFixed(3))} rot ${b.rot}`);
+  const pr2 = mod.nuovoProgetto(), x = mod.nuovoPezzo(pr2, 'pannello'), y = mod.nuovoPezzo(pr2, 'pannello');
+  x.pos = [0, 0, 0]; y.pos = [0, 26, 0];
+  const s = mod.calamita(pr2, new Set([y.id]), p => mod.ingombro(p));
+  prova('calamita: a 8 mm si appoggia sopra', Math.abs(y.pos[1] - 18) < 0.01, `${s} → ${y.pos}`);
+  const pr3 = mobilettoLeggio(), fs = pr3.pezzi.find(p => p.nome === 'Fianco sinistro'), an = pr3.pezzi.find(p => p.nome === 'Anta');
+  const [c1, c2] = mod.copiaSpecchiata(pr3, [fs, an], 800);
+  const g1 = geometriaPezzo(c1), b1 = mod.ingombro(c1, g1.vertici.map(v => new T.Vector3(...v).applyMatrix4(mod.matrice(c1))));
+  prova('copia specchiata del fianco: da x 1582 a 1600, stessa misura finita', Math.abs(b1.min.x - 1582) < 0.01 && Math.abs(b1.max.x - 1600) < 0.01 && Math.abs(g1.max[0] - g1.min[0] - 900) < 0.6, `${b1.min.x.toFixed(1)}..${b1.max.x.toFixed(1)} L ${(g1.max[0] - g1.min[0]).toFixed(1)}`);
+  const piano = pr3.pezzi.find(p => p.nome === 'Piano inclinato'), gp = geometriaPezzo(piano);
+  const topFianco = Math.max(...g1.vertici.map(v => new T.Vector3(...v).applyMatrix4(mod.matrice(c1)).y));
+  prova('copia specchiata: il taglio obliquo resta in cima (900 dietro)', Math.abs(topFianco - 900) < 0.6, `${topFianco.toFixed(1)}`);
+  prova('copia specchiata dell\'anta: cerniere sul lato B', cerniere(c2).lato === 'B', cerniere(c2).lato);
+}
+
+// 13. Modelli pronti e cassetti
+for (const m of MODELLI) {
+  const pr = mod.nuovoProgetto(m.nome);
+  let errore = '';
+  try { m.crea(pr, valoriDefault(m), 0); } catch (e) { errore = e.message; }
+  const righe = righeDistinta(pr), c = controlli(pr), u = unioni(pr);
+  const vuoti = righe.filter(r => r.vuoto).length;
+  const conViti = u.giunti.filter(g => g.viti.length).length;
+  prova(`modello «${m.nome}»: ${pr.pezzi.length} pezzi, nessun errore, nessuna compenetrazione`, !errore && pr.pezzi.length >= 3 && !vuoti && !c.avvisi.some(a => /compenetrano/.test(a)) && !u.avvisi.length,
+    `${errore} ${vuoti} vuoti · ${c.avvisi.join(' ')} ${u.avvisi.join(' ')} · ${conViti} unioni con viti · ${c.peso.toFixed(1)} kg`);
+}
+{
+  const m = MODELLI.find(x => x.id === 'cassettiera'), pr = mod.nuovoProgetto();
+  m.crea(pr, valoriDefault(m), 0);
+  const fr = pr.pezzi.filter(p => /frontale/.test(p.nome)), sp = listaSpesa(pr, unioni(pr));
+  prova('cassettiera: 4 frontali e 4 coppie di guide da 400 (450 meno il frontale a filo)', fr.length === 4 && sp.righe.some(r => /guide.*400/.test(r.voce) && r.qta === 4), sp.righe.map(r => `${r.qta}× ${r.voce}`).join('; '));
+  const u = unioni(pr), mobili = u.giunti.filter(g => g.tipo === 'parte mobile');
+  prova('cassetti: nessuna vite tra cassetto e mobile', u.giunti.every(g => !(g.a.mobile ^ g.b.mobile) || g.tipo === 'parte mobile' || !g.viti.length), `${mobili.length} contatti mobili`);
+  const interne = u.giunti.filter(g => g.a.gruppo && g.a.gruppo === g.b.gruppo && g.viti.length);
+  prova('cassetto: fianchi avvitati a fronte e retro, frontale avvitato da dentro', interne.length >= 4 * 3, `${interne.length} unioni avvitate nei cassetti · ${interne.slice(0, 3).map(g => g.vite.misura).join(', ')}`);
+}
+{
+  const pr = mobilettoLeggio(), a = pr.pezzi[0], b = mod.duplica(pr, a);
+  b.pos = [...a.pos]; b.pos[0] -= 5;
+  prova('due fianchi uno dentro l\'altro: «si compenetrano»', controlli(pr).avvisi.some(x => /compenetrano/.test(x)));
+}
+
+// 14. Fissaggi, bordi, venatura
+{
+  const pr = mobilettoLeggio(), fs = pr.pezzi.find(p => p.nome === 'Fianco sinistro'), fondo = pr.pezzi.find(p => p.nome === 'Fondo');
+  const k = [fs.id, fondo.id].sort().join('|');
+  for (const [tipo, atteso] of [['confirmat', /confirmat 7×50/], ['spinotti', /spinotti Ø 8/], ['eccentrici', /eccentrici Ø 15/], ['colla', /solo colla/]]) {
+    pr.fissaggi = { [k]: tipo };
+    const g = unioni(pr).giunti.find(x => x.chiave === k);
+    prova(`fianco → fondo con ${tipo}`, atteso.test((await import('./js/unioni.js')).descriviGiunto(g)), (await import('./js/unioni.js')).descriviGiunto(g));
+  }
+  pr.fissaggi = { [k]: 'spinotti' };
+  const sp = listaSpesa(pr, unioni(pr));
+  prova('spinotti nella lista della spesa con la colla', sp.righe.some(r => /Spinotto/.test(r.voce)) && sp.righe.some(r => /Colla/.test(r.voce)));
+  const rip = pr.pezzi.find(p => p.nome === 'Ripiano');
+  prova('nomi dei bordi del ripiano: davanti = bordo basso', mod.nomeBordo(rip, 'basso') === 'davanti' && mod.nomeBordo(rip, 'alto') === 'dietro', `${mod.nomeBordo(rip, 'basso')} / ${mod.nomeBordo(rip, 'alto')}`);
+  rip.bordatura = { spessore: 2, lati: ['basso'] };
+  const r = righeDistinta(pr).find(x => x.nome === 'Ripiano');
+  prova('ripiano bordato 2 mm davanti: da tagliare 764 × 488', r.Ltaglio === 764 && r.Wtaglio === 488, `${r.Ltaglio} × ${r.Wtaglio}`);
+  rip.venatura = 'W';
+  const g = schemaDiTaglio(pr).find(x => x.materiale.id === 'mb18'), posto = g.fogli.flatMap(f => f.pezzi).find(p => p.n === rip.n);
+  prova('venatura in larghezza: il ripiano va ruotato sulla lastra', posto.ruotato && Math.abs(posto.w - 488) < 0.01, `${posto.w}×${posto.h} ruotato=${posto.ruotato}`);
+  prova('schema senza sovrapposizioni con bordi e venatura', !controllaLastre(schemaDiTaglio(pr), 3.2));
+}
+
+// 15. Sagome, disegni, dime, etichette
+{
+  const arco = puntiArco([0, 0], [100, 0], 20), ymin = Math.min(...arco.map(q => q[1]));
+  prova('arco di freccia 20 su corda 100: sporge di 20 verso l\'esterno (a destra)', Math.abs(ymin + 20) < 0.3, ymin.toFixed(2));
+  const orario = [{ x: 0, y: 0 }, { x: 0, y: 300 }, { x: 500, y: 300 }, { x: 500, y: 0 }];
+  const n = normalizza(orario);
+  const area = n.punti.reduce((t, q, i) => { const r = n.punti[(i + 1) % n.punti.length]; return t + q.x * r.y - r.x * q.y; }, 0);
+  prova('sagoma disegnata in senso orario: girata in antiorario', area > 0 && n.L === 500 && n.W === 300, `${area} ${n.L}×${n.W}`);
+  const ar = normalizza(FORME.arco(800, 400));
+  prova('forma «arco sopra» 800×400: ingombro 800 × 400', Math.abs(ar.L - 800) < 0.2 && Math.abs(ar.W - 400) < 0.5, `${ar.L}×${ar.W}`);
+  const pr = mobilettoLeggio(), fs = pr.pezzi.find(p => p.nome === 'Fianco sinistro');
+  Object.assign(fs, { forma: 'sagoma', sagoma: ar.punti, L: ar.L, W: ar.W, tagli: [] });
+  const g = geometriaPezzo(fs);
+  prova('pezzo sagomato: solido valido con l\'area giusta', g && Math.abs(g.volume / 18 - (800 * 300 + (2 / 3) * 800 * 100)) / g.volume * 18 < 0.02, g && `${Math.round(g.volume / 18)} mm²`);
+  const anta = pr.pezzi.find(p => p.nome === 'Anta'), fori = foriDelPezzo(pr, anta);
+  prova('fori dell\'anta: 2 scodelle Ø 35 e 2 fori maniglia', fori.filter(f => f.d === 35).length === 2 && fori.filter(f => f.d === 5).length === 2, fori.map(f => `${f.nome} Ø${f.d}`).join(', '));
+  const fondo = pr.pezzi.find(p => p.nome === 'Fondo'), ff = foriDelPezzo(pr, fondo);
+  prova('fori del fondo: 6 fori nel bordo per le viti dai fianchi', ff.filter(f => f.faccia === 'bordo').length === 6, `${ff.length}`);
+  prova('disegno del fondo con tabella fori', /Foro nel bordo/.test(htmlDisegno(pr, fondo)));
+  const tav = tavoloRotondo(), dima = htmlDima(tav, tav.pezzi[0]);
+  prova('dima 1:1 del piano Ø 1000: 24 fogli A4', (dima.match(/class="foglio-dima"/g) || []).length === 24, `${(dima.match(/class="foglio-dima"/g) || []).length}`);
+  const et = htmlEtichette(pr, righeDistinta(pr));
+  prova('etichette: una per pezzo', (et.match(/class="etichetta"/g) || []).length === pr.pezzi.length);
+}
+
+// 16. Esportazioni, montaggio, avanzi
+{
+  const pr = mobilettoLeggio();
+  const csv = csvDistinta(pr);
+  prova('CSV: intestazione + 7 righe, separatore ;', csv.trim().split('\r\n').length === 8 && /^\ufeffN;Pezzo;/.test(csv), csv.split('\r\n')[1]);
+  const dxf = dxfPezzi(pr);
+  prova('DXF: linee, cerchi dei fori e fine file', /\r\nLINE\r\n/.test(dxf) && /\r\nCIRCLE\r\n/.test(dxf) && dxf.endsWith('EOF'), `${(dxf.match(/\nLINE\r/g) || []).length} linee`);
+  const stl = stlProgetto(pr);
+  prova('STL: triangoli di tutti i pezzi', (stl.match(/facet normal/g) || []).length > 7 * 12 && stl.startsWith('solid'));
+  const passi = istruzioni(pr);
+  prova('montaggio: fori, poi si parte da un pezzo e si montano tutti', passi[0].titolo === 'Prepara i fori' && /Parti da/.test(passi[1].titolo) && passi.some(x => x.titolo === 'Ante'), passi.map(x => x.titolo).join(' → '));
+  const avanzi = [{ mat: 'mb18', L: 950, W: 520, qta: 2 }];
+  const g = schemaDiTaglio(pr, avanzi).find(x => x.materiale.id === 'mb18');
+  prova('avanzi 950×520: i due fianchi ci entrano, si compra comunque 1 lastra', g.daAvanzi === 2 && g.nuovi === 1 && g.fogli.filter(f => f.avanzo).every(f => f.pezzi.length === 1), `avanzi usati ${g.daAvanzi}, lastre ${g.nuovi}`);
+  pr.usaAvanzi = false;
+  prova('avanzi disattivati nel progetto: non si usano', schemaDiTaglio(pr, avanzi).find(x => x.materiale.id === 'mb18').daAvanzi === 0);
+  prova('schema con avanzi senza sovrapposizioni', !controllaLastre(schemaDiTaglio({ ...pr, usaAvanzi: true }, avanzi), 3.2));
+}
+
+// 17. Spessori e sezioni su misura, modelli personalizzati, Accosta faccia contro faccia, unità
+{
+  const { materialePezzo } = await import('./js/materiali.js');
+  const { scelto } = await import('./js/modelli.js');
+  const { Vector3 } = await import('./vendor/three.module.js');
+  const pr = mod.nuovoProgetto();
+  const a = mod.nuovoPezzo(pr, 'pannello'), b = mod.nuovoPezzo(pr, 'pannello');
+  b.mat = 'al27'; b.spessore = 40;
+  const mb = materialePezzo(b);
+  prova('spessore su misura: lamellare 40, prezzo in proporzione', mod.dimensioni(b).T === 40 && mb.nome === 'Lamellare abete 40' && vicino(mb.prezzoM2, 32 * 40 / 27, 0.01) && materialePezzo(a).id === 'pan', `${mb.nome} ${mb.prezzoM2}`);
+  const g = geometriaPezzo(b);
+  prova('spessore su misura: il solido è alto 40', vicino(g.max[2] - g.min[2], 40, 0.01));
+  const righe = righeDistinta(pr);
+  prova('distinta: T 40 e materiale su misura', righe[1].T === 40 && righe[1].materiale === 'Lamellare abete 40');
+  const gruppi = schemaDiTaglio(pr);
+  prova('schema di taglio: il su misura ha la sua lastra', gruppi.length === 2 && gruppi.some(x => x.materiale.id === 'al27@40'), gruppi.map(x => x.materiale.id).join(', '));
+  const l = mod.nuovoPezzo(pr, 'listello'); l.mat = 'ab6060'; l.sezione = [70, 50];
+  prova('listello con sezione 70×50', mod.dimensioni(l).W === 70 && mod.dimensioni(l).T === 50 && materialePezzo(l).nome === 'Abete 70×50', materialePezzo(l).nome);
+
+  // Tipo di legno facoltativo: pezzi nuovi generici, il nome è la misura, venatura libera nello schema di taglio
+  const { materialeDaId } = await import('./js/materiali.js');
+  const pg = mod.nuovoProgetto(), g1 = mod.nuovoPezzo(pg, 'pannello'), g2 = mod.nuovoPezzo(pg, 'pannello'), gl = mod.nuovoPezzo(pg, 'listello');
+  g2.spessore = 12; gl.sezione = [40, 20];
+  prova('generici: «Pannello 18 mm», «Pannello 12 mm», «Listello 40×20»', materialePezzo(g1).nome === 'Pannello 18 mm' && materialePezzo(g2).nome === 'Pannello 12 mm' && materialePezzo(g2).id === 'pan@12' && materialePezzo(gl).nome === 'Listello 40×20', [g1, g2, gl].map(x => materialePezzo(x).nome).join(', '));
+  prova('materialeDaId: pan@12 e lis@40x20', materialeDaId('pan@12').T === 12 && materialeDaId('lis@40x20').W === 40 && materialeDaId('mb18').nome === 'Multistrato betulla 18');
+  g1.L = 2000; g1.W = 1000;
+  const sg = schemaDiTaglio(pg).find(x => x.materiale.id === 'pan');
+  prova('generico: venatura libera (il pezzo può ruotare sulla lastra)', righeDistinta(pg).find(r => r.n === g1.n).vena === 'libera' && sg.fuori.length === 0, JSON.stringify(sg.fuori));
+  const vt = valoriDefault(MODELLI.find(m => m.id === 'tavolo'));
+  prova('modelli: materiali generici con lo spessore del modello', vt.mat === 'pan' && vt.matT === 27 && vt.matL === 'lis' && vt.matLW === 60, JSON.stringify(vt));
+
+  const tav = MODELLI.find(m => m.id === 'tavolo'), v = { ...valoriDefault(tav), matT: 40, matLW: 80, matLT: 80, rientro: 100 };
+  const pt = mod.nuovoProgetto(); tav.crea(pt, v, 0);
+  const piano = pt.pezzi.find(p => p.nome === 'Piano'), gamba = pt.pezzi.find(p => p.nome === 'Gamba 1');
+  const c = controlli(pt);
+  prova('tavolo: piano da 40, gambe 80×80 alte 710, nessuna compenetrazione', mod.dimensioni(piano).T === 40 && mod.dimensioni(gamba).W === 80 && gamba.L === 710 && !c.avvisi.some(x => /compenetrano/.test(x)), c.avvisi.join(' '));
+  prova('scelto(): valori del catalogo = nessun su misura', !('spessore' in scelto({ mat: 'mb18', matT: 18 }, 'mat').r) && scelto({ mat: 'mb18', matT: 25 }, 'mat').r.spessore === 25);
+
+  // gamba sdraiata: si sceglie la sua testa e la si mette sotto il piano, nel punto toccato
+  const pa = mod.nuovoProgetto();
+  const top = mod.nuovoPezzo(pa, 'pannello'); top.L = 1000; top.W = 600; top.pos = [0, 700, 0];
+  const leg = mod.nuovoPezzo(pa, 'listello'); leg.mat = 'ab6060'; leg.L = 700; leg.rot = mod.rotazioneDa('frontale'); leg.pos = [2000, 0, 0];
+  const verts = p => { const gg = geometriaPezzo(p), m = mod.matrice(p); return gg.vertici.map(q => new Vector3(...q).applyMatrix4(m)); };
+  const testa = { normale: new Vector3(1, 0, 0), punto: new Vector3(2700, 30, 30) };
+  const sotto = { normale: new Vector3(0, -1, 0), punto: new Vector3(100, 700, -100) };
+  const { delta, ruotato } = mod.deltaAccosta(testa, sotto, verts(leg));
+  mod.trasforma(leg, delta);
+  const box = mod.ingombro(leg, verts(leg));
+  prova('accosta faccia contro faccia: gamba girata in piedi sotto il piano, centrata sul punto', vicino(ruotato, 90, 0.01) && vicino(box.max.y, 700, 0.01) && vicino(box.min.y, 0, 0.01) && vicino((box.min.x + box.max.x) / 2, 100, 0.01) && vicino((box.min.z + box.max.z) / 2, -100, 0.01),
+    `ruotato ${ruotato} · y ${box.min.y}..${box.max.y} · x ${box.min.x}..${box.max.x} · z ${box.min.z}..${box.max.z}`);
+  prova('distanza dalla faccia: 0 dopo l\'accostamento', vicino(mod.distanzaDaFaccia(verts(leg), sotto.punto, sotto.normale), 0, 0.01));
+
+  // Adatta con un pezzo ruotato di 30° in pianta: allungato in larghezza fino a un muro (faccia toccata)
+  {
+    const pq = mod.nuovoProgetto();
+    const muro = mod.nuovoPezzo(pq, 'pannello'); muro.L = 2000; muro.W = 1000; muro.rot = mod.rotazioneDa('frontale'); muro.pos = [-500, 0, -800];
+    const r = mod.nuovoPezzo(pq, 'pannello'); r.L = 400; r.W = 300; r.rot = [-90, 30, 0]; r.pos = [0, 400, 0];
+    const faccia = { normale: new Vector3(0, 0, 1), punto: new Vector3(0, 500, -800 + 18) };
+    const prima = r.W, esito = mod.adatta(r, muro, { faccia, asse: 'y' });
+    const vv = verts(r), zMin = Math.min(...vv.map(q => q.z));
+    prova('adatta un pezzo ruotato di 30°, in larghezza, fino alla faccia toccata', esito.ok && r.W > prima && r.L === 400 && vicino(zMin, -782, 0.05) && r.tagli.length === 1, `${esito.msg} · W ${r.W} · z min ${zMin}`);
+    const r2 = mod.nuovoPezzo(pq, 'pannello'); r2.rot = mod.rotazioneDa('frontale'); r2.pos = [0, 0, 0];
+    prova('adatta: la lunghezza parallela alla faccia dà un messaggio chiaro', !mod.adatta(r2, muro, { faccia, asse: 'x' }).ok);
+    prova('assePerFaccia: testa → x, bordo → y, faccia grande → null', mod.assePerFaccia(r2, new Vector3(1, 0, 0)) === 'x' && mod.assePerFaccia(r2, new Vector3(0, 1, 0)) === 'y' && mod.assePerFaccia(r2, new Vector3(0, 0, 1)) === null);
+  }
+  prova('misure scritte con l\'unità', mod.leggiMisura('76 cm') === 760 && mod.leggiMisura('760') === 760 && mod.leggiMisura('0,76m') === 760 && vicino(mod.leggiMisura('30"'), 762, 0.01) && mod.leggiMisura('abc') === null);
+  mod.unita.u = 'cm';
+  prova('unità cm: «76» vale 760 mm e si scrive 76 cm', mod.leggiMisura('76') === 760 && mod.fmtU(760, true) === '76 cm' && mod.fmtU(18) === '1,8');
+  mod.unita.u = 'mm';
+}
+
+// 18. Disegno 2D: pieni, fori passanti e scassi
+{
+  const { normalizzaDisegno, formeDaPezzo } = await import('./js/disegno2d.js');
+  const { ingombroDisegno } = await import('./js/geometria.js');
+  const pr = mod.nuovoProgetto(), p = mod.nuovoPezzo(pr, 'pannello');
+  const forme = [
+    { tipo: 'rett', cx: 1200, cy: 500, w: 400, h: 300, rot: 0, modo: 'pieno' },
+    { tipo: 'ellisse', cx: 1100, cy: 500, w: 100, h: 100, rot: 0, modo: 'vuoto' },
+    { tipo: 'rett', cx: 1300, cy: 500, w: 100, h: 50, rot: 0, modo: 'vuoto', prof: 10 },
+  ];
+  const n = normalizzaDisegno(forme);
+  prova('disegno: normalizzato in (0, 0), ingombro 400 × 300', n.L === 400 && n.W === 300 && n.forme[0].cx === 200 && n.forme[0].cy === 150, `${n.L} × ${n.W}`);
+  Object.assign(p, { forma: 'disegno', disegno: { forme: n.forme }, L: n.L, W: n.W });
+  const g = geometriaPezzo(p), cerchio = Math.PI * 50 * 50;
+  const atteso = (400 * 300 - cerchio) * 18 - 100 * 50 * 10;
+  prova('disegno: volume = pieno − foro Ø 100 − scasso 100×50×10', vicino(g.volume / atteso, 1, 0.005), `${Math.round(g.volume)} / ${Math.round(atteso)}`);
+  prova('disegno: due pieni sovrapposti si uniscono', vicino(ingombroDisegno({ forme: [forme[0], { tipo: 'rett', cx: 1450, cy: 500, w: 200, h: 100, rot: 0, modo: 'pieno' }] }).max[0], 1550, 0.01));
+  const ruotato = ingombroDisegno({ forme: [{ tipo: 'rett', cx: 0, cy: 0, w: 100, h: 100, rot: 45, modo: 'pieno' }] });
+  prova('disegno: quadrato ruotato di 45° → ingombro 141,4', vicino(ruotato.max[0] - ruotato.min[0], 141.42, 0.05));
+  const esa = ingombroDisegno({ forme: [{ tipo: 'poligono', lati: 6, cx: 0, cy: 0, w: 200, h: 200, rot: 0, modo: 'pieno' }] });
+  prova('disegno: esagono inscritto in Ø 200', vicino(esa.max[1], 100, 0.01) && vicino(esa.max[0], 86.6, 0.05));
+  const lin = ingombroDisegno({ forme: [{ tipo: 'linea', cx: 0, cy: 0, w: 0, h: 0, rot: 0, modo: 'pieno', punti: [{ x: 0, y: 0 }, { x: 300, y: 0 }, { x: 0, y: 200 }] }] });
+  prova('disegno: linea a punti (triangolo) anche in senso orario', vicino(lin.max[0], 300, 0.01) && vicino(lin.max[1], 200, 0.01));
+  prova('disegno: senza pieni il pezzo è vuoto', ingombroDisegno({ forme: [forme[1]] }) === null && !geometriaPezzo({ ...p, disegno: { forme: [n.forme[1]] } }));
+  const r = righeDistinta(pr)[0];
+  prova('distinta: pezzo disegnato con foro e scasso', /disegnato/.test(r.forma.join()) && /1 foro passante/.test(r.forma.join()) && /1 scasso \(10 mm\)/.test(r.forma.join()) && r.L === 400, r.forma.join(' · '));
+  const dxf = dxfPezzi(pr);
+  prova('DXF: layer dello scasso con la profondità', /_SCASSO_10mm/.test(dxf));
+  prova('disegni: scasso tratteggiato nel disegno quotato', /pz-scasso/.test(htmlDisegno(pr, p)));
+  const tondo = mod.nuovoPezzo(pr, 'pannello'); tondo.forma = 'cerchio'; tondo.D = 500;
+  prova('forme di partenza: rettangolo, cerchio e sagoma diventano forme', formeDaPezzo(tondo)[0].tipo === 'ellisse' && formeDaPezzo(mod.nuovoPezzo(pr, 'pannello'))[0].tipo === 'rett' && formeDaPezzo({ forma: 'sagoma', L: 100, W: 50, sagoma: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 0, y: 50 }] })[0].punti.length === 3);
+}
+
+// 19. Maniglie (ridimensiona) e lastra scelta per il progetto
+{
+  const pr = mod.nuovoProgetto(), p = mod.nuovoPezzo(pr, 'pannello');
+  p.rot = [0, 0, 0]; p.pos = [0, 0, 0]; p.L = 800; p.W = 400;
+  p.tagli = [{ n: [-1, 0, 0], d: -755, da: null }]; // testa B tagliata a 755
+  const lung = q => { const g = geometriaPezzo(q); return g.max[0] - g.min[0]; };
+  prova('ridimensiona: pezzo tagliato a 755, la testa B col taglio si allunga', vicino(lung(p), 755, 0.01));
+  mod.ridimensiona(p, 'x', 'max', 845);
+  prova('ridimensiona: il taglio della testa B segue (755 → 800 finiti)', p.L === 845 && vicino(lung(p), 800, 0.01), `${p.L} ${lung(p)}`);
+  const q = mod.nuovoPezzo(pr, 'pannello'); q.rot = [0, 0, 0]; q.pos = [1000, 0, 0]; q.L = 500; q.W = 300;
+  mod.ridimensiona(q, 'x', 'min', 600);
+  prova('ridimensiona dal lato A: la testa B resta ferma', q.L === 600 && vicino(q.pos[0], 900, 0.01));
+  mod.ridimensiona(q, 'y', 'max', 350);
+  prova('ridimensiona la larghezza', q.W === 350);
+  prova('maniglie: sagome no, listelli solo in lunghezza', mod.assiManiglie({ tipo: 'listello', forma: 'rett' }).join() === 'x' && !mod.assiManiglie({ tipo: 'pannello', forma: 'sagoma' }).length);
+  const g0 = schemaDiTaglio(pr)[0];
+  pr.lastre = { [g0.materiale.id]: [1000, 600] };
+  const g1 = schemaDiTaglio(pr)[0];
+  prova('schema: lastra scelta per il progetto', g1.formatoProgetto && g1.materiale.lastra[0] === 1000 && g1.fogli.length >= 2 && g1.catalogo.lastra[0] === g0.materiale.lastra[0], `${g1.fogli.length} lastre`);
+}
+
+// 20. Adatta: faccia lontana, pezzo troppo lungo, testa A, piano inclinato
+{
+  const pr = mod.nuovoProgetto();
+  const piano = mod.nuovoPezzo(pr, 'pannello'); piano.rot = mod.rotazioneDa('orizzontale'); piano.pos = [-200, 800, 200]; piano.L = 800; piano.W = 600;
+  const gamba = (L = 700, y = 0) => { const g = mod.nuovoPezzo(pr, 'listello'); g.rot = mod.rotazioneDa('verticale'); g.pos = [100, y, 0]; g.L = L; return g; };
+  const ys = p => { const g = geometriaPezzo(p), m = mod.matrice(p), v = g.vertici.map(x => new Vector3(...x).applyMatrix4(m).y); return [Math.min(...v), Math.max(...v)]; };
+  const su = { normale: new Vector3(0, 1, 0), punto: new Vector3(0, 818, 0) }, giu = { normale: new Vector3(0, -1, 0), punto: new Vector3(0, 800, 0) };
+  let g = gamba(); let r = mod.adatta(g, piano, { faccia: su, asse: 'x', lato: 'max' });
+  prova('adatta: toccando il sopra del piano la gamba arriva a filo (non sparisce)', r.ok && vicino(ys(g)[1], 818, 0.01) && g.L === 818, `${r.msg} L ${g.L}`);
+  g = gamba(1000); r = mod.adatta(g, piano, { faccia: giu, asse: 'x' });
+  prova('adatta: un pezzo troppo lungo si accorcia fino al taglio (L = misura finita)', r.ok && g.L === 800 && vicino(ys(g)[1], 800, 0.01), `L ${g.L}`);
+  const pav = mod.nuovoPezzo(pr, 'pannello'); pav.rot = mod.rotazioneDa('orizzontale'); pav.pos = [-200, -18, 200];
+  g = gamba(700, 100); r = mod.adatta(g, pav, { faccia: { normale: new Vector3(0, 1, 0), punto: new Vector3(0, 0, 0) }, asse: 'x', lato: 'min' });
+  prova('adatta dalla testa A: scende fino al pavimento, la testa B resta ferma', r.ok && vicino(ys(g)[0], 0, 0.01) && vicino(ys(g)[1], 800, 0.01));
+  const incl = mod.nuovoPezzo(pr, 'pannello'); incl.rot = [-70, 0, 0]; incl.pos = [-200, 800, 200]; incl.L = 800; incl.W = 800;
+  g = gamba(1200); r = mod.adatta(g, incl, { asse: 'x' });
+  const gg = geometriaPezzo(g);
+  prova('adatta su piano inclinato: taglio obliquo e lunghezza = parte che resta', r.ok && /obliquo|inclinata/.test(r.msg) && vicino(g.L, gg.max[0] - gg.min[0], 0.11), `${r.msg} L ${g.L} vs ${gg.max[0] - gg.min[0]}`);
+}
+
+// 21. Pezzi bloccati che intagliano, fori e forme sul pezzo
+{
+  const pr = mod.nuovoProgetto();
+  const piano = mod.nuovoPezzo(pr, 'pannello'); piano.rot = mod.rotazioneDa('orizzontale'); piano.pos = [0, 300, 0]; piano.L = 1000; piano.W = 600;
+  const gamba = mod.nuovoPezzo(pr, 'listello'); gamba.rot = mod.rotazioneDa('verticale'); gamba.pos = [100, 0, -100]; gamba.L = 700;
+  const vol0 = geometriaPezzo(piano).volume;
+  aggiornaIntagli(pr);
+  prova('intagli: senza pezzi bloccati la sovrapposizione non taglia', !piano.intagli);
+  gamba.bloccato = true; aggiornaIntagli(pr);
+  const vol1 = geometriaPezzo(piano).volume, atteso = 45 * 45 * 18;
+  prova('intagli: la gamba bloccata scava il ripiano (45 × 45 × 18)', piano.intagli?.length === 1 && vicino(vol0 - vol1, atteso, 5), `${vol0 - vol1} vs ${atteso}`);
+  prova('intagli: la gamba bloccata resta intera', !gamba.intagli && vicino(geometriaPezzo(gamba).volume, 45 * 45 * 700, 5));
+  mod.sposta(gamba, [200, 0, 0]); aggiornaIntagli(pr);
+  const g = geometriaPezzo(piano), m = mod.matrice(piano);
+  prova('intagli: se la gamba si sposta, l\'intaglio la segue', vicino(geometriaPezzo(piano).volume, vol1, 5) && piano.intagli[0].m[12] > 250, String(piano.intagli[0].m[12]));
+  mod.sposta(gamba, [2000, 0, 0]); aggiornaIntagli(pr);
+  prova('intagli: se non si toccano più, l\'intaglio sparisce', !piano.intagli && vicino(geometriaPezzo(piano).volume, vol0, 1));
+  const tav = mod.nuovoPezzo(pr, 'pannello'); tav.rot = [0, 0, 0]; tav.pos = [0, 0, 0]; tav.L = 800; tav.W = 400;
+  tav.lavorazioni = [{ tipo: 'ellisse', w: 40, h: 40, rot: 0, prof: 0, ax: 'dx', dx: 100, ay: 'c', dy: 0 }];
+  const v0 = geometriaPezzo(tav).volume;
+  prova('fori sul pezzo: foro Ø 40 passante', vicino(800 * 400 * 18 - v0, Math.PI * 400 * 18, 300), String(800 * 400 * 18 - v0));
+  mod.ridimensiona(tav, 'x', 'max', 1000);
+  const f = formeLavorazioni(tav)[0];
+  prova('fori sul pezzo: ridimensionando resta Ø 40 e a 100 dal bordo destro', f.w === 40 && f.cx === 900 && f.cy === 200);
+  const l = lavorazioneDa({ tipo: 'rett', cx: 50, cy: 200, w: 30, h: 10, modo: 'vuoto' }, 1000, 400);
+  prova('fori sul pezzo: ancora al bordo più vicino o al centro', l.ax === 'sx' && l.dx === 50 && l.ay === 'c' && l.dy === 0 && !('cx' in l));
+  const r = righeDistinta(pr).find(x => x.nome === tav.nome);
+  prova('distinta: fori sul pezzo', /1 foro passante/.test(r.forma.join()));
+}
+
+// 22. Cassetti: tipi di guida e mobile girato
+{
+  const vano = { x0: 18, x1: 782, y0: 404, y1: 750, zFronte: 0, profondita: 497, n: 1, spessoreFianchi: 18, matCassone: 'mb12', matFrontale: 'mb18', frontale: 'sovrapposto' };
+  const crea = (guida, extra = {}) => { const pr = mod.nuovoProgetto(); const r = creaCassetti(pr, { ...vano, guida, ...extra }); return { pr, r, p: nome => pr.pezzi.find(x => x.nome.endsWith(nome)) }; };
+  let c = crea({ tipo: 'sfere', gioco: 12.5 });
+  prova('cassetto a sfere: gioco 12,5 per lato e guide da 450', c.r.ok && c.r.guida === 450 && vicino(c.p('fianco sinistro').pos[0], 30.5, 0.01) && c.p('fianco sinistro').ferramenta[0].gioco === 12.5);
+  c = crea({ tipo: 'sfere', gioco: 13, lunghezza: 400 });
+  prova('cassetto: gioco e lunghezza delle guide impostabili', c.r.guida === 400 && vicino(c.p('fianco destro').pos[0], 782 - 13 - 12, 0.01));
+  c = crea({ tipo: 'sotto' });
+  prova('cassetto con guide nascoste: 5 mm per lato, 14 sotto', c.r.ok && vicino(c.p('fianco sinistro').pos[0], 23, 0.01) && vicino(c.p('fianco sinistro').pos[1], 418, 0.01) && c.p('fianco sinistro').ferramenta[0].modello === 'sotto');
+  c = crea({ tipo: 'legno', gioco: 1, listello: [20, 25] });
+  const ls = c.p('listello di scorrimento sinistro'), fs = c.p('fianco sinistro');
+  prova('cassetto su listelli: due listelli fissi, il fianco ci appoggia sopra', c.r.ok && ls && !ls.mobile && vicino(ls.pos[1] + 20, fs.pos[1], 0.01) && vicino(fs.pos[0], 19, 0.01) && !fs.ferramenta.length, JSON.stringify(ls?.pos));
+  c.pr.pezzi.forEach(x => { x.tagli = x.tagli || []; });
+  const ctr = controlli(c.pr);
+  prova('cassetto su listelli: niente compenetrazioni', !ctr.avvisi.some(a => /compenetr|entra/i.test(a)), ctr.avvisi.join(' | '));
+  c = crea({ tipo: 'sfere', gioco: 12.5 }, { ruota: Math.PI / 2 });
+  const fr = c.p('frontale'), q = mod.ingombro(fr);
+  prova('cassetto nel mobile girato: il frontale guarda verso +X', vicino(q.max.x - q.min.x, 18, 0.01) && q.max.z - q.min.z > 700);
+}
+
+// 23. Compositore: mobili a livelli, colonne, moduli affiancati, scrivanie
+{
+  const { calcola, composizioneDa, genera, nuovoLivello, normalizza } = await import('./js/compositore.js');
+  const liv = (q, m = 0, c = 0) => q.moduli[m].colonne[c].livelli;
+  const como = composizioneDa('como'), q = calcola(como);
+  // 850 − zoccolo 60 − base e cielo 36 = 754 per i cassetti
+  prova('comò: un livello di cassetti alto 754, sopra la base', q.ok && liv(q).length === 1 && vicino(liv(q)[0].h, 754, 0.01) && vicino(liv(q)[0].y0, 78, 0.01), JSON.stringify(liv(q)));
+  const pr = mod.nuovoProgetto(), r = genera(pr, como, 'm1');
+  const fronti = r.pezzi.filter(p => p.ruolo === 'frontale').sort((a, b) => a.pos[1] - b.pos[1]);
+  const giu = fronti[0].pos[1], su = fronti.at(-1).pos[1] + fronti.at(-1).W;
+  prova('comò: 4 frontali che coprono base e cielo (1,5 mm di fuga)', r.ok && fronti.length === 4 && vicino(giu, 61.5, 0.01) && vicino(su, 848.5, 0.01) && vicino(fronti[0].L, 997, 0.01), `${giu} ${su} ${fronti[0].L}`);
+  prova('comò: tutti i pezzi ricordano il mobile', r.pezzi.every(p => p.comp === 'm1') && r.pezzi.some(p => p.nome === 'Fianco sinistro'));
+  const la = composizioneDa('libreria-ante'), pl = mod.nuovoProgetto(), rl = genera(pl, la, 'm2');
+  const ante = rl.pezzi.filter(p => /^Anta/.test(p.nome)), fisso = rl.pezzi.find(p => /Ripiano fisso/.test(p.nome));
+  prova('libreria con ante: ripiano fisso a 878, ante fino al suo bordo alto', rl.ok && fisso && vicino(fisso.pos[1], 878, 0.01) && ante.length === 2 && vicino(ante[0].pos[1] + ante[0].W, 878 + 18 - 1.5, 0.01), JSON.stringify(ante.map(a => [a.pos[1], a.W])));
+  const sbagliata = composizioneDa('credenza');
+  sbagliata.moduli[0].colonne[0].livelli.forEach(l => { if (l.h === 'auto') l.h = 200; });
+  prova('altezze che non tornano: messaggio chiaro', !calcola(sbagliata).ok && /Avanzano/.test(calcola(sbagliata).errori[0]), calcola(sbagliata).errori.join(' '));
+  const bassa = composizioneDa('como'); bassa.moduli[0].H = 300;
+  prova('cassetti in poco spazio: «troppo basso»', !calcola(bassa).ok && /troppo basso/.test(calcola(bassa).errori.join(' ')), calcola(bassa).errori.join(' '));
+  const cuc = composizioneDa('base-cucina'), pc = mod.nuovoProgetto(), rc = genera(pc, cuc, 'm3'), piano = rc.pezzi.find(p => p.nome === 'Piano');
+  prova('base cucina: piano da 40 che sporge 20, cassa alta 860', rc.ok && mod.dimensioni(piano).T === 40 && piano.W === 600 && vicino(piano.pos[1], 860, 0.01), JSON.stringify(piano && [piano.pos, piano.W]));
+  prova('base cucina: nessuna compenetrazione', !controlli(pc).avvisi.some(a => /compenetr/i.test(a)), controlli(pc).avvisi.join(' | '));
+  prova('nuovo livello «ante»: altezza auto, ante auto, un ripiano', JSON.stringify(nuovoLivello('ante')) === JSON.stringify({ tipo: 'ante', h: 'auto', ante: 'auto', ripiani: 1 }));
+  // composizioni salvate con la 0.17 (livelli con zoccolo e piano): stessi pezzi
+  const vecchia = { nome: 'X', L: 600, H: 900, P: 580, T: 18, schienale: true, livelli: [{ tipo: 'zoccolo', h: 100 }, nuovoLivello('ante'), { tipo: 'piano', h: 40, sporge: 20, lati: 0 }] };
+  const nv = normalizza(vecchia), pv = mod.nuovoProgetto(), rv = genera(pv, vecchia, 'v');
+  prova('composizione della 0.17: diventa un modulo con zoccolo e piano', nv.moduli[0].zoccolo === 100 && nv.moduli[0].piano.h === 40 && nv.moduli[0].colonne[0].livelli.length === 1 && rv.ok && rv.pezzi.some(p => p.nome === 'Piano'));
+  // colonne: cassetti a sinistra, ante a destra; frontali e ante si dividono il divisorio a metà
+  const madia = composizioneDa('madia'), qm = calcola(madia), pm = mod.nuovoProgetto(), rm = genera(pm, madia, 'm4');
+  const div = rm.pezzi.find(p => /Divisorio/.test(p.nome)), fr = rm.pezzi.filter(p => p.ruolo === 'frontale'), an = rm.pezzi.filter(p => /^Anta/.test(p.nome));
+  const xDiv = qm.moduli[0].colonne[0].x1; // 18 + 450
+  prova('madia: due colonne, divisorio tra 468 e 486', qm.ok && div && vicino(div.pos[0], xDiv + 18, 0.01) && vicino(qm.moduli[0].colonne[1].w, 1400 - 36 - 18 - 450, 0.01), JSON.stringify(div?.pos));
+  prova('madia: frontali fino a metà divisorio, ante da metà divisorio (3 mm tra loro)', fr.length === 4 && vicino(fr[0].pos[0] + fr[0].L, xDiv + 9 - 1.5, 0.01) && vicino(Math.min(...an.map(a => a.pos[0])), xDiv + 9 + 1.5, 0.01), JSON.stringify([fr[0].pos[0], fr[0].L, an.map(a => a.pos[0])]));
+  prova('madia: nessuna compenetrazione', !controlli(pm).avvisi.some(a => /compenetr/i.test(a)), controlli(pm).avvisi.join(' | '));
+  // libreria con scrivania: la scrivania si appoggia alla libreria (meno profonda: gamba davanti) e sta a filo del muro
+  const ls = composizioneDa('libreria-scrivania'), qs = calcola(ls), ps = mod.nuovoProgetto(), rs = genera(ps, ls, 'm5');
+  const pianoS = rs.pezzi.find(p => p.nome === 'Piano della scrivania'), listello = rs.pezzi.find(p => /Listello di appoggio sinistro/.test(p.nome));
+  const gambe = rs.pezzi.filter(p => /^Gamba/.test(p.nome)), fianco = rs.pezzi.find(p => p.nome === 'Fianco sinistro');
+  prova('libreria con scrivania: appoggio «mobile + gamba», 3 gambe, listello lungo 310', qs.ok && qs.moduli[1].so.sx === 'mobile+gamba' && gambe.length === 3 && listello?.L === 310, JSON.stringify([qs.moduli[1].so, gambe.length, listello?.L]));
+  const bL = mod.ingombro(fianco), bS = mod.ingombro(pianoS);
+  prova('libreria con scrivania: retro allineato, piano accanto alla libreria a 725', vicino(bL.min.z, bS.min.z, 0.01) && vicino(bS.min.x, 800, 0.01) && vicino(bS.min.y, 725, 0.01), JSON.stringify([bL.min, bS.min]));
+  prova('libreria con scrivania: nessuna compenetrazione', !controlli(ps).avvisi.some(a => /compenetr/i.test(a)), controlli(ps).avvisi.join(' | '));
+  const sc = composizioneDa('scrivania-cassettiera'), pk = mod.nuovoProgetto(), rk = genera(pk, sc, 'm6');
+  prova('scrivania con cassettiera: 3 frontali sotto il piano, nessuna compenetrazione', rk.ok && rk.pezzi.filter(p => p.ruolo === 'frontale').length === 3 && !controlli(pk).avvisi.some(a => /compenetr/i.test(a)), controlli(pk).avvisi.join(' | '));
+  const troppa = composizioneDa('scrivania-cassettiera'); troppa.moduli[0].cassettiera.L = 1300;
+  prova('cassettiera troppo larga: messaggio chiaro', !calcola(troppa).ok && /non sta sotto/.test(calcola(troppa).errori.join(' ')));
+}
+
+document.getElementById('esiti').innerHTML = esiti.map(e => `<li class="${e.ok ? 'ok' : 'ko'}">${e.ok ? '✓' : '✗'} ${e.nome} <small>${e.dettaglio}</small></li>`).join('');
+const ko = esiti.filter(e => !e.ok).length;
+document.getElementById('riassunto').textContent = ko ? `FALLITE ${ko} su ${esiti.length}` : `TUTTE OK (${esiti.length})`;
+</script></body></html>
