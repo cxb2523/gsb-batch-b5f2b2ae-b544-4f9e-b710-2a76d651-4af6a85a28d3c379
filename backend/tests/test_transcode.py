@@ -296,6 +296,158 @@ class TestTranscodeAdmission:
         assert kwargs.get("stdin") is subprocess.DEVNULL
 
 
+class TestCacheInvalidation:
+    def test_missing_source_invalidates_the_cache(self, tmp_path, monkeypatch) -> None:
+        """A cache file whose source WAV is gone is stale and must not be served."""
+        from app.services import transcode as transcode_module
+
+        wav = tmp_path / "job_denoised.wav"  # cleaned up already: never written
+        stale = tmp_path / "job_denoised.mp3"
+        stale.write_bytes(b"stale")
+
+        def forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError("ffmpeg must not run for a missing source")
+
+        monkeypatch.setattr(subprocess, "run", forbidden)
+        with pytest.raises(FileNotFoundError):
+            transcode_output(wav, "mp3")
+
+        # Nothing is held: the slot is free and no conversion is registered
+        assert _TRANSCODE_SLOTS.acquire(blocking=False)
+        _TRANSCODE_SLOTS.release()
+        assert transcode_module._in_flight == {}
+
+    def test_cache_hit_while_source_lives_skips_ffmpeg(self, wav_file, monkeypatch) -> None:
+        """The source check does not break the normal cache hit."""
+        cached = wav_file.with_suffix(".mp3")
+        cached.write_bytes(b"cached")
+
+        def forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError("cached format must not reconvert")
+
+        monkeypatch.setattr(subprocess, "run", forbidden)
+        assert transcode_output(wav_file, "mp3") == cached
+
+
+class TestConcurrentSameFormat:
+    def test_concurrent_same_format_shares_one_conversion(self, wav_file, monkeypatch) -> None:
+        """Two simultaneous downloads of one format run ffmpeg once; the late
+        arrival waits for the first conversion and serves its cached result."""
+        from app.services import transcode as transcode_module
+
+        calls: list[list[str]] = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(list(argv))
+            entered.set()
+            assert release.wait(timeout=10), "test never released fake ffmpeg"
+            Path(argv[-1]).write_bytes(b"encoded")
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        results: list[Path] = []
+        errors: list[Exception] = []
+
+        def convert() -> None:
+            try:
+                results.append(transcode_output(wav_file, "mp3"))
+            except Exception as e:
+                errors.append(e)
+
+        first = threading.Thread(target=convert)
+        first.start()
+        assert entered.wait(timeout=5), "first conversion never reached ffmpeg"
+        # The first conversion is in flight now, so the second thread must
+        # become a waiter on it rather than an owner
+        second = threading.Thread(target=convert)
+        second.start()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        target = wav_file.with_suffix(".mp3")
+        assert errors == []
+        assert sorted(results) == [target, target]
+        assert len(calls) == 1
+        assert transcode_module._in_flight == {}
+
+    def test_waiter_retries_after_the_owners_failure(self, wav_file, monkeypatch) -> None:
+        """A failed conversion frees its waiters to convert for themselves,
+        and leaves no cache, temp file, slot, or in-flight entry behind."""
+        from app.services import transcode as transcode_module
+
+        attempts = 0
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                entered.set()
+                assert release.wait(timeout=10), "test never released fake ffmpeg"
+                return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"boom")
+            Path(argv[-1]).write_bytes(b"encoded")
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        outcomes: list[object] = []
+
+        def convert() -> None:
+            try:
+                outcomes.append(transcode_output(wav_file, "mp3"))
+            except TranscodeError as e:
+                outcomes.append(e)
+
+        first = threading.Thread(target=convert)
+        first.start()
+        assert entered.wait(timeout=5), "first conversion never reached ffmpeg"
+        second = threading.Thread(target=convert)
+        second.start()
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        # The owner failed; the waiter became the owner and succeeded
+        assert len(outcomes) == 2
+        assert sum(isinstance(o, TranscodeError) for o in outcomes) == 1
+        assert wav_file.with_suffix(".mp3") in outcomes
+        assert attempts == 2
+
+        # No residue: only the source and the retried conversion remain
+        leftovers = [
+            p
+            for p in wav_file.parent.iterdir()
+            if p not in (wav_file, wav_file.with_suffix(".mp3"))
+        ]
+        assert leftovers == []
+        assert transcode_module._in_flight == {}
+        assert _TRANSCODE_SLOTS.acquire(blocking=False)
+        _TRANSCODE_SLOTS.release()
+
+    def test_failed_conversion_leaves_no_in_flight_entry(self, wav_file, monkeypatch) -> None:
+        """After a failure the target is immediately convertible again."""
+        from app.services import transcode as transcode_module
+
+        def failing_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"boom")
+
+        monkeypatch.setattr(subprocess, "run", failing_run)
+        with pytest.raises(TranscodeError):
+            transcode_output(wav_file, "mp3")
+
+        assert transcode_module._in_flight == {}
+
+        def ok_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            Path(argv[-1]).write_bytes(b"encoded")
+            return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", ok_run)
+        assert transcode_output(wav_file, "mp3") == wav_file.with_suffix(".mp3")
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_real_ffmpeg_roundtrip(tmp_path) -> None:
     """Real conversion of a genuine tiny WAV for every non-wav format."""

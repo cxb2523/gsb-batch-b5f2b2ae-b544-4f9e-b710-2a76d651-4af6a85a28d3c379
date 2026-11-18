@@ -31,6 +31,14 @@ _FFMPEG_TIMEOUT_SECONDS = 120
 # cancelled HTTP request cannot free capacity while ffmpeg still runs.
 _TRANSCODE_SLOTS = threading.BoundedSemaphore(1)
 
+# Conversions in progress, keyed by their target path. A second request for
+# the same job and format waits on the owner's event instead of launching a
+# competing ffmpeg or failing busy; when the owner finishes, the waiter
+# re-checks the cache and serves the file the owner wrote. Different formats
+# map to different keys, so they still contend for the single slot above.
+_in_flight_lock = threading.Lock()
+_in_flight: dict[Path, threading.Event] = {}
+
 # Formats servable for download, mapped to media types. wav is the model's
 # native output and is served directly without conversion.
 DOWNLOAD_FORMATS: dict[str, str] = {
@@ -47,7 +55,11 @@ def transcode_output(wav_path: Path, fmt: str) -> Path:
 
     The encoder is inferred by ffmpeg from the output extension. Results are
     written atomically and cached, so repeat downloads of the same format
-    never reconvert.
+    never reconvert. The cache is valid only while its source is: a leftover
+    conversion whose result WAV is gone is never served, so a cleaned-up job
+    cannot leak back through its cache. Concurrent requests for the same
+    target share one conversion: the first caller converts, the rest wait and
+    serve its result.
 
     Args:
         wav_path: Path to the restored 16kHz mono WAV.
@@ -67,13 +79,53 @@ def transcode_output(wav_path: Path, fmt: str) -> Path:
         raise TranscodeError(f"Unsupported download format: {fmt}")
 
     target = wav_path.with_suffix(f".{fmt}")
-    if target.exists():
-        return target
+    while True:
+        # The source is stated before the cache is consulted, so a missing
+        # source raises FileNotFoundError even when a stale cache file
+        # survives it, and a source that disappears while waiting for another
+        # thread's conversion is caught on the next pass.
+        source_size = wav_path.stat().st_size
+        if target.exists():
+            return target
 
+        with _in_flight_lock:
+            event = _in_flight.get(target)
+            if event is None:
+                event = threading.Event()
+                _in_flight[target] = event
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            # Another thread is already producing this exact file; wait for
+            # it, then loop: serve its result, or become the owner and retry
+            # if its conversion left nothing behind.
+            event.wait()
+            continue
+
+        try:
+            return _convert(wav_path, fmt, target, source_size)
+        finally:
+            # Whatever happened above, the target's waiters must be woken and
+            # a later request must be able to start a fresh conversion.
+            with _in_flight_lock:
+                del _in_flight[target]
+            event.set()
+
+
+def _convert(wav_path: Path, fmt: str, target: Path, source_size: int) -> Path:
+    """Run the conversion to *target* as the owner of its in-flight entry.
+
+    The caller registered the in-flight entry and clears it afterwards.
+
+    Raises:
+        TranscodeBusyError: If the conversion slot or the byte budget is full.
+        TranscodeError: If ffmpeg fails or times out.
+    """
     # Deliberately conservative reservation (2x source) so no per-codec
     # output-size proof is required; released when the subprocess exits. The
     # source is read before the slot is taken, so a missing source holds nothing.
-    reservation = wav_path.stat().st_size * 2
+    reservation = source_size * 2
     if not _TRANSCODE_SLOTS.acquire(blocking=False):
         logger.warning("Conversion slot busy; rejecting %s to %s", wav_path.name, fmt)
         raise TranscodeBusyError("Another conversion is in progress")

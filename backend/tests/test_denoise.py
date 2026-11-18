@@ -449,6 +449,55 @@ def test_download_conversion_failure_returns_500_and_releases_guard(
     assert client.get(f"/api/v1/download/{job_id}").status_code == 200
 
 
+def test_download_returns_404_when_only_a_stale_cache_remains(
+    client, mock_denoiser
+) -> None:
+    """A leftover conversion cache is not served once the result WAV is gone."""
+    from app.services.jobs import job_manager
+
+    r = client.post(
+        "/api/v1/denoise",
+        files={"file": ("song.wav", SMALL_WAV, "audio/wav")},
+    )
+    job_id = r.json()["job_id"]
+    result = app.state.file_store.result_path(job_id)
+    # A cache generated earlier, now orphaned: the result itself is gone
+    result.with_suffix(".mp3").write_bytes(b"stale")
+    result.unlink()
+
+    d = client.get(f"/api/v1/download/{job_id}?format=mp3")
+
+    assert d.status_code == 404
+    assert job_id not in job_manager._downloading
+
+
+def test_download_maps_source_vanishing_mid_request_to_404(
+    client, mock_denoiser, monkeypatch
+) -> None:
+    """If the source disappears between the existence check and the conversion,
+    the transcoder's FileNotFoundError is the same 404, not a 500."""
+    from app.routes import denoise as denoise_module
+    from app.services.jobs import job_manager
+
+    def gone_transcode(wav_path, fmt):  # type: ignore[no-untyped-def]
+        raise FileNotFoundError(wav_path)
+
+    monkeypatch.setattr(denoise_module, "transcode_output", gone_transcode)
+
+    r = client.post(
+        "/api/v1/denoise",
+        files={"file": ("song.wav", SMALL_WAV, "audio/wav")},
+    )
+    job_id = r.json()["job_id"]
+    d = client.get(f"/api/v1/download/{job_id}?format=mp3")
+
+    assert d.status_code == 404
+    assert d.json()["detail"] == "File not found"
+    # Guard released: a wav download still succeeds afterwards
+    assert job_id not in job_manager._downloading
+    assert client.get(f"/api/v1/download/{job_id}").status_code == 200
+
+
 def test_status_response_does_not_leak_download_stem(client, mock_denoiser) -> None:
     """download_stem is internal-only, like client_ip."""
     r = client.post(

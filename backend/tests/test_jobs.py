@@ -262,6 +262,47 @@ async def test_cleanup_keeps_the_record_when_its_files_cannot_be_deleted(
     assert not stuck_file.exists()
 
 
+async def test_cleanup_removes_caches_even_when_the_result_file_resists(
+    tmp_path, monkeypatch
+) -> None:
+    """A result WAV that cannot be deleted does not strand the job's cached
+    conversions, and the rest of the cleanup pass still completes."""
+    monkeypatch.setattr(settings, "processed_dir", tmp_path)
+    clock = FakeWallClock()
+    store = InMemoryJobStore(10, 10, _TTL, clock=clock)
+    await _finished(store, STUCK)
+    await _finished(store, FINE)
+    clock.advance(_TTL + 1)
+    stuck_wav = tmp_path / f"{STUCK}_denoised.wav"
+    stuck_mp3 = tmp_path / f"{STUCK}_denoised.mp3"
+    fine_wav = tmp_path / f"{FINE}_denoised.wav"
+    for f in (stuck_wav, stuck_mp3, fine_wav):
+        f.write_bytes(b"x")
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == stuck_wav:
+            raise PermissionError("cannot delete")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    mgr = JobManager()
+
+    removed = await mgr.cleanup_expired(store, _files())
+
+    # STUCK keeps its record for a retry, but its cache is already gone and
+    # the failure did not stop FINE from being cleaned up
+    assert removed == 1
+    assert await store.expired_ids() == [STUCK]
+    assert stuck_wav.exists()
+    assert not stuck_mp3.exists()
+    assert not fine_wav.exists()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert await mgr.cleanup_expired(store, _files()) == 1
+    assert not stuck_wav.exists()
+
+
 # --- download guard ---
 
 

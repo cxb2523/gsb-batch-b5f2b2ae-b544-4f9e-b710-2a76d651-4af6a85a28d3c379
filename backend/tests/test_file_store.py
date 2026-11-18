@@ -45,6 +45,30 @@ class TestLocalFileStore(FileStoreContract):
 
         assert not any(f.exists() for f in files)
 
+    def test_delete_results_removes_every_file_it_can(self, tmp_path: Path, monkeypatch) -> None:
+        """One undeletable file neither strands the job's other files nor goes
+        unreported: the rest are removed and the failure is still raised."""
+        job_id = str(uuid.uuid4())
+        store = LocalFileStore(tmp_path)
+        result = store.result_path(job_id)
+        cached = result.with_suffix(".mp3")
+        for f in (result, cached):
+            f.write_bytes(b"x")
+        real_unlink = Path.unlink
+
+        def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+            if self == result:
+                raise PermissionError("locked")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+        with pytest.raises(OSError, match="locked"):
+            store.delete_results(job_id)
+
+        assert result.exists()
+        assert not cached.exists()
+
 
 def test_build_file_store_roots_the_local_adapter_at_processed_dir() -> None:
     """The local backend stores results where the artifact budget looks."""

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Protocol, assert_never
 
 from app.config import FileStoreBackend, settings
+
+logger = logging.getLogger(__name__)
 
 
 class FileStore(Protocol):
@@ -85,9 +88,23 @@ class LocalFileStore:
         return self._root / f"{_checked_job_id(job_id)}_denoised.wav"
 
     def delete_results(self, job_id: str) -> None:
-        """Remove the job's result and any cached conversions. Safe to repeat."""
+        """Remove the job's result and any cached conversions. Safe to repeat.
+
+        Every matched file is attempted even when one cannot be removed, so a
+        single stuck file does not strand the job's cached conversions; the
+        first failure is re-raised afterwards, so the caller still knows the
+        job is not fully deleted and must keep its record for a retry.
+        """
+        first_error: OSError | None = None
         for path in self._root.glob(f"{_checked_job_id(job_id)}_denoised.*"):
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("Could not delete %s: %s", path.name, e)
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            raise first_error
 
 
 def build_file_store(backend: FileStoreBackend) -> FileStore:

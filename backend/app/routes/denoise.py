@@ -448,6 +448,10 @@ async def download_audio(job_id: str, request: Request, format: str = Query("wav
 
         try:
             serve_path = await run_in_threadpool(transcode_output, output_path, fmt)
+        except FileNotFoundError as err:
+            # The result vanished between the existence check above and the
+            # conversion; a stale cache must not stand in for it
+            raise HTTPException(status_code=404, detail="File not found") from err
         except TranscodeBusyError as err:
             raise HTTPException(
                 status_code=503,
