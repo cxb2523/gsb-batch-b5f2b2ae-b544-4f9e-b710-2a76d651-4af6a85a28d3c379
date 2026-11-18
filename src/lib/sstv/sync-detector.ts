@@ -21,6 +21,15 @@ export enum SyncPulseWidth {
   None,
 }
 
+/**
+ * Line sync pulse width used by an SSTV mode.
+ * Robot/Scottie modes use 9ms line sync pulses, PD modes use 20ms.
+ */
+export enum SyncPulseMode {
+  NineMilliSeconds,
+  TwentyMilliSeconds,
+}
+
 export interface SyncPulseDetection {
   detected: boolean;
   width: SyncPulseWidth;
@@ -41,6 +50,13 @@ export class SyncDetector {
   private scanLineBandwidth: number;
   private syncPulseFrequencyValue: number;
   private syncPulseFrequencyTolerance: number;
+
+  /**
+   * Line sync width accepted for the active mode.
+   * null = accept both 9ms and 20ms (unconfigured/legacy behavior).
+   * 5ms VIS pulses are always rejected regardless of this setting.
+   */
+  private acceptedLineSyncWidth: SyncPulseWidth | null = null;
 
   private syncPulse5msMinSamples: number;
   private syncPulse5msMaxSamples: number;
@@ -191,15 +207,35 @@ export class SyncDetector {
         }
         this.syncPulseCounter = 0;
       } else {
-        // Valid sync pulse detected!
+        // Classify the pulse width
+        let pulseWidth: SyncPulseWidth;
         if (this.syncPulseCounter < this.syncPulse5msMaxSamples) {
-          syncPulseWidth = SyncPulseWidth.FiveMilliSeconds;
+          pulseWidth = SyncPulseWidth.FiveMilliSeconds;
         } else if (this.syncPulseCounter < this.syncPulse9msMaxSamples) {
-          syncPulseWidth = SyncPulseWidth.NineMilliSeconds;
+          pulseWidth = SyncPulseWidth.NineMilliSeconds;
         } else {
-          syncPulseWidth = SyncPulseWidth.TwentyMilliSeconds;
+          pulseWidth = SyncPulseWidth.TwentyMilliSeconds;
         }
 
+        // 5ms pulses belong to the VIS code and are never line sync pulses.
+        // In addition, only the line sync width of the active mode is accepted:
+        // a 9ms mode rejects 20ms pulses and a 20ms mode rejects 9ms pulses.
+        const acceptedByMode =
+          this.acceptedLineSyncWidth === null ||
+          pulseWidth === this.acceptedLineSyncWidth;
+        if (pulseWidth === SyncPulseWidth.FiveMilliSeconds || !acceptedByMode) {
+          const reason =
+            pulseWidth === SyncPulseWidth.FiveMilliSeconds
+              ? '5ms VIS pulse (always ignored)'
+              : `width ${pulseWidth} not accepted by active mode`;
+          console.log(`⏭️ Ignored pulse: ${reason}, counter=${this.syncPulseCounter}`);
+          this.syncPulseCounter = 0;
+          this.debugMaxCounter = 0;
+          continue;
+        }
+
+        // Valid line sync pulse for the active mode detected!
+        syncPulseWidth = pulseWidth;
         syncPulseOffset = i - this.syncPulseFilterDelay;
         frequencyOffset = syncPulseDelayedValue - this.syncPulseFrequencyValue;
         syncPulseDetected = true;
@@ -241,11 +277,29 @@ export class SyncDetector {
     };
   }
 
+  /**
+   * Select which line sync pulse width the active SSTV mode uses.
+   * Also resets all internal state (counters, filters, delay lines) so no
+   * samples from the previous mode leak into detections for the new mode.
+   */
+  setSyncPulseMode(mode: SyncPulseMode): void {
+    this.acceptedLineSyncWidth =
+      mode === SyncPulseMode.TwentyMilliSeconds
+        ? SyncPulseWidth.TwentyMilliSeconds
+        : SyncPulseWidth.NineMilliSeconds;
+    this.reset();
+  }
+
   reset(): void {
     this.syncPulseFilter.reset();
     this.frequencyModulation.reset();
     this.syncPulseTrigger.reset();
     this.syncPulseValueDelay.reset();
+    this.baseBandLowPass.reset();
+    this.baseBandOscillator.reset();
     this.syncPulseCounter = 0;
+    this.debugSampleCount = 0;
+    this.debugLastLogTime = 0;
+    this.debugMaxCounter = 0;
   }
 }

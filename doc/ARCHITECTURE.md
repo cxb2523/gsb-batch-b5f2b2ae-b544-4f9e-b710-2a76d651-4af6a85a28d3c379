@@ -136,6 +136,9 @@ src/lib/sstv/
 │       ├── FM demodulates baseband signal
 │       ├── Applies moving average filter
 │       ├── Uses Schmitt trigger to detect sync threshold crossings
+│       ├── setSyncPulseMode() selects the active mode's line sync width:
+│       │   9ms modes reject 20ms pulses and vice versa; 5ms VIS pulses are always ignored
+│       ├── reset()/setSyncPulseMode() clear every counter, filter and delay line
 │       └── Returns pulse width classification + frequency offset calibration
 │
 ├── robot36-line-decoder.ts # Robot36 line decoding
@@ -152,8 +155,13 @@ src/lib/sstv/
         ├── Maintains dual circular buffers (raw audio + FM demodulated)
         ├── Processes samples through sync detector continuously
         ├── When sync pulse detected, extracts line between sync boundaries
-        ├── Passes extracted line to Robot36LineDecoder
+        ├── Passes extracted line to the active mode's line decoder
         ├── Updates canvas with decoded RGB pixel data
+        ├── First line is only decoded once two valid sync pulses have been seen
+        ├── setMode() swaps image dimensions, line decoder and sync width at
+        │   runtime, clearing all buffers/progress so no old-mode half line carries over
+        ├── reset()/start() restore a clean initial state (buffers, write pointer,
+        │   last sync position, frequency offset and detector/decoder internals)
         └── Tracks signal strength, frequency offset, and decode progress
 ```
 

@@ -173,8 +173,10 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
                   </svg>
                   <div className="text-sm text-[#8b949e]">
                     <p>
-                      <strong className="text-[#c9d1d9]">Note:</strong> Changing modes will reset the
-                      current decoding session. Make sure to save your image before switching.
+                      <strong className="text-[#c9d1d9]">Note:</strong> You can switch modes even while
+                      decoding. The current session is reset immediately — buffered audio and the partial
+                      image are cleared, and decoding continues with the new mode&apos;s timing. Save any
+                      image you want to keep first.
                     </p>
                   </div>
                 </div>

@@ -50,6 +50,10 @@ export class Phasor {
     while (this.phase < -Math.PI) this.phase += 2 * Math.PI;
     return result;
   }
+
+  reset(): void {
+    this.phase = 0;
+  }
 }
 
 export class FrequencyModulation {
@@ -292,6 +296,18 @@ export class ComplexConvolution {
       }
     }
     return this.sum;
+  }
+
+  /**
+   * Clear the filter delay line and running sum.
+   * Filter taps are preserved.
+   */
+  reset(): void {
+    this.real.fill(0);
+    this.imag.fill(0);
+    this.pos = 0;
+    this.sum.real = 0;
+    this.sum.imag = 0;
   }
 
   /**

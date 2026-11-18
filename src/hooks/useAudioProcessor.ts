@@ -27,6 +27,9 @@ export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
   const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Float32Array[]>([]);
+  // Always-current mode so callbacks created once never read a stale mode
+  const modeRef = useRef<SSTVMode>(mode);
+  modeRef.current = mode;
 
   // Check browser support on mount
   useEffect(() => {
@@ -156,7 +159,7 @@ export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
       }
 
       // Initialize and start decoder with the actual sample rate and selected mode
-      decoderRef.current = new SSTVDecoder(audioContext.sampleRate, mode);
+      decoderRef.current = new SSTVDecoder(audioContext.sampleRate, modeRef.current);
       decoderRef.current.start();
 
       setState(prev => ({
@@ -231,6 +234,26 @@ export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
     }
   };
 
+  /**
+   * Switch SSTV mode, including while a decoding session is running.
+   * The decoder swaps its line decoder/sync timing and discards all
+   * buffered samples and previously decoded lines for the old mode.
+   */
+  const changeMode = (newMode: SSTVMode) => {
+    if (newMode === modeRef.current) {
+      return;
+    }
+    modeRef.current = newMode;
+    if (decoderRef.current) {
+      decoderRef.current.setMode(newMode);
+      // Surface the fresh (zeroed) stats immediately
+      setState(prev => ({
+        ...prev,
+        stats: decoderRef.current ? decoderRef.current.getStats() : prev.stats,
+      }));
+    }
+  };
+
   const getImageData = (): Uint8ClampedArray | null => {
     return decoderRef.current ? decoderRef.current.getImageData() : null;
   };
@@ -240,7 +263,7 @@ export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
       return decoderRef.current.getDimensions();
     }
     // Return dimensions based on current mode
-    const modeConfig = SSTV_MODES[mode];
+    const modeConfig = SSTV_MODES[modeRef.current];
     return { width: modeConfig.width, height: modeConfig.height };
   };
 
@@ -337,6 +360,7 @@ export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
     startRecording,
     stopRecording,
     resetDecoder,
+    changeMode,
     getImageData,
     getDimensions,
     getAnalyser,

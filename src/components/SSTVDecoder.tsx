@@ -23,16 +23,16 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
     startRecording,
     stopRecording,
     resetDecoder,
+    changeMode,
     getImageData,
     getDimensions,
     getAnalyser,
   } = useAudioProcessor(selectedMode);
 
   const handleModeChange = (newMode: SSTVMode) => {
-    // Stop recording if active
-    if (state.isRecording) {
-      stopRecording();
-    }
+    // Switching modes is supported mid-session: the decoder swaps its timing
+    // and line decoder and discards the old mode's buffered/decoded content.
+    changeMode(newMode);
     onModeChange(newMode);
   };
 
@@ -436,7 +436,6 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
       <SettingsPanel
         currentMode={selectedMode}
         onModeChange={handleModeChange}
-        disabled={state.isRecording}
       />
 
       {/* Controls */}

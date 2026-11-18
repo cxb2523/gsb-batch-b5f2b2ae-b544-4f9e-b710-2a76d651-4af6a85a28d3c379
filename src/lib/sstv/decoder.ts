@@ -1,5 +1,5 @@
 import { SSTV_MODES, SSTVMode, SAMPLE_RATE } from './constants';
-import { SyncDetector, SyncPulseWidth } from './sync-detector';
+import { SyncDetector, SyncPulseWidth, SyncPulseMode } from './sync-detector';
 import { Robot36LineDecoder, DecodedLine as Robot36DecodedLine } from './robot36-line-decoder';
 import { Robot72LineDecoder, DecodedLine as Robot72DecodedLine } from './robot72-line-decoder';
 import { PD120LineDecoder, DecodedLine as PD120DecodedLine } from './pd120-line-decoder';
@@ -9,6 +9,8 @@ import { ScottieS1LineDecoder, DecodedLine as ScottieS1DecodedLine } from './sco
 import { ScottieS2LineDecoder, DecodedLine as ScottieS2DecodedLine } from './scottie-s2-line-decoder';
 
 type DecodedLine = Robot36DecodedLine | Robot72DecodedLine | PD120DecodedLine | PD160DecodedLine | PD180DecodedLine | ScottieS1DecodedLine | ScottieS2DecodedLine;
+
+type LineDecoder = Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder;
 
 export enum DecoderState {
   IDLE = 'IDLE',
@@ -46,7 +48,7 @@ export class SSTVDecoder {
 
   // Sync detection
   private syncDetector: SyncDetector;
-  private lineDecoder: Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder;
+  private lineDecoder: LineDecoder;
 
   // Line boundaries detected by sync pulses
   private lastSyncPos: number = -1;
@@ -64,41 +66,68 @@ export class SSTVDecoder {
     this.mode = SSTV_MODES[modeName];
 
     // Initialize image data based on mode dimensions
-    this.imageData = new Uint8ClampedArray(this.mode.width * this.mode.height * 4);
-
-    // Initialize with black
-    for (let i = 0; i < this.imageData.length; i += 4) {
-      this.imageData[i] = 0;       // R
-      this.imageData[i + 1] = 0;   // G
-      this.imageData[i + 2] = 0;   // B
-      this.imageData[i + 3] = 255; // A
-    }
+    this.imageData = this.createBlackImage(this.mode.width, this.mode.height);
 
     // Buffer size: 7 seconds (max line ~752ms for PD180 + safety margin)
     this.bufferSize = Math.floor(sampleRate * 7);
     this.audioBuffer = new Float32Array(this.bufferSize);
     this.demodulatedBuffer = new Float32Array(this.bufferSize);
 
-    // Create sync detector and mode-specific line decoder
+    // Create sync detector and configure it for the initial mode's sync width
     this.syncDetector = new SyncDetector(sampleRate);
-    if (modeName === 'ROBOT36') {
-      this.lineDecoder = new Robot36LineDecoder(sampleRate);
-    } else if (modeName === 'ROBOT72') {
-      this.lineDecoder = new Robot72LineDecoder(sampleRate);
-    } else if (modeName === 'SCOTTIE_S1') {
-      this.lineDecoder = new ScottieS1LineDecoder(sampleRate);
-    } else if (modeName === 'SCOTTIE_S2') {
-      this.lineDecoder = new ScottieS2LineDecoder(sampleRate);
-    } else if (modeName === 'PD120') {
-      this.lineDecoder = new PD120LineDecoder(sampleRate);
-    } else if (modeName === 'PD160') {
-      this.lineDecoder = new PD160LineDecoder(sampleRate);
-    } else if (modeName === 'PD180') {
-      this.lineDecoder = new PD180LineDecoder(sampleRate);
-    } else {
-      // Default to PD120 for unknown modes
-      this.lineDecoder = new PD120LineDecoder(sampleRate);
+    this.syncDetector.setSyncPulseMode(this.syncPulseModeFor(this.mode));
+
+    // Create the mode-specific line decoder
+    this.lineDecoder = this.createLineDecoder(modeName, sampleRate);
+  }
+
+  /**
+   * Create the line decoder matching the given SSTV mode.
+   * Unknown modes fall back to PD120.
+   */
+  private createLineDecoder(modeName: keyof typeof SSTV_MODES, sampleRate: number): LineDecoder {
+    switch (modeName) {
+      case 'ROBOT36':
+        return new Robot36LineDecoder(sampleRate);
+      case 'ROBOT72':
+        return new Robot72LineDecoder(sampleRate);
+      case 'SCOTTIE_S1':
+        return new ScottieS1LineDecoder(sampleRate);
+      case 'SCOTTIE_S2':
+        return new ScottieS2LineDecoder(sampleRate);
+      case 'PD120':
+        return new PD120LineDecoder(sampleRate);
+      case 'PD160':
+        return new PD160LineDecoder(sampleRate);
+      case 'PD180':
+        return new PD180LineDecoder(sampleRate);
+      default:
+        // Default to PD120 for unknown modes
+        return new PD120LineDecoder(sampleRate);
     }
+  }
+
+  /**
+   * Map an SSTV mode to its line sync pulse width.
+   */
+  private syncPulseModeFor(mode: SSTVMode): SyncPulseMode {
+    return mode.syncPulse >= 20
+      ? SyncPulseMode.TwentyMilliSeconds
+      : SyncPulseMode.NineMilliSeconds;
+  }
+
+  /**
+   * Allocate an RGBA image buffer of the given size, initialized to black.
+   */
+  private createBlackImage(width: number, height: number): Uint8ClampedArray {
+    const image = new Uint8ClampedArray(width * height * 4);
+    for (let i = 0; i < image.length; i += 4) {
+      image[i] = 0;       // R
+      image[i + 1] = 0;   // G
+      image[i + 2] = 0;   // B
+      image[i + 3] = 255; // A
+    }
+    return image;
   }
 
   // Sample counter for periodic logging
@@ -148,14 +177,24 @@ export class SSTVDecoder {
       // Calculate absolute position in buffer (where sync pulse ended)
       const syncEndPos = (this.bufferWritePos - samples.length + result.offset + this.bufferSize) % this.bufferSize;
 
-      // Only process if this is a new sync pulse (9ms or 20ms)
-      if ((result.width === SyncPulseWidth.NineMilliSeconds || result.width === SyncPulseWidth.TwentyMilliSeconds) &&
+      // Only process if this is a new line sync pulse matching the active mode.
+      // The SyncDetector already enforces this; guard again here so a wrong-width
+      // pulse can never anchor a line or update the frequency calibration.
+      const expectedWidth =
+        this.mode.syncPulse >= 20
+          ? SyncPulseWidth.TwentyMilliSeconds
+          : SyncPulseWidth.NineMilliSeconds;
+      if (result.width === expectedWidth &&
           (this.lastSyncPos === -1 || this.distanceInBuffer(this.lastSyncPos, syncEndPos) > this.sampleRate * 0.1)) {
 
         // Update frequency calibration
         this.frequencyOffset = result.frequencyOffset;
 
-        // If we have a previous sync, decode the line between them
+        // If we have a previous sync, decode the line between them.
+        // The first line is only decoded once two valid sync pulses for the
+        // active mode have been observed (lastSyncPos starts at -1 after
+        // start/reset/setMode), so a half line carried over from a previous
+        // session can never be decoded.
         if (this.lastSyncPos !== -1) {
           const distance = this.distanceInBuffer(this.lastSyncPos, syncEndPos);
           console.log(`📏 Decoding line between syncs: distance=${distance} samples (${(distance/this.sampleRate*1000).toFixed(1)}ms)`);
@@ -166,6 +205,8 @@ export class SSTVDecoder {
         this.lastSyncWidth = result.width;
       } else if (result.width === SyncPulseWidth.FiveMilliSeconds) {
         console.log(`⏭️ Skipping 5ms sync (VIS code)`);
+      } else if (result.detected) {
+        console.log(`⏭️ Skipping sync: width ${result.width} does not match active mode (${expectedWidth})`);
       } else {
         console.log(`⏭️ Skipping sync: too close to last`);
       }
@@ -282,9 +323,52 @@ export class SSTVDecoder {
   }
 
   /**
-   * Reset decoder
+   * Switch the decoder to another SSTV mode while it is running.
+   *
+   * After the switch everything matches the new mode: image dimensions,
+   * total line count, line decoder and accepted sync pulse width. All
+   * previously decoded content is discarded, progress returns to zero and
+   * every buffered sample (raw and demodulated), write pointer, last sync
+   * position/width and frequency offset are cleared, so a half line from the
+   * previous mode cannot carry into the new one. The running/stopped state
+   * itself is preserved.
    */
-  reset(): void {
+  setMode(modeName: keyof typeof SSTV_MODES): void {
+    if (modeName === this.modeName) {
+      return;
+    }
+
+    this.modeName = modeName;
+    this.mode = SSTV_MODES[modeName];
+
+    // Recreate the image buffer at the new mode's dimensions (black)
+    this.imageData = this.createBlackImage(this.mode.width, this.mode.height);
+
+    // Swap in the line decoder for the new mode
+    this.lineDecoder = this.createLineDecoder(modeName, this.sampleRate);
+
+    // Restrict sync detection to the new mode's pulse width and reset every
+    // filter/delay line/counter inside the sync detector
+    this.syncDetector.setSyncPulseMode(this.syncPulseModeFor(this.mode));
+
+    // Return all buffering and calibration state to a clean initial state
+    this.resetBufferedState();
+
+    console.log(`Switched SSTV decoder to mode ${modeName} (${this.mode.width}x${this.mode.height}, ${this.mode.syncPulse}ms sync)`);
+  }
+
+  /**
+   * Get the currently active mode name
+   */
+  getMode(): keyof typeof SSTV_MODES {
+    return this.modeName;
+  }
+
+  /**
+   * Reset all buffering, sync and calibration state without changing mode.
+   * Shared by reset(), start() and setMode().
+   */
+  private resetBufferedState(): void {
     this.currentLine = 0;
     this.bufferWritePos = 0;
     this.lastSyncPos = -1;
@@ -293,27 +377,35 @@ export class SSTVDecoder {
     this.sampleCounter = 0;
     this.lastLogTime = 0;
     this.absoluteSamplePosition = 0;
+    this.signalStrength = 0;
 
-    // Reset sync detector state
+    // Reset sync detector and line decoder internal state (filters, delay
+    // lines, counters and interlacing buffers)
     this.syncDetector.reset();
     this.lineDecoder.reset();
 
-    // Clear audio buffer
+    // Clear both circular buffers so no previous-mode samples remain
     this.audioBuffer.fill(0);
+    this.demodulatedBuffer.fill(0);
+  }
 
-    // Clear image data to black
-    for (let i = 0; i < this.imageData.length; i += 4) {
-      this.imageData[i] = 0;       // R
-      this.imageData[i + 1] = 0;   // G
-      this.imageData[i + 2] = 0;   // B
-      this.imageData[i + 3] = 255; // A
-    }
+  /**
+   * Reset decoder
+   */
+  reset(): void {
+    this.resetBufferedState();
+
+    // Clear image data to black (keep the current mode's dimensions)
+    this.imageData = this.createBlackImage(this.mode.width, this.mode.height);
   }
 
   /**
    * Start decoding
    */
   start(): void {
+    // Always begin from a completely clean state, including audio buffer,
+    // demodulation buffer, write pointer, last sync position and frequency
+    // offset. The first decoded line still requires two valid sync pulses.
     this.reset();
     this.state = DecoderState.DECODING_IMAGE;
     console.log('Starting SSTV decode with sync detection');

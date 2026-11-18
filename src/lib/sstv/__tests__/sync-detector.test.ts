@@ -1,7 +1,53 @@
-import { SyncDetector, SyncPulseWidth } from '../sync-detector';
+import { SyncDetector, SyncPulseWidth, SyncPulseMode } from '../sync-detector';
 
 describe('SyncDetector', () => {
   const sampleRate = 48000;
+
+  /**
+   * Build a signal containing one 1200Hz pulse of the given duration followed
+   * by a 1900Hz gap, and feed it through the detector in fixed-size chunks
+   * (mirrors the browser's audio processing blocks).
+   * Returns the first detection result (if any) produced while processing.
+   */
+  function feedPulse(
+    detector: SyncDetector,
+    pulseMs: number,
+    gapMs: number = 30,
+    chunkSize: number = 2048
+  ): { detected: boolean; width: SyncPulseWidth } | null {
+    const pulseSamples = Math.round((pulseMs / 1000) * sampleRate);
+    const gapSamples = Math.round((gapMs / 1000) * sampleRate);
+    const input = new Float32Array(pulseSamples + gapSamples);
+    let phase = 0;
+    const writeTone = (freq: number, offset: number, length: number) => {
+      for (let i = 0; i < length; i++) {
+        input[offset + i] = 0.8 * Math.sin(phase);
+        phase += (2 * Math.PI * freq) / sampleRate;
+      }
+    };
+    writeTone(1200, 0, pulseSamples);
+    writeTone(1900, pulseSamples, gapSamples);
+
+    // Warm up the detector's filters with idle (1900Hz) audio first
+    const warmup = new Float32Array(Math.round(0.05 * sampleRate));
+    let warmPhase = 0;
+    for (let i = 0; i < warmup.length; i++) {
+      warmup[i] = 0.8 * Math.sin(warmPhase);
+      warmPhase += (2 * Math.PI * 1900) / sampleRate;
+    }
+    detector.process(warmup, new Float32Array(warmup.length));
+
+    let result: { detected: boolean; width: SyncPulseWidth } | null = null;
+    for (let off = 0; off < input.length; off += chunkSize) {
+      const part = input.subarray(off, Math.min(off + chunkSize, input.length));
+      const demod = new Float32Array(part.length);
+      const r = detector.process(part, demod);
+      if (r.detected && result === null) {
+        result = { detected: true, width: r.width };
+      }
+    }
+    return result;
+  }
 
   describe('Initialization', () => {
     test('creates instance with valid sample rate', () => {
@@ -256,6 +302,123 @@ describe('SyncDetector', () => {
       ]);
 
       expect(values.size).toBe(4);
+    });
+  });
+
+  describe('Mode-specific pulse width acceptance', () => {
+    test('9ms mode accepts 9ms sync pulses', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+
+      const result = feedPulse(detector, 9);
+
+      expect(result).not.toBeNull();
+      expect(result?.detected).toBe(true);
+      expect(result?.width).toBe(SyncPulseWidth.NineMilliSeconds);
+    });
+
+    test('9ms mode rejects 20ms sync pulses', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+
+      const result = feedPulse(detector, 20);
+
+      expect(result).toBeNull();
+    });
+
+    test('20ms mode accepts 20ms sync pulses', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.TwentyMilliSeconds);
+
+      const result = feedPulse(detector, 20);
+
+      expect(result).not.toBeNull();
+      expect(result?.detected).toBe(true);
+      expect(result?.width).toBe(SyncPulseWidth.TwentyMilliSeconds);
+    });
+
+    test('20ms mode rejects 9ms sync pulses', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.TwentyMilliSeconds);
+
+      const result = feedPulse(detector, 9);
+
+      expect(result).toBeNull();
+    });
+
+    test('5ms VIS pulses are always ignored in 9ms mode', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+
+      const result = feedPulse(detector, 5);
+
+      expect(result).toBeNull();
+    });
+
+    test('5ms VIS pulses are always ignored in 20ms mode', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.TwentyMilliSeconds);
+
+      const result = feedPulse(detector, 5);
+
+      expect(result).toBeNull();
+    });
+
+    test('unconfigured detector accepts both 9ms and 20ms line sync pulses', () => {
+      const detector9 = new SyncDetector(sampleRate);
+      const result9 = feedPulse(detector9, 9);
+      expect(result9?.width).toBe(SyncPulseWidth.NineMilliSeconds);
+
+      const detector20 = new SyncDetector(sampleRate);
+      const result20 = feedPulse(detector20, 20);
+      expect(result20?.width).toBe(SyncPulseWidth.TwentyMilliSeconds);
+
+      // 5ms VIS pulses remain ignored even without a configured mode
+      const detector5 = new SyncDetector(sampleRate);
+      expect(feedPulse(detector5, 5)).toBeNull();
+    });
+  });
+
+  describe('Mode switching and reset', () => {
+    test('switching from 9ms to 20ms mode changes accepted pulse width', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+      expect(feedPulse(detector, 20)).toBeNull();
+
+      detector.setSyncPulseMode(SyncPulseMode.TwentyMilliSeconds);
+      const result = feedPulse(detector, 20);
+      expect(result?.width).toBe(SyncPulseWidth.TwentyMilliSeconds);
+    });
+
+    test('switching from 20ms to 9ms mode changes accepted pulse width', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.TwentyMilliSeconds);
+      expect(feedPulse(detector, 9)).toBeNull();
+
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+      const result = feedPulse(detector, 9);
+      expect(result?.width).toBe(SyncPulseWidth.NineMilliSeconds);
+    });
+
+    test('reset clears internal state so a half pulse cannot complete after it', () => {
+      const detector = new SyncDetector(sampleRate);
+      detector.setSyncPulseMode(SyncPulseMode.NineMilliSeconds);
+
+      // Feed the first half of a 9ms pulse, then reset before it completes
+      const halfSamples = Math.round(0.0045 * sampleRate);
+      const half = new Float32Array(halfSamples);
+      let phase = 0;
+      for (let i = 0; i < halfSamples; i++) {
+        half[i] = 0.8 * Math.sin(phase);
+        phase += (2 * Math.PI * 1200) / sampleRate;
+      }
+      detector.process(half, new Float32Array(halfSamples));
+      detector.reset();
+
+      // After reset, finishing the pulse with another 1200Hz segment plus a
+      // gap must not produce a detection assembled across the reset boundary
+      const result = feedPulse(detector, 4.5, 30);
+      expect(result).toBeNull();
     });
   });
 });
