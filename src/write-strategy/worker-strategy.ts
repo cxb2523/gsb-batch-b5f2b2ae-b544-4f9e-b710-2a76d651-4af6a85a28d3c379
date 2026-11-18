@@ -25,7 +25,7 @@ class Context<FillerParams> {
   private readonly _node: OutputStreamNode
   private readonly _bufferContext: FillerFrameBufferContext
   private readonly _fillerParam: FillerParams
-  private readonly _worker: Worker
+  private _worker: Worker | null
 
   /**
    * Creates an instance of PlayContext.
@@ -66,19 +66,23 @@ class Context<FillerParams> {
    */
   private init() {
     return new Promise<void>((resolve) => {
+      const worker = this._worker
+      if (worker === null) {
+        throw new Error('Invalid state: worker is already terminated.')
+      }
       const message: MessageToWorker<FillerParams> = {
         type: 'init',
         config: this._bufferContext,
         fillerParams: this._fillerParam,
       }
-      this._worker.postMessage(message)
+      worker.postMessage(message)
       const listener = (ev: MessageEvent<MessageToStrategy>) => {
         if (ev.data.type === 'init-done') {
-          this._worker.removeEventListener('message', listener)
+          worker.removeEventListener('message', listener)
           resolve()
         }
       }
-      this._worker.addEventListener('message', listener)
+      worker.addEventListener('message', listener)
     })
   }
 
@@ -86,18 +90,31 @@ class Context<FillerParams> {
    * Starts the buffer filling process by sending the 'start' message to the worker.
    */
   public start() {
+    const worker = this._worker
+    if (worker === null) {
+      throw new Error('Invalid state: worker is already terminated.')
+    }
     const message: MessageToWorker<FillerParams> = {
       type: 'start',
     }
-    this._worker.postMessage(message)
+    worker.postMessage(message)
   }
 
   /**
-   * Stops the worker and terminates it.
+   * Terminates the worker and releases the internal reference.
+   * Idempotent: it is safe to call more than once, including when a filler-driven
+   * automatic stop races with an external stop(). Only the first call terminates
+   * the worker; subsequent calls are no-ops, so no duplicate termination can occur
+   * and no worker (or its filling timer) can remain alive after teardown.
    */
   public stopped() {
-    this._worker.onmessage = null
-    this._worker.terminate()
+    const worker = this._worker
+    if (worker === null) {
+      return
+    }
+    this._worker = null
+    worker.onmessage = null
+    worker.terminate()
   }
 }
 
@@ -144,11 +161,17 @@ export class WorkerBufferWriteStrategy<FillerParam> implements BufferWriteStrate
 
   /**
    * Stops the strategy.
+   * Terminates the worker and clears the internal play context.
+   * Idempotent: repeated calls (for example a filler-driven automatic stop racing
+   * with an external node.stop()) do not terminate the worker twice or throw,
+   * and no filling timer or worker instance is left behind.
    */
   onStopped(): void {
-    if (!this._context) {
-      throw new Error('Invalid state: context is null.')
+    const context = this._context
+    if (context === null) {
+      return
     }
-    this._context.stopped()
+    this._context = null
+    context.stopped()
   }
 }
