@@ -188,6 +188,51 @@ function getPartFromCoords(variant, point) {
   return part;
 }
 
+// Normalise an entry of the uv map ([x, y, width, height]) into a positive
+// width / height rectangle.
+function normalizeUVRect([x, y, width, height]) {
+  if (width < 0) {
+    x += width;
+    width *= -1;
+  }
+
+  if (height < 0) {
+    y += height;
+    height *= -1;
+  }
+
+  return {x, y, width, height};
+}
+
+// Find the face (part, layer, face) a texture pixel belongs to, along with the
+// rectangle that face occupies on the texture.
+function getFaceFromCoords(variant, point) {
+  const uv = MODEL_MAP[variant];
+  if (!uv) { return undefined; }
+
+  const x = Math.floor(point.x);
+  const y = Math.floor(point.y);
+
+  for (const [key, value] of Object.entries(uv)) {
+    const rect = normalizeUVRect(value);
+
+    if (x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height) {
+      const match = key.match(/^(.+)_(base|overlay)_(front|back|left|right|top|bottom)$/);
+      if (!match) { continue; }
+
+      return {
+        key,
+        part: match[1],
+        layer: match[2],
+        face: match[3],
+        rect,
+      };
+    }
+  }
+
+  return undefined;
+}
+
 function getMirroredCoords(variant, point) {
   const uv = MODEL_MAP[variant];
   const part = getPartFromCoords(variant, point);
@@ -237,26 +282,7 @@ function clearLayer(inputCanvas, variant, layer) {
 }
 
 function getUV(variant, part) {
-  const uv = MODEL_MAP[variant][part];
-
-  let x = uv[0];
-  let y = uv[1];
-  let width = uv[2];
-  let height = uv[3];
-
-  if (width < 0) {
-    x += width;
-    width *= -1;
-  }
-
-  if (height < 0) {
-    y += height;
-    height *= -1;
-  }
-
-  return {
-    x, y, width, height
-  }
+  return normalizeUVRect(MODEL_MAP[variant][part]);
 }
 
 function getUVFromCoords(variant, point) {
@@ -326,4 +352,4 @@ function mergeLayers(inputCanvas, sourceLayer, destLayer, variant) {
   return canvas;
 }
 
-export {remapUV, getMirroredCoords, swapBodyOverlay, swapFrontBack, swapLeftRight, getPartFromCoords, getUV, getUVFromCoords, getWatermarkData, clearLayer, mergeLayers}
+export {remapUV, getMirroredCoords, swapBodyOverlay, swapFrontBack, swapLeftRight, getPartFromCoords, getFaceFromCoords, getUV, getUVFromCoords, getWatermarkData, clearLayer, mergeLayers}

@@ -1,5 +1,8 @@
 import Color from "color";
 import { BaseTool } from "../base_tool.js";
+import { getFaceFromCoords } from "../../layers/texture_utils.js";
+import { clamp } from "../../../helpers.js";
+import { IMAGE_HEIGHT, IMAGE_WIDTH } from "../../../constants.js";
 
 const TRANSPARENT_COLOR = new Color("#000000").alpha(0);
 
@@ -54,7 +57,9 @@ class BucketTool extends BaseTool {
     this.replaceWithColor = this.config.get("fillStyle")==="fill-cube-replace"||this.config.get("fillStyle")==="fill-face-replace";
 
     this.cursor = point;
-    if (!this.replaceColor) {
+    if (this.isFaceMode()) {
+      this.draw_face(toolData, texture, point, color);
+    } else if (!this.replaceColor) {
       Object.keys(limbs).forEach(key => {
         if ((toolData.variant === 'slim' && key.endsWith("classic")) ||
             (toolData.variant === 'classic' && key.endsWith("slim"))) {
@@ -68,6 +73,98 @@ class BucketTool extends BaseTool {
     }
 
     return texture.toTexture();
+  }
+
+  fillStyle() {
+    return this.config.get("fillStyle");
+  }
+
+  isFaceMode() {
+    const style = this.fillStyle();
+    return style === "fill-face-connected" || style === "fill-face-replace";
+  }
+
+  // Restrict the fill to the single face under the cursor, using the uv map to
+  // resolve which part / layer / face the clicked pixel belongs to.
+  draw_face(toolData, texture, point, color) {
+    const seed = this._resolveFaceSeed(toolData.variant, point);
+    if (!seed) { return; }
+
+    const { rect } = seed;
+    const x = rect.x;
+    const y = rect.y;
+    const maxX = x + Math.abs(rect.width) - 1;
+    const maxY = y + Math.abs(rect.height) - 1;
+
+    if (this.fillStyle() === "fill-face-replace") {
+      for (let px = x; px <= maxX; px++) {
+        for (let py = y; py <= maxY; py++) {
+          texture.putPixel({ x: px, y: py }, color());
+        }
+      }
+      return;
+    }
+
+    // Face connected: four-neighbour flood fill, matching same coloured pixels
+    // and never leaving the face rectangle.
+    const { x: startX, y: startY } = seed.point;
+    const startColor = texture.getPixel({ x: startX, y: startY });
+    const queue = [{ x: startX, y: startY }];
+    const visited = new Set();
+    const filled = [];
+
+    while (queue.length > 0) {
+      const { x: px, y: py } = queue.pop();
+
+      if (px < x || px > maxX || py < y || py > maxY) continue;
+
+      const key = `${px},${py}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+
+      if (!this.colorsMatch(texture.getPixel({ x: px, y: py }), startColor)) continue;
+
+      filled.push({ x: px, y: py });
+      queue.push(
+        { x: px + 1, y: py },
+        { x: px - 1, y: py },
+        { x: px, y: py + 1 },
+        { x: px, y: py - 1 },
+      );
+    }
+
+    filled.forEach(({ x: px, y: py }) => {
+      texture.putPixel({ x: px, y: py }, color());
+    });
+  }
+
+  // Resolve the face under the cursor. If rounding places the point just
+  // outside the texture's face rectangles (e.g. exactly on a seam), snap to the
+  // nearest pixel that does belong to a face.
+  _resolveFaceSeed(variant, point) {
+    const x = clamp(Math.floor(point.x), 0, IMAGE_WIDTH - 1);
+    const y = clamp(Math.floor(point.y), 0, IMAGE_HEIGHT - 1);
+
+    const candidates = [[x, y], [x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+
+    for (const [cx, cy] of candidates) {
+      if (cx < 0 || cy < 0 || cx >= IMAGE_WIDTH || cy >= IMAGE_HEIGHT) continue;
+
+      const face = getFaceFromCoords(variant, { x: cx, y: cy });
+      if (!face) { continue; }
+
+      const { rect } = face;
+      return {
+        face,
+        rect,
+        point: {
+          x: clamp(cx, rect.x, rect.x + Math.abs(rect.width) - 1),
+          y: clamp(cy, rect.y, rect.y + Math.abs(rect.height) - 1),
+        },
+      };
+    }
+
+    return undefined;
   }
 
   move(toolData) {
