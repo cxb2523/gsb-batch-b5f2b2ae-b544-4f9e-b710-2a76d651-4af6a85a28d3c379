@@ -2,9 +2,10 @@ import { Player, type PlayerAPI, PlayerEvent, type SourceConfig } from 'bitmovin
 import { UIFactory } from 'bitmovin-player-ui';
 import 'bitmovin-player-ui/dist/css/bitmovinplayer-ui.css';
 import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from 'react';
-import { type Film, type Preview, isBeforePreview, isPastPreview, previewRemaining } from '../../../discover/model.js';
+import { type Film, type Preview } from '../../../discover/model.js';
 import { ICON } from '../cover.js';
 import { Icon } from '../Icon.js';
+import { createPreviewController } from './previewController.js';
 import { PlayerLoading, PreviewErrorCard } from './shared.js';
 
 const LOAD_TIMEOUT_MS = 30_000; // how long a source may take to load before the stage reports a failure
@@ -35,11 +36,15 @@ const clock = (sec: number) => `${Math.floor(sec / 60)}:${String(Math.floor(sec 
  * Mounts the Bitmovin Player into a ref'd node that React leaves alone, since
  * the player appends its own DOM. Overlays are siblings React controls. Mount
  * one instance per film (`key={film.id}`); the player is not reused across films.
+ *
+ * The window rules live in `previewWindow.ts`. This component only feeds it
+ * the player's events and publishes what it decides, so the player has one
+ * source of truth for "playing", "ended" and "where the window is".
  */
 export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, handoff }: PreviewPlayerProps) {
   const mountRef = useRef<HTMLDivElement>(null);
-  const playerRef = useRef<PlayerAPI | null>(null);
-  const endedRef = useRef(false); // the window has been reached; re-armed by replay
+  // Set while the player is mounted; replaying runs through the controller.
+  const replayRef = useRef<(() => boolean) | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
@@ -59,9 +64,6 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
     }
     let cancelled = false;
     let failed = false;
-    let reachedWindow = false; // positions reported before the start offset applies are not seeks
-    let seekingBack = false; // one seek back at a time, while old positions still arrive
-    const previewWindow = { startSec, durationSec };
 
     // One container per player, so teardown can detach this player's DOM alone.
     const container = document.createElement('div');
@@ -77,28 +79,34 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
       adaptation: { limitToPlayerSize: true },
       ui: false,
     });
-    playerRef.current = player;
     const uiManager = UIFactory.buildUI(player);
+
+    // The window machine drives the player: this component only publishes what
+    // it decides (the end card and the countdown) and forwards "Replay preview".
+    const controller = createPreviewController({
+      span: { startSec, durationSec },
+      player,
+      onChange: state => {
+        if (!cancelled) {
+          setEnded(state.phase === 'ended');
+          setRemaining(state.remaining);
+        }
+      },
+      // Fires exactly on the playing → ended transition, so a replay followed
+      // by another pass reports again and stale events report nothing.
+      onEnded: () => fireEnded(),
+    });
+    replayRef.current = () => controller.replay();
 
     const fail = (detail: string) => {
       if (cancelled || failed) {
         return;
       }
       failed = true;
+      controller.fail();
       void player.unload().catch(() => {}); // stop a load that is still in flight
       setError(detail);
       fireError();
-    };
-
-    const finish = () => {
-      if (cancelled || failed || endedRef.current) {
-        return;
-      }
-      endedRef.current = true;
-      player.pause();
-      setEnded(true);
-      setRemaining(0);
-      fireEnded();
     };
 
     player.on(PlayerEvent.Ready, () => {
@@ -107,24 +115,28 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
       }
     });
     player.on(PlayerEvent.TimeChanged, e => {
-      if (cancelled || failed) {
-        return;
-      }
-      if (isBeforePreview(previewWindow, e.time)) {
-        if (reachedWindow && !seekingBack) {
-          seekingBack = true;
-          player.seek(startSec); // the user sought back before the window
-        }
-        return;
-      }
-      reachedWindow = true;
-      seekingBack = false;
-      setRemaining(previewRemaining(previewWindow, e.time));
-      if (isPastPreview(previewWindow, e.time)) {
-        finish();
+      if (!cancelled && !failed) {
+        controller.time(e.time);
       }
     });
-    player.on(PlayerEvent.PlaybackFinished, finish);
+    // The player's seek bar seeks through the public API, and so do our own
+    // seeks; a seek we already started just re-reports its target, which the
+    // window machine treats as the same target (no second seek).
+    player.on(PlayerEvent.Seek, e => {
+      if (!cancelled && !failed) {
+        controller.seek(e.seekTarget);
+      }
+    });
+    player.on(PlayerEvent.Seeked, () => {
+      if (!cancelled && !failed) {
+        controller.seeked();
+      }
+    });
+    player.on(PlayerEvent.PlaybackFinished, () => {
+      if (!cancelled && !failed) {
+        controller.finished();
+      }
+    });
     player.on(PlayerEvent.Error, e => fail(`Error ${e.code}: ${e.message ?? 'playback failed'}`));
 
     const source: SourceConfig = { title: film.title, options: { startOffset: startSec } };
@@ -148,7 +160,7 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
         }
         // In a sandbox that blocks even muted autoplay the rejection is benign;
         // the user can press play.
-        player.play().catch(() => {});
+        void player.play('api').catch(() => {});
       })
       .catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)))
       .finally(() => clearTimeout(loadTimer));
@@ -156,7 +168,7 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
     return () => {
       cancelled = true;
       clearTimeout(loadTimer);
-      playerRef.current = null;
+      replayRef.current = null;
       uiManager.release();
       container.remove();
       void player.destroy().catch(() => {});
@@ -164,16 +176,9 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
   }, [film.title, stream.url, stream.type, startSec, durationSec, licenseKey]);
 
   const replay = () => {
-    const player = playerRef.current;
-    if (!player) {
-      return;
+    if (replayRef.current?.()) {
+      onReplay?.();
     }
-    endedRef.current = false; // re-arm the cut-off for the next pass
-    setEnded(false);
-    setRemaining(durationSec);
-    onReplay?.();
-    player.seek(startSec);
-    player.play().catch(() => {});
   };
 
   return (

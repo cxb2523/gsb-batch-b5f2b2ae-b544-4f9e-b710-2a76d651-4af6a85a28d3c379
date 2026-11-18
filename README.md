@@ -47,9 +47,10 @@ src/
         ├── Diagnostics.tsx         # video-capability probe for the host sandbox (DRM, fullscreen, cast…)
         ├── Icon.tsx                # inline SVG icon component
         ├── cover.ts                # inline SVG cover art, one of nine hand-drawn scenes
-        └── discover/               # DiscoverApp, TrailerReel, PreviewPlayer (+ lazy wrapper), shared bits
+        └── discover/               # DiscoverApp, TrailerReel, PreviewPlayer (+ lazy wrapper), shared bits,
+                                    #   and the pure state machines behind the preview window and the reel
 test/
-├── unit/               # Discover: catalogue, search, screens, model helpers
+├── unit/               # Discover: catalogue, search, screens, model helpers, preview window and reel state
 └── mcp.test.ts         # boots the built server and checks what it puts on the wire
 ```
 

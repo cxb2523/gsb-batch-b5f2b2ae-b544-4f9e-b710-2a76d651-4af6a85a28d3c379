@@ -1,14 +1,12 @@
 import '@/views/css/discover.css';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useReducer, useRef } from 'react';
 import { type ReelPayload, nextIndex } from '../../../discover/model.js';
 import { useAutoHeight } from '../../hooks.js';
 import { ICON, coverArt } from '../cover.js';
 import { Icon } from '../Icon.js';
 import { PreviewPlayerLazy } from './PreviewPlayerLazy.js';
+import { ADVANCE_DELAY_MS, initialReelState, reelReducer, shouldAdvance } from './reelState.js';
 import { Credits, FilmMeta, ModelContext, Topbar, WatchButton } from './shared.js';
-
-const ADVANCE_DELAY_MS = 4_000; // time the end (or error) card stays up before the reel moves on
-const MAX_FAILURES_IN_A_ROW = 3; // then the reel stops: the host is probably blocking every stream
 
 /**
  * The Trailer Reel: previews played back to back, built for the side panel
@@ -16,72 +14,42 @@ const MAX_FAILURES_IN_A_ROW = 3; // then the reel stops: the host is probably bl
  * running while the user chats. Each preview ends on a hand-off to the full
  * film; after a short beat the reel moves to the next one, and it stops after
  * the last.
+ *
+ * Which preview plays and whether a beat is due lives in `reelState.ts`; this
+ * component only arms the beat for the current preview and clears it the
+ * moment the reel moves on, so a leftover timer can never push a freshly
+ * selected film away.
  */
 export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; licenseKey: string }) {
   const rootRef = useRef<HTMLDivElement>(null);
   useAutoHeight(rootRef);
-  const [index, setIndex] = useState(0);
-  const [autoAdvance, setAutoAdvance] = useState(true);
-  // Whether the current preview is showing its end or error card, i.e. waiting to move on.
-  const [waiting, setWaiting] = useState(false);
-  const failures = useRef(0); // previews in a row that could not play
-  const advanceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [state, dispatch] = useReducer(reelReducer, initialReelState);
 
   const films = payload?.films ?? [];
-  const film = films[index];
+  const film = films[state.index];
+  const advance = film !== undefined && shouldAdvance(state, films.length);
 
-  useEffect(() => () => clearTimeout(advanceTimer.current), []);
+  // One beat per card, owned by this effect: leaving the card, moving on,
+  // switching auto-advance off or reaching the failure limit all clear it.
+  useEffect(() => {
+    if (!advance) {
+      return;
+    }
+    const from = state.index;
+    const count = films.length;
+    const timer = setTimeout(() => dispatch({ type: 'advance', from, count }), ADVANCE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [advance, state.index, films.length]);
 
-  const cancelAdvance = () => clearTimeout(advanceTimer.current);
   const goTo = (i: number) => {
-    if (i === index) {
-      return; // already playing: the card's own Replay restarts it
-    }
-    cancelAdvance();
-    failures.current = 0; // the user is choosing, so start counting afresh
-    setWaiting(false);
-    setIndex(nextIndex(i, films.length, 0));
-  };
-  /**
-   * Moves the reel on after a short beat, unless it should stop: it plays the
-   * queue once, without wrapping around, and gives up after a few previews in a
-   * row fail. Each preview builds a fresh player with its own license check, so
-   * a panel left open must not keep doing that forever.
-   */
-  const scheduleAdvance = (auto: boolean) => {
-    cancelAdvance();
-    const last = index >= films.length - 1;
-    if (auto && !last && failures.current < MAX_FAILURES_IN_A_ROW) {
-      advanceTimer.current = setTimeout(() => {
-        setWaiting(false);
-        setIndex(i => i + 1);
-      }, ADVANCE_DELAY_MS);
-    }
+    dispatch({ type: 'select', index: nextIndex(i, films.length, 0) });
   };
   // A finished preview and one that cannot play here both move the reel on, so a
   // single broken stream never stalls it; the card in between keeps the hand-off.
-  const onEnded = () => {
-    failures.current = 0;
-    setWaiting(true);
-    scheduleAdvance(autoAdvance);
-  };
-  const onError = () => {
-    failures.current++;
-    setWaiting(true);
-    scheduleAdvance(autoAdvance);
-  };
-  const onReplay = () => {
-    cancelAdvance();
-    setWaiting(false);
-  };
-  const toggleAuto = (on: boolean) => {
-    setAutoAdvance(on);
-    if (on && waiting) {
-      scheduleAdvance(true); // turned back on while a card is up: resume
-    } else if (!on) {
-      cancelAdvance(); // an advance may already be counting down
-    }
-  };
+  const onEnded = () => dispatch({ type: 'ended' });
+  const onError = () => dispatch({ type: 'error' });
+  const onReplay = () => dispatch({ type: 'replay' });
+  const toggleAuto = (on: boolean) => dispatch({ type: 'auto', on });
 
   if (!payload || !film) {
     return (
@@ -100,7 +68,7 @@ export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; li
         label="Trailer Reel"
         right={
           <span className="reel-count" aria-live="polite">
-            {index + 1} / {films.length}
+            {state.index + 1} / {films.length}
           </span>
         }
       />
@@ -126,7 +94,7 @@ export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; li
         <div className="controls">
           <WatchButton film={film} provider={provider} />
           {films.length > 1 ? (
-            <button className="iconbtn" onClick={() => goTo(index + 1)}>
+            <button className="iconbtn" onClick={() => goTo(state.index + 1)}>
               <Icon html={ICON.next} />
               Next preview
             </button>
@@ -135,7 +103,7 @@ export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; li
       </div>
 
       <label className="reel-auto">
-        <input type="checkbox" checked={autoAdvance} onChange={e => toggleAuto(e.target.checked)} />
+        <input type="checkbox" checked={state.auto} onChange={e => toggleAuto(e.target.checked)} />
         Play the next preview automatically
       </label>
 
@@ -143,8 +111,8 @@ export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; li
         {films.map((f, i) => (
           <li key={f.id}>
             <button
-              className={`reel-item ${i === index ? 'is-current' : ''}`}
-              aria-current={i === index ? 'true' : undefined}
+              className={`reel-item ${i === state.index ? 'is-current' : ''}`}
+              aria-current={i === state.index ? 'true' : undefined}
               onClick={() => goTo(i)}
             >
               <span
@@ -165,7 +133,7 @@ export function TrailerReel({ payload, licenseKey }: { payload?: ReelPayload; li
 
       <Credits text={payload.credits} />
       <ModelContext
-        text={`The ${payload.brand.name} Trailer Reel is playing the "${film.title}" preview (${index + 1} of ${films.length}). Full film: ${film.watchUrl}.`}
+        text={`The ${payload.brand.name} Trailer Reel is playing the "${film.title}" preview (${state.index + 1} of ${films.length}). Full film: ${film.watchUrl}.`}
       />
     </div>
   );
