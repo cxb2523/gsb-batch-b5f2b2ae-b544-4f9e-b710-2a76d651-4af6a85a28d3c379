@@ -17,7 +17,7 @@ filter: { genre: $shared.genre }
 
 ## `select: <key>`
 
-On a chart, `select` names a `prism.shared` key. A click on a label (bar, pie segment, calendar day, map region) sets the key to that `x` value; a second click on the same label clears it. While something is selected, the other labels fade. Keyboard: the chart is a tab stop, arrow keys move between labels, Enter selects. A calendar writes the day as YYYY-MM-DD, so filter on a column with plain dates (not timestamps such as 2026-10-18T09:00).
+On a chart, `select` names a `prism.shared` key. A click on a label (bar, pie segment, calendar day, map region) sets the key to that `x` value; a second click on the same label clears it. While something is selected, the other labels fade. Keyboard: the chart is a tab stop, arrow keys move between labels, Enter selects. A calendar writes the day as YYYY-MM-DD and a map writes the region name lower-cased and trimmed; the reader normalizes its own cells the same way before comparing, so a day also matches timestamps such as `2026-10-18T09:00`, and a region matches rows regardless of letter case or surrounding spaces. Map regions without a data row are not clickable and never take part in a selection.
 
 ## `filter: { column: $shared.<key> }`
 

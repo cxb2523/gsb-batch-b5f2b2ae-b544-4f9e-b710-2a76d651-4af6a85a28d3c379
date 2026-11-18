@@ -40,7 +40,7 @@ y: days
 
 ## Interaction and export
 
-- `select: <key>` makes days and regions clickable for a cross-filter, see [`cross-filter.md`](cross-filter.md).
+- `select: <key>` makes days and regions clickable for a cross-filter, see [`cross-filter.md`](cross-filter.md). The selected key is the normalized day (`YYYY-MM-DD`) or region name (lower-cased, trimmed), and reader blocks normalize their cells the same way, so highlights and filtered rows always agree. Only days and regions with data are clickable.
 - The chart is one tab stop: arrow keys move between the days or regions with data, Enter opens or selects.
 - Block menu → *Export CSV* saves the values per day or region.
 - In HTML blocks: `await prism.chart(container, { type: "calendar", … })` returns the container. The calendar and map need no library keyword.

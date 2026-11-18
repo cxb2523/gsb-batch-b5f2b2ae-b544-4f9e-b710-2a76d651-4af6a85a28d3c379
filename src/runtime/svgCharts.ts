@@ -6,8 +6,9 @@
 // elements, not stylesheet rules. The runtime redraws on theme changes.
 
 import { toText } from "../util";
-import { ChartSpec, aggregateRows, columnsOf, ignoredKeys } from "./chartSpec";
+import { ChartSpec, aggregateRows, columnsOf, ignoredKeys, matches } from "./chartSpec";
 import { isoDay } from "./periods";
+import { regionKey, sharedMarker, sharedValueEquals, type SharedMarker } from "./shared";
 import type { RowTarget } from "./trace";
 import { createDiv, createEl, createSpan, createSvg } from "./dom";
 
@@ -87,11 +88,10 @@ export function itemsBy(spec: ChartSpec, rows: Row[], key: (r: Row) => string | 
 	return out;
 }
 
-/** Rows after `filter` (already resolved) – list cells match by containment, like charts. */
+/** Rows after `filter` (already resolved) – the same rule charts and tables use, so shared selections match everywhere. */
 export function filtered(spec: ChartSpec, rows: Row[]): Row[] {
 	if (!spec.filter) return rows;
-	const one = (cell: unknown, w: unknown) => (Array.isArray(cell) ? cell.includes(w) : cell === w);
-	return rows.filter((r) => Object.entries(spec.filter as object).every(([k, v]) => (Array.isArray(v) ? v.some((w) => one(r[k], w)) : one(r[k], v))));
+	return rows.filter((r) => Object.entries(spec.filter as object).every(([k, v]) => matches(r[k], v)));
 }
 
 /** 1–4 for a value between min and max (0: no value). */
@@ -176,14 +176,14 @@ export function renderCalendar(container: HTMLElement, spec: ChartSpec, rows: Ro
 		}
 	});
 	frame.legend(span, numFmt, deps.colors);
-	interact(frame.root, svg, cells, spec, deps);
+	interact(frame.root, svg, cells, spec, deps, "day");
 	return items;
 }
 
 /* --------------------------------------------------------------------- map */
 
 type Position = number[];
-interface Region {
+export interface Region {
 	props: Record<string, unknown>;
 	/** Rings of projected [x, y] points. */
 	rings: Position[][];
@@ -224,7 +224,7 @@ export function regionsOf(geo: unknown): Region[] {
 	return out;
 }
 
-const norm = (v: unknown) => toText(v).trim().toLowerCase();
+const norm = regionKey;
 
 /** The feature property that matches the most x values (ties: the first property). */
 export function bestGeoKey(regions: Region[], values: unknown[]): string | null {
@@ -248,6 +248,23 @@ export interface MapResult {
 	/** x values without a matching region. */
 	unmatched: string[];
 	geoKey: string | null;
+}
+
+/**
+ * Regions with at least one data row are the only clickable/selectable targets;
+ * a region without rows cannot be written into prism.shared and is not a cell.
+ * The returned key is the normalized name, the same key `select` writes and
+ * the reader's filter compares against.
+ */
+export function regionTargets(regions: Region[], items: Map<string, Item>, geoKey: string | null): { region: Region; name: string; key: string; item: Item }[] {
+	const out: { region: Region; name: string; key: string; item: Item }[] = [];
+	for (const region of regions) {
+		const name = geoKey ? toText(region.props[geoKey]) : "";
+		const key = regionKey(name);
+		const item = key ? items.get(key) : undefined;
+		if (item) out.push({ region, name, key, item });
+	}
+	return out;
 }
 
 export function renderMap(container: HTMLElement, spec: ChartSpec, rows: Row[], geo: unknown, deps: SvgChartDeps): MapResult {
@@ -282,10 +299,14 @@ export function renderMap(container: HTMLElement, spec: ChartSpec, rows: Row[], 
 	// Only values that have a region set the color scale.
 	const span = range(Array.from(items.values()).filter((it) => known.has(it.key)));
 	const numFmt = new Intl.NumberFormat(deps.locale, { maximumFractionDigits: 2 });
+	// Regions with data are the only clickable targets (see regionTargets);
+	// their key is the normalized name that `select` writes and readers filter on.
+	const byKey = new Map(regionTargets(regions, items, geoKey).map((t) => [t.key, t]));
 	const cells: Cell[] = [];
 	for (const r of regions) {
 		const name = geoKey ? toText(r.props[geoKey]) : "";
-		const item = items.get(norm(name));
+		const target = byKey.get(regionKey(name));
+		const item = target?.item;
 		const d = r.rings.map((ring) => "M" + ring.map(([px, py]) => `${((px - minX) * scale).toFixed(1)},${((py - minY) * scale).toFixed(1)}`).join("L") + "Z").join("");
 		const path = createSvg("path");
 		path.setAttribute("d", d);
@@ -296,10 +317,11 @@ export function renderMap(container: HTMLElement, spec: ChartSpec, rows: Row[], 
 		const label = `${name}${item && item.value !== null ? `: ${numFmt.format(item.value)}` : ""}`;
 		path.appendChild(createSvg("title")).textContent = label;
 		svg.appendChild(path);
-		if (item) cells.push({ el: path, key: item.rows[0][x], item, label });
+		// A region without data rows is no cell: not clickable, never highlighted.
+		if (target) cells.push({ el: path, key: target.key, item: target.item, label });
 	}
 	frame.legend(span, numFmt, deps.colors);
-	interact(frame.root, svg, cells, spec, deps);
+	interact(frame.root, svg, cells, spec, deps, "region");
 	return { items, unmatched, geoKey };
 }
 
@@ -307,7 +329,11 @@ export function renderMap(container: HTMLElement, spec: ChartSpec, rows: Row[], 
 
 export interface Cell {
 	el: SVGElement;
-	/** The x value (what `select` writes). */
+	/**
+	 * The key `select` writes. For calendar and map cells this is already
+	 * normalized (YYYY-MM-DD day, or the lower-cased trimmed region name);
+	 * interact() wraps it in the matching shared marker.
+	 */
 	key: unknown;
 	item: Item;
 	label: string;
@@ -392,14 +418,19 @@ function cell(svg: SVGSVGElement, x: number, y: number, lvl: number, label: stri
  * Click, hover preview and keyboard for the cells with data: with `select` a
  * click toggles prism.shared[select], otherwise it opens what deps.locate
  * finds for the cell's rows (their note, or the table row in this note).
+ * `kind` marks calendar ("day") and map ("region") selections: their written
+ * value is a normalized marker (see shared.ts); other SVG charts pass nothing
+ * and keep raw text keys.
  * Keyboard: the chart is one tab stop, arrow keys move between cells, Enter activates.
  */
-export function interact(root: HTMLElement, svg: SVGSVGElement, cells: Cell[], spec: ChartSpec, deps: SvgChartDeps) {
+export function interact(root: HTMLElement, svg: SVGSVGElement, cells: Cell[], spec: ChartSpec, deps: SvgChartDeps, kind?: SharedMarker["kind"]) {
 	const targets = new Map(cells.map((c) => [c, deps.locate(c.item.rows)]));
 	const selecting = typeof spec.select === "string" && !!spec.select;
 	const hasSelection = selecting && deps.selected !== undefined && deps.selected !== null;
+	// The highlight uses the exact key the writer produced and the reader filters on.
+	const isSelected = (c: Cell) => (kind ? sharedValueEquals(kind, deps.selected, c.key) : toText(deps.selected) === toText(c.key));
 	const activate = (c: Cell) => {
-		if (selecting) deps.select(c.key);
+		if (selecting) deps.select(kind ? sharedMarker(kind, c.key) : c.key);
 		else {
 			const target = targets.get(c);
 			if (target) deps.openNote(target.path, target.line);
@@ -408,7 +439,7 @@ export function interact(root: HTMLElement, svg: SVGSVGElement, cells: Cell[], s
 	const active = cells.filter((c) => selecting || targets.get(c));
 	for (const c of active) {
 		c.el.classList.add("is-active");
-		if (hasSelection && toText(deps.selected) === toText(c.key)) c.el.classList.add("is-selected");
+		if (hasSelection && isSelected(c)) c.el.classList.add("is-selected");
 		const target = targets.get(c);
 		if (target?.preview && !selecting) c.el.setAttribute("data-prism-note", target.path);
 		c.el.addEventListener("click", () => activate(c));

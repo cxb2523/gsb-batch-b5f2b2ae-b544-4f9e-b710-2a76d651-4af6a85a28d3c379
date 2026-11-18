@@ -5,6 +5,7 @@
 
 import { toText } from "../util";
 import { PERIODS, periodOf, periodRange } from "./periods";
+import { cellMatchesMarker, isSharedMarker } from "./shared";
 import type { NoteMeta } from "../protocol";
 
 export interface ChartSpec {
@@ -310,6 +311,9 @@ function referenceLines(spec: ChartSpec): ReferenceLine[] {
 
 /** Filter test: a list value (e.g. tags) matches when it contains the wanted value. */
 export function matches(cell: unknown, wanted: unknown): boolean {
+	// Calendar days and map regions write their selection as a marker whose
+	// value is normalized; the row cell is normalized the same way before comparing.
+	if (isSharedMarker(wanted)) return cellMatchesMarker(cell, wanted);
 	const one = (w: unknown) => (Array.isArray(cell) ? cell.includes(w) : cell === w);
 	return Array.isArray(wanted) ? wanted.some(one) : one(wanted);
 }
@@ -470,7 +474,9 @@ export function sharedKeys(spec: { filter?: Record<string, unknown>; select?: un
 /**
  * The filter with "$shared.key" values replaced by prism.shared values. A
  * condition whose key is unset is dropped (nothing selected: show all rows),
- * and the "(none)" group of an aggregate matches empty cells.
+ * and the "(none)" group of an aggregate matches empty cells. Selections of
+ * calendar/map blocks arrive as markers and keep the normalization their
+ * writer applied, so the reader compares exactly what was written.
  */
 export function resolveFilter(filter: Record<string, unknown> | undefined, shared: (key: string) => unknown): Record<string, unknown> | undefined {
 	if (!filter) return filter;

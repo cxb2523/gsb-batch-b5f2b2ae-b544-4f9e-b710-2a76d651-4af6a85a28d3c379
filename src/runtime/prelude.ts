@@ -27,6 +27,7 @@ import {
 import { ChartSpec, LegendBox, SVG_TYPES, chartConfig, chartTable, columnsOf, deepMerge, isLinksSource, isNotesSource, isTasksSource, linkRows, noteRows, resolveFilter, sharedKeys, shortenLegendLabels, specWarnings, taskRows } from "./chartSpec";
 import { TableSpec, renderTable, tableWarnings } from "./table";
 import { SvgChartDeps, SvgColors, SvgResult, dataCardText, ignoredNote, renderCalendar, renderMap } from "./svgCharts";
+import { isSharedMarker, sharedValueEquals } from "./shared";
 import { rowTarget, rowsAt } from "./trace";
 import { computeRows } from "./compute";
 import { formatKpi, renderKpi } from "./kpi";
@@ -1117,7 +1118,11 @@ function follow(from: string | null, keys: string[], alive: () => boolean, reloa
 
 /** Sets prism.shared[key] to a clicked value, or clears it when that value is already selected. */
 function toggleShared(key: string, value: unknown) {
-	const done = sharedApi.get(key) === value ? sharedApi.delete(key) : sharedApi.set(key, value);
+	const current = sharedApi.get(key);
+	// Calendar/map clicks write markers: compare the normalized key they carry,
+	// so the second click on the same day or region clears the selection.
+	const same = isSharedMarker(value) ? sharedValueEquals(value.kind, current, value.value) : current === value;
+	const done = same ? sharedApi.delete(key) : sharedApi.set(key, value);
 	void done.catch((err) => reportError(err, "error"));
 }
 
