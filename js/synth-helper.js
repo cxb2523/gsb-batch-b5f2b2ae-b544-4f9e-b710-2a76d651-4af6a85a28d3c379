@@ -187,7 +187,11 @@ function SynthHelper(songObj, synthUi, rebuildPatternSynthListCallback) {
 
 			songObj.deleteSynth(selectedSynthIndex);
 			rebuildPatternSynthListCallback(true);
-			selectSynth(0);
+
+			// deleteSynth already converged currentSynthIndex to the surviving
+			// instrument; keep the helper's own selection in lockstep with it.
+			selectedSynthIndex = songObj.currentSynthIndex;
+			selectSynth(selectedSynthIndex);
 
 			that.rebuildSynthList();
 			g_switchTab("synth-list");

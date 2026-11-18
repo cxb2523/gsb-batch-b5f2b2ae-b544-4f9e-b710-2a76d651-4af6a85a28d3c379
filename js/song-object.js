@@ -285,6 +285,17 @@ function SongObject(onSynthChangeCallback) {
 			this.patterns[i].spliceSynth(index);
 		}
 
+		// Keep the selected-instrument pointer pointing at the same instrument
+		// (which shifted down) instead of the neighbour that took its place.
+		if (this.currentSynthIndex > index)
+			this.currentSynthIndex--;
+		else if (this.currentSynthIndex >= this.synths.length)
+			this.currentSynthIndex = this.synths.length - 1;
+
+		// Reconnect every surviving synth to its (shifted) send target. The data
+		// array was spliced above; this makes the audio graph converge with it.
+		this.restoreSends();
+
 		this.calculateSynthFill();
 	}
 

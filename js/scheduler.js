@@ -331,6 +331,12 @@ function Scheduler(songObj, barCallback, stepCallback) {
 			if (synthIndex !== null) {
 				let synth = synths[synthIndex];
 
+				// A layer can outlive its instrument when one is deleted mid-playback.
+				// Never address a missing slot: doing so would misroute the note onto a
+				// different (shifted) synth or throw on an undefined reference.
+				if (!synth)
+					continue;
+
 				let attackTime = time;
 				let lenCoef = lengths[stepIndex] / 100;
 				let stepLen = (60 / songObj.bpm) / 4 - 0.001;

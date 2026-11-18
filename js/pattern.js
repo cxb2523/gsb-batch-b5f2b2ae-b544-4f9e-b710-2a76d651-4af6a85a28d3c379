@@ -22,11 +22,15 @@ class Pattern {
 
 	spliceSynth(index) {
 		for (let i = 0; i < this.patternData.length; i++) {
-			if (this.patternData[i].synthIndex == index)
-				this.patternData[i].synthIndex = null;
+			let synthIndex = this.patternData[i].synthIndex;
 
-			if (this.patternData[i].synthIndex > index)
-				this.patternData[i].synthIndex--;
+			if (synthIndex === null)
+				continue;
+
+			if (synthIndex === index)
+				this.patternData[i].synthIndex = null; // layer pointed at the deleted synth
+			else if (synthIndex > index)
+				this.patternData[i].synthIndex--;      // higher-numbered synth shifted down
 		}
 	}
 
