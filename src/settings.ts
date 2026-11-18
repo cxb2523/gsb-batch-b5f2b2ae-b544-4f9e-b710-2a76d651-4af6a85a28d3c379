@@ -1,0 +1,250 @@
+import { App, PluginSettingTab, Setting } from "obsidian";
+import type PrismPlugin from "../main";
+import { normalizeAllowlist } from "./document";
+import { DEFAULT_ONLINE, OnlineSettings, renderOnlineSettings } from "./online/settings";
+
+export interface PrismSettings {
+	/** Height reserved for a block before it has measured itself. */
+	defaultHeight: number;
+	/** Upper bound for auto-height. */
+	maxAutoHeight: number;
+	/** Push theme changes into rendered blocks live. */
+	themeSync: boolean;
+	/** CSP host sources allowed for scripts, styles, images, fonts and fetch. */
+	networkAllowlist: string[];
+	/** Write a PNG of every successfully rendered block to .prism/snapshots. */
+	snapshots: boolean;
+	/** Render blocks only when they scroll into view. */
+	lazyRender: boolean;
+	/** Write errors to .prism/errors.json. */
+	errorLog: boolean;
+	/** Vault folders whose data files (csv, tsv, json, yaml, txt) blocks may read via prism.data(). */
+	dataFolders: string[];
+	/** Opt-in network features (prism.http, web pages); all off by default. */
+	online: OnlineSettings;
+	/** Open the agent skill guide and changelog once after installing or updating Prism. */
+	showGuideAfterUpdate: boolean;
+	/** prism.edit: blocks may change their own note after the reader allowed it once per block. */
+	noteEdits: boolean;
+	/** Underline lines with block errors in the editor. */
+	editorErrors: boolean;
+	/** Milliseconds the pointer rests on a note link inside a block before its page preview opens. */
+	hoverDelay: number;
+}
+
+export const DEFAULT_SETTINGS: PrismSettings = {
+	defaultHeight: 240,
+	maxAutoHeight: 6000,
+	themeSync: true,
+	networkAllowlist: [],
+	snapshots: false,
+	lazyRender: true,
+	errorLog: true,
+	dataFolders: [],
+	online: { ...DEFAULT_ONLINE },
+	showGuideAfterUpdate: true,
+	noteEdits: true,
+	editorErrors: true,
+	hoverDelay: 600,
+};
+
+export class PrismSettingTab extends PluginSettingTab {
+	constructor(app: App, private plugin: PrismPlugin) {
+		super(app, plugin);
+	}
+
+	display(): void {
+		const { containerEl } = this;
+		const s = this.plugin.settings;
+		containerEl.empty();
+
+		new Setting(containerEl)
+			.setName("Agent skill")
+			.setDesc("How to install the skill that lets Claude Code and Codex write and fix viz blocks, followed by the changelog.")
+			.addButton((b) => b.setButtonText("Show install guide").onClick(() => void this.plugin.openGuide("skill")));
+
+		new Setting(containerEl)
+			.setName("Show changelog after updates")
+			.setDesc("Open the install guide and changelog once after Prism is installed or updated.")
+			.addToggle((t) =>
+				t.setValue(s.showGuideAfterUpdate).onChange(async (v) => {
+					s.showGuideAfterUpdate = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Default height")
+			.setDesc("Height in pixels reserved for a block before it reports its size. Blocks size themselves automatically unless they set height=….")
+			.addText((t) =>
+				t.setValue(String(s.defaultHeight)).onChange(async (v) => {
+					const n = parseInt(v, 10);
+					if (Number.isFinite(n) && n >= 40 && n <= 4000) {
+						s.defaultHeight = n;
+						await this.plugin.saveSettings();
+					}
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Maximum auto height")
+			.setDesc("Upper limit in pixels for automatically sized blocks.")
+			.addText((t) =>
+				t.setValue(String(s.maxAutoHeight)).onChange(async (v) => {
+					const n = parseInt(v, 10);
+					if (Number.isFinite(n) && n >= 200 && n <= 20000) {
+						s.maxAutoHeight = n;
+						await this.plugin.saveSettings();
+					}
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Theme sync")
+			.setDesc("Update rendered blocks live when the theme or light/dark mode changes. When off, blocks use the theme at render time.")
+			.addToggle((t) =>
+				t.setValue(s.themeSync).onChange(async (v) => {
+					s.themeSync = v;
+					await this.plugin.saveSettings();
+					if (v) this.plugin.refreshTheme();
+				})
+			);
+
+		const hoverSetting = new Setting(containerEl).setName("Link preview delay");
+		const hoverDesc = (ms: number) =>
+			hoverSetting.setDesc(
+				`How long the pointer rests on a note link inside a block before its page preview opens: ${ms === 0 ? "at once" : `${(ms / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })} s`}. Moving away earlier opens nothing.`
+			);
+		hoverDesc(s.hoverDelay);
+		hoverSetting.addSlider((sl) =>
+			sl
+				.setLimits(0, 2000, 100)
+				.setValue(s.hoverDelay)
+				.setDynamicTooltip()
+				.onChange(async (v) => {
+					s.hoverDelay = v;
+					hoverDesc(v);
+					await this.plugin.saveSettings();
+				})
+		);
+
+		new Setting(containerEl)
+			.setName("Lazy rendering")
+			.setDesc("Render blocks only when they scroll near the viewport. Keeps notes with many blocks fast.")
+			.addToggle((t) =>
+				t.setValue(s.lazyRender).onChange(async (v) => {
+					s.lazyRender = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Error log")
+			.setDesc("Write block errors with note path and line numbers to .prism/errors.json so that CLI agents can read and fix them.")
+			.addToggle((t) =>
+				t.setValue(s.errorLog).onChange(async (v) => {
+					s.errorLog = v;
+					this.plugin.errorLog.enabled = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Errors in the editor")
+			.setDesc("Underline the lines of a block that caused errors or warnings while you edit the note, with the message at the end of the line.")
+			.addToggle((t) =>
+				t.setValue(s.editorErrors).onChange(async (v) => {
+					s.editorErrors = v;
+					await this.plugin.saveSettings();
+					this.plugin.editorErrors.refreshAll();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Blocks may edit their note")
+			.setDesc(
+				"Lets blocks check off tasks, change table cells, add table rows and set properties in their own note, for habit trackers and boards. Each block asks once before its first edit and again after its code changed. Other notes are never changed."
+			)
+			.addToggle((t) =>
+				t.setValue(s.noteEdits).onChange(async (v) => {
+					s.noteEdits = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Snapshots")
+			.setDesc("After a block renders without errors, save a PNG to .prism/snapshots/<hash>.png (index in .prism/snapshots/index.json) so agents can see the result.")
+			.addToggle((t) =>
+				t.setValue(s.snapshots).onChange(async (v) => {
+					s.snapshots = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		const dataSetting = new Setting(containerEl).setName("Data folders").setDesc("");
+		const dataDesc = dataSetting.descEl;
+		dataDesc.appendText("Vault folders (one per line, e.g. ");
+		dataDesc.createEl("code", { text: "Projects/data" });
+		dataDesc.appendText(") whose files blocks may read with ");
+		dataDesc.createEl("code", { text: "prism.data()" });
+		dataDesc.appendText(". Read-only; only .csv, .tsv, .json, .geojson, .yaml, .yml and .txt; hidden files and notes are never readable. Empty = off.");
+		const dataStatus = dataDesc.createDiv({ cls: "prism-setting-status" });
+		const showDataStatus = (folders: string[]) => {
+			const vault = this.app.vault;
+			const missing = typeof vault.getFolderByPath === "function" ? folders.filter((f) => f !== "/" && !vault.getFolderByPath(f)) : [];
+			dataStatus.setText(missing.length ? `Not found: ${missing.join(", ")}` : "");
+		};
+		showDataStatus(s.dataFolders);
+		dataSetting.addTextArea((t) => {
+			t.inputEl.rows = 3;
+			t.inputEl.addClass("prism-allowlist");
+			t.setPlaceholder("Projects/data").setValue(s.dataFolders.join("\n"));
+			t.onChange(async (v) => {
+				s.dataFolders = Array.from(
+					new Set(
+						v
+							.split("\n")
+							.map((l) => l.trim().replace(/^\/+|\/+$/g, "") || (l.trim() === "/" ? "/" : ""))
+							.filter(Boolean)
+					)
+				);
+				showDataStatus(s.dataFolders);
+				await this.plugin.saveSettings();
+			});
+		});
+
+		const allowSetting = new Setting(containerEl)
+			.setName("Network allowlist")
+			.setDesc("");
+		const desc = allowSetting.descEl;
+		desc.appendText("Network access from blocks is off by default. Domains listed here (one per line, e.g. ");
+		desc.createEl("code", { text: "cdn.jsdelivr.net" });
+		desc.appendText(" or ");
+		desc.createEl("code", { text: "*.example.com" });
+		desc.appendText(") are added to the Content-Security-Policy for scripts, styles, images, fonts and fetch. HTTPS is assumed unless http:// is given.");
+		const status = desc.createDiv({ cls: "prism-setting-status" });
+		const showStatus = (invalid: string[]) => {
+			status.setText(invalid.length ? `Ignored (invalid): ${invalid.join(", ")}` : "");
+		};
+		allowSetting.addTextArea((t) => {
+			t.inputEl.rows = 4;
+			t.inputEl.addClass("prism-allowlist");
+			t.setPlaceholder("cdn.jsdelivr.net").setValue(s.networkAllowlist.join("\n"));
+			t.onChange(async (v) => {
+				const { valid, invalid } = normalizeAllowlist(v.split(/[\n,]/));
+				showStatus(invalid);
+				s.networkAllowlist = valid;
+				await this.plugin.saveSettings();
+			});
+		});
+		allowSetting.addExtraButton((b) =>
+			b
+				.setIcon("refresh-cw")
+				.setTooltip("Reload all blocks to apply")
+				.onClick(() => this.plugin.reloadAll())
+		);
+
+		renderOnlineSettings(containerEl, this.plugin);
+	}
+}

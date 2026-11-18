@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output (npm run build)
+main.js
+libs/
+
+# User settings and widget state, written by Obsidian
+data.json
+
+.DS_Store
+
+# Example vault (Prism)
+examples/.obsidian/plugins/
+examples/.obsidian/workspace*.json
+examples/.prism/
+
+# Unit test bundles (npm test)
+.test-build*/
