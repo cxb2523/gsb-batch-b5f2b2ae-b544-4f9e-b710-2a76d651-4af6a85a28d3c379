@@ -9,3 +9,12 @@ export {
   createVideoNode,
 } from "./node-factory"
 export { cn } from "./utils"
+export {
+  acquireVideoPlaybackManager,
+  getVideoPlaybackManagerCount,
+  MIN_VIDEO_NODE_DIMENSION,
+  releaseVideoPlaybackManager,
+  type VideoElementLike,
+  VideoPlaybackManager,
+  type VideoSlot,
+} from "./video-playback"

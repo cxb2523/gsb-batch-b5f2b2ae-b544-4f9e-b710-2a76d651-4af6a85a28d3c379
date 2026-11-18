@@ -28,7 +28,7 @@ export function FocusContent() {
     case "image":
       return <FocusImageContent />
     case "video":
-      return <FocusVideoContent />
+      return <FocusVideoContent nodeId={node.id} />
     default:
       return <Placeholder>Unsupported node type</Placeholder>
   }

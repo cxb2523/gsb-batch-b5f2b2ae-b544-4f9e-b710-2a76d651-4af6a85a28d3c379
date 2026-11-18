@@ -1,14 +1,21 @@
 "use client"
 
-import { useReactFlow } from "@xyflow/react"
-import { useFocusModeState } from "../../../hooks/use-focus-mode"
+import { useNodesData } from "@xyflow/react"
+import { useVideoPlayback } from "../../../hooks/use-video-playback"
 import { VideoContent } from "./video-content"
 
-export function FocusVideoContent() {
-  const focusInfo = useFocusModeState()
-  const { getNode } = useReactFlow()
+interface FocusVideoContentProps {
+  /** Id of the focused node, provided by the focus overlay. */
+  nodeId: string
+}
 
-  const node = focusInfo ? getNode(focusInfo.nodeId) : null
+export function FocusVideoContent({ nodeId }: FocusVideoContentProps) {
+  // Subscribe to the node's data so a videoUrl change (e.g. via a command)
+  // switches the focus layer to the new video while it is open.
+  const nodeData = useNodesData(nodeId)
+  const videoUrl = nodeData?.data.videoUrl as string | undefined
 
-  return <VideoContent videoUrl={node?.data.videoUrl as string} variant="focus" />
+  const { videoRef } = useVideoPlayback({ nodeId, slot: "focus", videoUrl })
+
+  return <VideoContent videoUrl={videoUrl} variant="focus" videoRef={videoRef} />
 }
