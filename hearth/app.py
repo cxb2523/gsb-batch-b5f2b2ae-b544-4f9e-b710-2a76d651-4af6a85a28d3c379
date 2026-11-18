@@ -78,6 +78,7 @@ from .smtc import (
     create_windows_bridge,
 )
 from .storage import HearthStore
+from .stream_cache import StreamCache
 from .theme import lyrics_font
 from .toast import NowPlayingToast
 from .tray import HearthTray, InstanceGuard
@@ -444,6 +445,12 @@ class Hearth:
 
         # Core + UI (panel stays built for ribbon mode; window is the default)
         self.core = PlaybackCore(self.qapp)
+        # the Pantry (Room 12): resolved stream URLs cached on disk, so a
+        # replay or a crossfade pre-warm can skip the resolve round-trip.
+        # Opt-in via config.STREAM_CACHE_ENABLED; a None cache is a no-op
+        # everywhere in the core.
+        if config.STREAM_CACHE_ENABLED:
+            self.core.stream_cache = StreamCache(self._dir / "streams")
         self.panel = FloatingPanel(palette_key)
         self.toast = NowPlayingToast(palette_key)
         self.overlay = LyricsOverlay(palette_key)
@@ -1211,7 +1218,12 @@ class Hearth:
         )
 
     def _on_stream_lost(self, track: Track, resume_ms: int) -> None:
-        """The player died mid-song: re-resolve a fresh URL and rejoin it."""
+        """The player died mid-song: re-resolve a fresh URL and rejoin it.
+
+        Deliberately bypasses the Pantry: the cached URL may be exactly
+        the one that just died, and the heal is only honest if the URL
+        is fresh. The successful rejoin re-files it via set_stream().
+        """
         if not self._enable_streaming:
             return  # test mode: keep the playback pool out of unit tests
         local_url = self._local_file_url(track)
@@ -1235,6 +1247,12 @@ class Hearth:
         local_url = self._local_file_url(track)
         if local_url is not None:
             self.core.prime_shadow(track, local_url)
+            return
+        cached = self.core.cached_stream(track)
+        if cached is not None:
+            # Pantry hit: the direct link is already on disk — prime the
+            # shadow straight from it, no resolve job at all.
+            self.core.prime_shadow(track, cached)
             return
         job = LoadJob(track)
         job.signals.finished.connect(
@@ -1271,6 +1289,15 @@ class Hearth:
         if track is None:
             return
         self.toast.announce(track)
+        cached = self.core.cached_stream(track)
+        if cached is not None:
+            # Pantry hit: the direct link is already on disk — play it
+            # without spending a resolve round-trip (or the pool at all).
+            self._resolve_retries.pop(track.video_id, None)
+            if self._enable_streaming:
+                self._fetch_lyrics(track)
+            self.core.set_stream(track, cached)
+            return
         if not self._enable_streaming:
             return  # test mode: keep the playback pool out of unit tests
         self._fetch_lyrics(track)

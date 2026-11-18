@@ -540,6 +540,11 @@ class PlaybackCore(QObject):
         self._xf_promoted_handle: MediaHandle | None = None   # keeps the promoted wrapper alive
         # Tests swap this for a fake factory; production builds Qt twins.
         self.shadow_factory: Callable[[], MediaHandle] | None = None
+        # --- the Pantry (stream_cache.py): resolved direct URLs on disk ---
+        # Injected by the app when config.STREAM_CACHE_ENABLED; None keeps
+        # every cache hook below a one-line no-op, so headless tests and
+        # flag-off runs see zero behavior change.
+        self.stream_cache = None
         if self._xf is not None:
             self._xf.adopt(_LiveBackendHandle(self))
             # queue_changed can be emitted from outside the core (the app
@@ -679,6 +684,12 @@ class PlaybackCore(QObject):
             self._player.play()
 
     def next(self) -> None:
+        # Whatever called this — user skip, error-skip, natural relay — a
+        # primed or mid-ramp shadow belongs to the OLD current track and
+        # must never speak out of turn. No-op in the states the machine
+        # itself relays through (IDLE on the legacy path, DONE inside the
+        # promotion), so the crossfade's own advance is untouched.
+        self._xf_cancel_user()
         last = self.engine.current
         track = self.engine.advance()
         self.queue_changed.emit()
@@ -846,6 +857,45 @@ class PlaybackCore(QObject):
         self._xf_primed_loudness = loudness_db
         if not ctl.prime(handle, track):   # lost a race: give the handle back
             handle.stop()
+            return
+        # The pre-resolve already paid the network cost — file the direct
+        # URL in the Pantry alongside, so a replay skips the resolve too.
+        self._cache_store(track.video_id, url)
+
+    # --- the Pantry: resolved direct URLs on disk (stream_cache.py) ---
+
+    def cached_stream(self, track) -> str | None:
+        """The Pantry's cached direct URL for `track`, or None.
+
+        A hit is an LRU touch (replaying a track is the strongest signal
+        it should survive eviction) and lets the caller skip the resolve
+        round-trip entirely. Never raises: a broken cache is just a miss.
+        """
+        cache = self.stream_cache
+        if cache is None or track is None:
+            return None
+        try:
+            path = cache.path_for(track.video_id)
+            if path is None:
+                return None
+            url = path.read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001 - a sick cache degrades to a miss
+            return None
+        return url or None
+
+    def _cache_store(self, video_id: str, url: str) -> None:
+        """File a resolved direct URL in the Pantry; never raises.
+
+        The cache is a replay shelf, never a requirement — a full disk
+        or a vanished root must not cost a single note of playback.
+        """
+        cache = self.stream_cache
+        if cache is None or not url:
+            return
+        try:
+            cache.store(video_id, str(url).encode("utf-8"))
+        except Exception:  # noqa: BLE001 - the Pantry never breaks playback
+            log.debug("stream cache store failed for %s", video_id)
 
     def _xf_cancel_user(self) -> None:
         """User-driven movement ends crossfade business immediately.
@@ -1143,6 +1193,7 @@ class PlaybackCore(QObject):
             self._xf_promoted_id = None
             self.apply_normalization(loudness_db)
             self._player.setPlaybackRate(self._rate)
+            self._cache_store(track.video_id, url)   # freshest URL wins the shelf
             return
         if self._recovered_id != track.video_id:
             self._recovered_id = track.video_id
@@ -1155,6 +1206,7 @@ class PlaybackCore(QObject):
         self._player.setSource(QUrl(url))
         self._player.setPlaybackRate(self._rate)
         self._player.play()
+        self._cache_store(track.video_id, url)   # every resolved URL lands in the Pantry
         if rejoin:
             self._player.setPosition(rejoin)
         self._poll.start()

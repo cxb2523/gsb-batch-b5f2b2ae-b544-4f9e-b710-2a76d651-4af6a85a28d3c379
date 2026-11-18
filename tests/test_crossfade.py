@@ -387,6 +387,70 @@ def test_core_error_paths_unaffected_when_flag_on(enabled):
     assert core.engine.current.video_id == "t1"
 
 
+def test_core_manual_next_discards_primed_shadow(enabled):
+    core, shadows = make_primed_core()
+    shadow = shadows[0]
+    assert core._xf.state == CrossfadeController.PRIMED
+    seen = []
+    core.track_changed.connect(seen.append)
+    core.next()                           # user skip: the shadow must die
+    assert shadow.stopped == 1            # stopped, not left humming
+    assert core._xf.state == CrossfadeController.IDLE
+    assert core._xf.shadow is None
+    assert core._xf.primed_track is None
+    assert core.engine.current.video_id == "t1"
+    assert [t.video_id for t in seen] == ["t1"]   # exactly one advance
+
+
+def test_core_toggle_pause_discards_primed_shadow(enabled):
+    core, shadows = make_primed_core()
+    shadow = shadows[0]
+    core.toggle()                         # pause: the primed shadow is void
+    assert shadow.stopped == 1
+    assert core._xf.state == CrossfadeController.IDLE
+    assert core._xf.shadow is None
+
+
+def test_core_skip_mid_ramp_stops_shadow_and_advances_once(enabled):
+    core, shadows = make_primed_core()
+    core._on_end_of_media()               # ramp engaged
+    assert core._xf.state == CrossfadeController.CROSSFADING
+    shadow = shadows[0]
+    seen = []
+    core.track_changed.connect(seen.append)
+    core.next()                           # user mashes skip mid-fade
+    assert shadow.stopped == 1            # the incoming track is silenced
+    assert core._xf.state == CrossfadeController.IDLE
+    assert [t.video_id for t in seen] == ["t1"]   # one advance, never two
+    assert core.engine.current.video_id == "t1"
+    for _ in range(20):                   # a dead ramp fires no late promotion
+        core._xf_tick()
+    assert core.engine.current.video_id == "t1"
+    assert [t.video_id for t in core.engine.upcoming] == ["t2"]
+
+
+def test_core_promotion_resets_whole_healing_ledger(enabled):
+    core, _shadows = make_primed_core()
+    # dirty the ledger as if the outgoing stream had a hard life
+    core._recovered_id = "t0"
+    core._retries = 2
+    core._stream_played = True
+    core._stall_polls = 3
+    core._stream_anchor_ms = 45_000
+    core._last_pos_ms = 200_000           # near the end: a natural finish
+    core._on_end_of_media()
+    for _ in range(20):
+        core._xf_tick()
+    assert core.engine.current.video_id == "t1"
+    # the new stream starts with a clean slate — nothing carries over
+    assert core._recovered_id == "t1"     # the budget belongs to the new track
+    assert core._retries == 0             # fresh rejoin budget
+    assert not core._stream_played        # proof-of-audio must be re-earned
+    assert core._stall_polls == 0         # stall watchdog starts clean
+    assert core._stream_anchor_ms == 0    # anchor re-joined at zero
+    assert core._last_pos_ms == 0
+
+
 def test_set_crossfade_clamps_and_zero_disables(enabled):
     core = PlaybackCore()
     core.shadow_factory = FakeHandle
