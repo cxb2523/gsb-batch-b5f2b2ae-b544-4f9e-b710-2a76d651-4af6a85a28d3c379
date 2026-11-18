@@ -13,34 +13,10 @@ export default class RBufferSource extends RScheduledSource {
       loopEnd: props.loopEnd || 0,
       playbackRate: props.playbackRate || 1
     };
-
-    this.onEnded = this.onEnded.bind(this);
-    this.instantiateNode = this.instantiateNode.bind(this);
   }
 
-  instantiateNode() {
-    if (!this.node) {
-      this.node = this.context.audio.createBufferSource();
-      this.node.addEventListener('ended', this.onEnded);
-
-      this.context.nodes.set(this.props.identifier, this.node);
-    }
-
-    this.updateParams = this.updateParams.bind(this);
-    this.updateParams(this.props);
-  }
-
-  // we need to make a new AudioBufferSourceNode after playback ends
-  onEnded(e) {
-    super.onEnded(e);
-    this.instantiateNode();
-    this.connectToAllDestinations(this.props.destination, this.node);
-    if (this.props.onEnded) this.props.onEnded(e);
-  }
-
-  componentWillMount() {
-    super.componentWillMount();
-    this.instantiateNode();
+  createNode() {
+    return this.context.audio.createBufferSource();
   }
 
   componentDidMount() {
@@ -48,6 +24,7 @@ export default class RBufferSource extends RScheduledSource {
     super.componentDidMount();
   }
 
+  // a new buffer means the source has to be rescheduled
   shouldStartWithPropsChange(prevProps, currentProps) {
     return prevProps.buffer !== currentProps.buffer;
   }

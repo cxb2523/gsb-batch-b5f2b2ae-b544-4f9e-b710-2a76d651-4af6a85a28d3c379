@@ -87,9 +87,12 @@ export default class RAudioNode extends RComponent {
   }
 
   componentWillUpdate(nextProps, nextState) {
-    // update the node's record in the node registry
+    // migrate the node's record in the node registry to the new identifier,
+    // leaving no stale keys behind
     if (this.props.identifier !== nextProps.identifier) {
-      this.context.nodes.delete(this.props.identifier);
+      if (this.context.nodes.get(this.props.identifier) === this.node) {
+        this.context.nodes.delete(this.props.identifier);
+      }
       this.context.nodes.set(nextProps.identifier, this.node);
     }
   }
@@ -103,8 +106,17 @@ export default class RAudioNode extends RComponent {
   }
 
   componentWillUnmount() {
-    this.node.disconnect();
-    this.context.nodes.delete(this.props.identifier);
+    if (this.node) {
+      try {
+        this.node.disconnect();
+      } catch (e) {
+        // the node may already be disconnected - that's fine
+      }
+    }
+    // only remove the registry entry if it still points at our node
+    if (this.context.nodes.get(this.props.identifier) === this.node) {
+      this.context.nodes.delete(this.props.identifier);
+    }
   }
 
   resolveTransitionProps(props, propName) {
