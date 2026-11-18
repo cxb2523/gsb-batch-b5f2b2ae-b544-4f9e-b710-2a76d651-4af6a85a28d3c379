@@ -1,0 +1,253 @@
+<!--
+    Garlmap - Gapless Almighty Rule-based Logical Mpv Audio Player
+    Copyright (C) 2021-2026 Jelmer van Arnhem
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+<!DOCTYPE html>
+<html>
+<head>
+    <link href="./index.css" rel="stylesheet" type="text/css">
+    <meta http-equiv="Content-Security-Policy" content="img-src 'self' data:; style-src file://*; media-src file://*; script-src 'none'; connect-src file://* data: node:; default-src 'none'">
+    <title>Garlmap</title>
+</head>
+<body focus-el="search" last-main-focus="search">
+    <svg>
+        <filter id="colored" color-interpolation-filters="sRGB" x="0" y="0" height="100%" width="100%">
+            <feColorMatrix type="matrix" values="0.33203125 0 0 0 0 0.9296875 0 0 0 0 0.9296875 0 0 0 0 0 0 0 1 0" />
+        </filter>
+    </svg>
+    <div id="player-container">
+        <div id="player-status">
+            <div id="player-controls">
+                <div class="button" id="prev"><img src="../img/prev.png" /></div>
+                <div class="button" id="pause"><img src="../img/play.png" /></div>
+                <div class="button" id="next"><img src="../img/next.png" /></div>
+                <input id="volume-slider" type="range" min="0" max="130" value="100" disabled="disabled" />
+            </div>
+            <span id="current-song"><span class="title">Welcome to Garlmap</span></span>
+        </div>
+        <div id="progress-container">
+            <div id="progress-played">&nbsp;00:00/00:00&nbsp;</div>
+            <div id="progress-string">&nbsp;00:00/00:00&nbsp;</div>
+        </div>
+    </div>
+    <div id="column-container">
+        <div id="search-container">
+            <div id="search-controls">
+                <div class="button" id="switch-to-playlist">To playlist</div>
+                <div class="button" id="add-songs">Add rule</div>
+                <div class="button" id="make-fallback">Make fallback</div>
+            </div>
+            <textarea id="rule-search" autofocus="autofocus"></textarea>
+            <div id="search-results"></div>
+        </div>
+        <div id="playlist-container">
+            <div id="playlist-controls">
+                <label class="checkbox-container">Autoscroll
+                    <input type="checkbox" id="toggle-autoscroll">
+                    <span class="checkbox-mark" />
+                </label>
+                <label class="checkbox-container">Autoclose
+                    <input type="checkbox" id="toggle-autoclose">
+                    <span class="checkbox-mark" />
+                </label>
+                <label class="checkbox-container">Autoremove
+                    <input type="checkbox" id="toggle-autoremove">
+                    <span class="checkbox-mark" />
+                </label>
+                <label class="checkbox-container">Autolyrics
+                    <input type="checkbox" id="toggle-autolyrics">
+                    <span class="checkbox-mark" />
+                </label>
+                <div class="button" id="switch-to-search">To search</div>
+                <div class="button" id="open-folder">Open folder</div>
+                <div class="button" id="import-playlist">Import</div>
+                <div class="button" id="export-playlist">Export</div>
+                <div class="button save-settings">Save settings</div>
+            </div>
+            <div id="main-playlist"></div>
+            <div id="fallback-rule">order=shuffle</div>
+        </div>
+        <div id="info-container">
+            <img id="song-cover" />
+            <div id="song-info"></div>
+        </div>
+    </div>
+    <div id="status-line">
+        <span id="status-current">Ready</span>
+        <span id="status-folder">No folder selected</span>
+        <span id="status-files"></span>
+        <span id="status-scan"></span>
+        <span id="status-notify"></span>
+        <div class="button" id="show-help"><img src="../img/info.png"></div>
+        <div class="button" id="show-lyrics"><img src="../img/text.png"></div>
+        <div class="button" id="fetch-lyrics"><img src="../img/download.png"></div>
+        <div class="button" id="edit-lyrics"><img src="../img/edit.png"></div>
+        <label class="checkbox-container">Genius
+            <input type="checkbox" id="toggle-genius">
+            <span class="checkbox-mark" />
+        </label>
+        <label class="checkbox-container">Shift
+            <input type="checkbox" id="toggle-shift-lyrics">
+            <span class="checkbox-mark" />
+        </label>
+        <div class="button" id="edit-settings"><img src="../img/settings.png"></div>
+    </div>
+    <div id="fullscreen">
+        <img id="fs-song-cover" />
+        <div id="fs-info">
+            <span id="fs-current-song">Welcome to Garlmap</span>
+            <div id="fs-player-status">
+                <div class="button" id="fs-prev"><img src="../img/prev.png" /></div>
+                <div class="button" id="fs-pause"><img src="../img/play.png" /></div>
+                <div class="button" id="fs-next"><img src="../img/next.png" /></div>
+                <input id="fs-volume-slider" type="range" min="0" max="130" value="100" disabled="disabled" />
+                <div id="fs-progress-container">
+                    <div id="fs-progress-played">&nbsp;00:00/00:00&nbsp;</div>
+                    <div id="fs-progress-string">&nbsp;00:00/00:00&nbsp;</div>
+                </div>
+            </div>
+            <div id="fs-lyrics"></div>
+            <div id="fs-up-next"></div>
+        </div>
+    </div>
+    <div id="events">
+        <h1>Events</h1>
+        <div id="events-list"></div>
+    </div>
+    <div id="infopanel">
+        <h1>Info</h1>
+        <div id="infopanel-details"></div>
+        <div id="infopanel-lyrics"></div>
+        <img id="infopanel-cover" />
+    </div>
+    <div id="lyrics-editor">
+        <h1>Lyrics</h1>
+        <div id="lyrics-container">
+            <div id="lyrics-tools">
+                <div id="lyrics-inputs">
+                    <input type="text" id="lyrics-search" />
+                    <div class="button" id="lyrics-query">Search</div>
+                    <div class="button" id="lyrics-save">Save</div>
+                </div>
+                <div id="lyrics-results"></div>
+            </div>
+            <textarea id="lyrics-edit-field"></textarea>
+        </div>
+    </div>
+    <div id="settings-editor">
+        <h1>Settings</h1>
+        <div id="settings-container">
+            <div>
+                These are advanced settings that cannot be changed with shortcuts.
+                Some of them require a restart and/or are only applied on startup.
+                You can switch between settings with Ctrl-Up and Ctrl-Down.
+                Open dropdowns with Space and select with Up and Down.
+                Then select a value or toggle checkboxes with Enter.
+                You can save the settings and close this dialog with Ctrl-Enter,
+                or close without saving immediately using Ctrl-/ or Escape.
+                You can also save later from the main screen with Ctrl-s,
+                this is also where you can change other much simpler settings.
+                On smaller screens you can scroll using PageUp and PageDown.
+            </div>
+            <label>Cache
+                <select id="setting-cache">
+                    <option selected value="all">All</option>
+                    <option value="songs">Songs</option>
+                    <option value="lyrics">Lyrics</option>
+                    <option value="none">None</option>
+                </select>
+            </label>
+            <div>
+                Configure caching policy for the next startup.
+                Recommended default value is "all".
+                If you want to delete song cache, but keep the lyrics, set to "Lyrics".
+                To only keep the song info without lyrics, set to "Songs".
+                Delete all cache on next startup with "None".
+            </div>
+            <label class="checkbox-container" tabindex="0" id="setting-cache-clean">Cache clean
+                <input type="checkbox" id="toggle-cache-clean">
+                <span class="checkbox-mark" />
+            </label>
+            <div>Toggle if you want to clean missing files from the cache on next startup.</div>
+            <label>Shift timer
+                <input type="number" min="0" max="1000" id="setting-shift-timer" value="0">
+            </label>
+            <div>
+                Control the delay to automatically enable lyrics shifting.
+                If set to the default 0, it's disabled.
+                When a shift timer is set, you can't manually toggle shifting,
+                but it's still turned off when you manually scroll the lyrics.
+                The value of this setting is the delay in seconds to re-enable shifting.
+            </div>
+            <label>Two column
+                <select id="setting-two-column">
+                    <option value="always">Always</option>
+                    <option selected value="mobile">Mobile</option>
+                    <option value="never">Never</option>
+                </select>
+            </label>
+            <div>
+                Control when the two column layout should be used.
+                If set to mobile, it will activate automatically when shrinking the window size.
+            </div>
+            <label>Font size
+                <input type="number" min="8" max="100" id="setting-fontsize" value="14">
+            </label>
+            <div>
+                Set the font size to use in all of Garlmap.
+                This will also resize the entire interface accordingly,
+                and requires you to restart Garlmap to take effect.
+            </div>
+            <label>Mpv
+                <input type="text" id="setting-mpv">
+            </label>
+            <div>
+                Location of the MPV executable that's used to play songs.
+                An empty value will default to "mpv" or "mpv.exe" (windows only).
+                This executable location is used on the next restart,
+                and if it's not found Garlmap won't be able to start or play songs!
+            </div>
+            <label>Fallback
+                <input type="text" id="setting-fallback">
+            </label>
+            <div>
+                Change the fallback rule for subsequent startups.
+                By default it will shuffle the entire library,
+                but with this setting you can change the initial fallback rule.
+            </div>
+            <label class="checkbox-container" tabindex="0" id="setting-autoplay">Autoplay
+                <input type="checkbox" id="toggle-autoplay">
+                <span class="checkbox-mark" />
+            </label>
+            <div>Toggle if you automatically play music on playlist load and app startup.</div>
+            <label>Api key
+                <input type="text" id="setting-apikey">
+            </label>
+            <div>
+                Optionally set the api key to be used for Genius requests.
+                Has the advantage of listing twice the amount of search results,
+                as well as being the officially supported way of using Genius without scraping.
+                A valid api key can be obtained on the genius.com/api-clients website.
+                The key you need is the Client Access Token, which can be generated once you have added an app.
+                If you don't want to use the official API and are fine with scraping you don't need to set an api key.
+            </div>
+        </div>
+        <div id="settings-actions">
+            <div class="button save-settings">Save settings</div>
+        </div>
+    </div>
+</body>
+</html>
