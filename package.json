@@ -5,7 +5,10 @@
   "type": "module",
   "main": "./build/three.min.js",
   "scripts": {
-    "build": "rollup -c"
+    "build": "rollup -c",
+    "verify": "node verify/run-node.mjs",
+    "verify:browser": "node verify/run-browser.mjs",
+    "test": "npm run build && npm run verify && npm run verify:browser"
   },
   "author": "Paul Masson",
   "license": "MIT",

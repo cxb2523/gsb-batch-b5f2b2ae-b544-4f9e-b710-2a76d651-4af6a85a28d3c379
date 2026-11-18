@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>View controller verification</title>
+<style>
+
+	body { font: 14px/1.5 Consolas, monospace; margin: 24px; }
+	#summary { font-weight: bold; margin-bottom: 12px; }
+	.pass { color: #128a12; }
+	.fail { color: #b00020; white-space: pre-wrap; }
+
+</style>
+</head>
+<body>
+
+<h1>View controller verification</h1>
+<div id="summary">running…</div>
+<ol id="results"></ol>
+<pre id="dump"></pre>
+
+<script src="../build/three.min.js"></script>
+<script type="module">
+
+import { createScheduler, runSuite } from './suite.js';
+
+const summary = document.getElementById( 'summary' );
+const list = document.getElementById( 'results' );
+const dump = document.getElementById( 'dump' );
+
+function report( results ) {
+
+	summary.textContent = `${results.passed} passed, ${results.failed.length} failed, ${results.tests.length} total`;
+	summary.className = results.failed.length === 0 ? 'pass' : 'fail';
+
+	for ( const name of results.tests ) {
+
+		const failure = results.failed.find( ( entry ) => entry.name === name );
+		const item = document.createElement( 'li' );
+		item.className = failure ? 'fail' : 'pass';
+		item.textContent = failure ? `FAIL ${name}: ${failure.message}` : `PASS ${name}`;
+		list.appendChild( item );
+
+	}
+
+	// Plain-text dump for headless runners that snapshot the DOM.
+	dump.textContent = [
+		`SUMMARY ${results.passed} passed, ${results.failed.length} failed, ${results.tests.length} total`,
+		...results.tests.map( ( name ) => {
+
+			const failure = results.failed.find( ( entry ) => entry.name === name );
+			return failure ? `FAIL ${name} ${failure.message}` : `PASS ${name}`;
+
+		} )
+	].join( '\n' );
+
+	document.title = results.failed.length === 0
+		? `VERIFY-OK ${results.passed}/${results.tests.length}`
+		: `VERIFY-FAIL ${results.failed.length}/${results.tests.length}`;
+
+}
+
+try {
+
+	const scheduler = createScheduler( window );
+
+	try {
+
+		report( runSuite( window.THREE, scheduler ) );
+
+	} finally {
+
+		scheduler.restore();
+
+	}
+
+} catch ( error ) {
+
+	summary.textContent = `ERROR ${error && error.message ? error.message : error}`;
+	summary.className = 'fail';
+	dump.textContent = `ERROR ${error && error.stack ? error.stack : error}`;
+	document.title = 'VERIFY-FAIL 0/0';
+
+}
+
+</script>
+
+</body>
+</html>

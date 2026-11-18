@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>View controller WebGL smoke test</title>
+<style>
+
+	body { font: 14px/1.5 Consolas, monospace; margin: 24px; }
+	#stage { width: 320px; height: 240px; outline: 1px solid #ccc; }
+	#zero { width: 0; height: 0; overflow: hidden; }
+	.pass { color: #128a12; }
+	.fail { color: #b00020; }
+
+</style>
+</head>
+<body>
+
+<h1>WebGL smoke test</h1>
+<div id="stage"></div>
+<div id="zero"></div>
+<div id="summary">running…</div>
+<pre id="dump"></pre>
+
+<script src="../build/three.min.js"></script>
+<script>
+(function () {
+
+	var out = [];
+	var failed = 0;
+
+	function check( name, fn ) {
+
+		try {
+
+			fn();
+			out.push( 'PASS ' + name );
+
+		} catch ( error ) {
+
+			failed ++;
+			out.push( 'FAIL ' + name + ' ' + ( error && error.message ? error.message : error ) );
+
+		}
+
+	}
+
+	function assert( condition, message ) {
+
+		if ( ! condition ) throw new Error( message );
+
+	}
+
+	var stage = document.getElementById( 'stage' );
+	var zero = document.getElementById( 'zero' );
+	var view = null;
+	var geometry = null;
+	var material = null;
+
+	check( 'creates a real WebGL view and canvas', function () {
+
+		view = THREE.createViewController( stage, {
+			camera: { fov: 60, position: [ 0, 2, 5 ] },
+			rendererOptions: { antialias: true }
+		} );
+
+		assert( view.renderer && view.renderer.domElement, 'renderer with canvas' );
+		assert( view.renderer.domElement.parentNode === stage, 'canvas mounted' );
+		assert( view.camera.aspect === 320 / 240, 'aspect matches stage, got ' + view.camera.aspect );
+		assert( view.scene.isScene && view.camera.isPerspectiveCamera, 'scene + camera' );
+		assert( view.controls && view.controls.enabled !== false, 'controls active' );
+
+		geometry = new THREE.BoxGeometry( 1, 1, 1 );
+		material = new THREE.MeshStandardMaterial( { color: 0x3366cc } );
+		view.scene.add( new THREE.Mesh( geometry, material ) );
+		view.scene.add( new THREE.AmbientLight( 0xffffff, 1 ) );
+
+	} );
+
+	check( 'renders a frame', function () {
+
+		view.render();
+		var gl = view.renderer.getContext();
+		assert( gl && ! gl.isContextLost(), 'context alive' );
+
+	} );
+
+	check( 'zero-sized resize is skipped', function () {
+
+		view.pause();
+		var before = view.size;
+		// A detached / zero-sized element measures 0x0.
+		var zeroView = THREE.createViewController( zero, { autoStart: false } );
+		zeroView.resize();
+		assert( zeroView.size === null, 'zero container produced no size' );
+		zeroView.resize();
+		zeroView.destroy();
+		assert( before && before.width === 320, 'previous size retained' );
+
+	} );
+
+	check( 'pause cancels the loop and resume restores one', function () {
+
+		var frames = 0;
+		var original = window.requestAnimationFrame;
+		window.requestAnimationFrame = function ( cb ) {
+
+			frames ++;
+			return original.call( window, cb );
+
+		};
+
+		try {
+
+			view.resume();
+			assert( view.running === true, 'running after resume' );
+			view.resume();
+			assert( frames === 1, 'only one frame requested by double resume, got ' + frames );
+			view.pause();
+			assert( view.running === false, 'not running after pause' );
+
+		} finally {
+
+			window.requestAnimationFrame = original;
+
+		}
+
+	} );
+
+	check( 'resize updates aspect and drawing buffer', function () {
+
+		stage.style.width = '400px';
+		stage.style.height = '200px';
+		view.resize();
+
+		assert( Math.abs( view.camera.aspect - 2 ) < 1e-6, 'aspect follows resize, got ' + view.camera.aspect );
+		var size = view.renderer.getSize( new THREE.Vector2() );
+		assert( size.x === 400 && size.y === 200, 'renderer size follows resize, got ' + size.x + 'x' + size.y );
+
+	} );
+
+	check( 'destroy releases resources and becomes inert', function () {
+
+		var disposedGeometry = false;
+		var disposedMaterial = false;
+		geometry.addEventListener( 'dispose', function () {
+
+			disposedGeometry = true;
+
+		} );
+		material.addEventListener( 'dispose', function () {
+
+			disposedMaterial = true;
+
+		} );
+
+		var canvas = view.renderer.domElement;
+		view.destroy();
+
+		assert( disposedGeometry, 'geometry dispose event fired' );
+		assert( disposedMaterial, 'material dispose event fired' );
+		assert( canvas.parentNode === null, 'canvas detached' );
+		assert( view.destroyed === true, 'destroyed flag' );
+
+		view.destroy();
+		view.resize();
+		view.resume();
+		view.render();
+		assert( view.running === false, 'resume after destroy is inert' );
+
+	} );
+
+	var summary = document.getElementById( 'summary' );
+	summary.textContent = ( failed === 0 ? 'OK ' : 'FAILED ' ) + ( out.length - failed ) + '/' + out.length;
+	summary.className = failed === 0 ? 'pass' : 'fail';
+	document.getElementById( 'dump' ).textContent = out.join( '\n' );
+	document.title = ( failed === 0 ? 'VERIFY-OK ' : 'VERIFY-FAIL ' ) + ( out.length - failed ) + '/' + out.length;
+
+} )();
+
+</script>
+</body>
+</html>
