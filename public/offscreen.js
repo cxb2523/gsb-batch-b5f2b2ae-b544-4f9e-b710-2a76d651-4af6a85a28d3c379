@@ -125,13 +125,18 @@ function readOutputPeak() {
 // Build a fresh chain for one tab from a bands[] + master gain.
 // Static chain (wired once): a biquad at 0 dB is transparent, so we never bypass
 // filters at runtime — live disconnect/reconnect is a classic click source.
+// The entry is populated AS the chain is wired, not at the end: if a create* call throws
+// mid-build, the catch in startCapture can disconnect exactly the nodes that already exist.
 function buildChain(entry, bands, gain) {
   const pre = audioContext.createGain();
   pre.gain.value = 1;
+  entry.preGain = pre;
   const post = audioContext.createGain();
   post.gain.value = clampMasterGain(gain);
+  entry.postGain = post;
 
   const filters = [];
+  entry.filters = filters;
   let node = pre;
   for (let i = 0; i < NUM_FILTERS; i++) {
     const f = audioContext.createBiquadFilter();
@@ -149,10 +154,6 @@ function buildChain(entry, bands, gain) {
   // Limit after summing all tabs: independent per-tab ceilings do not constrain their sum.
   post.connect(outputBus);
   post.__t = post.gain.value;
-
-  entry.preGain = pre;
-  entry.postGain = post;
-  entry.filters = filters;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +192,16 @@ async function startCapture(streamId, tab, settings) {
   }
   pending.delete(tab.id);
 
-  try {
-    if (tab.id in streams) stopStream(tab.id); // re-capture replaces old stream
-    if (Object.keys(streams).length === 0) audioContext.resume().catch((e) => dlog('resume failed:', e && e.message));
+  // Re-capture replaces the old chain through the SAME release Stop uses: the old stream
+  // and nodes are gone — and, if it was the last chain, the limiter reset has fired —
+  // before the new chain is allowed to touch the shared bus.
+  if (tab.id in streams) releaseTab(tab.id);
+  if (Object.keys(streams).length === 0) audioContext.resume().catch((e) => dlog('resume failed:', e && e.message));
 
+  // `entry` is declared outside the try so the catch can disconnect whatever buildChain
+  // had already wired when it threw — a partial chain must not leak into the shared bus.
+  let entry = null;
+  try {
     const host = hostOf(tab.url);
     // Resolved by the service worker, so shortcuts and closing the popup cannot start a saved
     // profile as Flat. The fallback supports older senders only; current capture always supplies it.
@@ -206,7 +213,7 @@ async function startCapture(streamId, tab, settings) {
     const gain = clampMasterGain(settings?.gain ?? 1);
 
     const source = audioContext.createMediaStreamSource(stream);
-    const entry = {
+    entry = {
       stream,
       source,
       host,
@@ -227,18 +234,33 @@ async function startCapture(streamId, tab, settings) {
     dlog('capturing tab', tab.id, 'host', host, '— active streams:', Object.keys(streams).length);
     broadcastStatus();
   } catch (e) {
-    // Chain construction threw (context closed, node limit, …) — stop the acquired stream so we
-    // don't leave the tab captured with no way to reach it.
+    // Chain construction threw (context closed, node limit, …). Stop the acquired stream so we
+    // don't leave the tab captured with no way to reach it, disconnect the partial chain, and
+    // run the same release Stop would — a re-capture that fails here already tore the old chain
+    // down, so the popup must be told the tab is gone (and the limiter reset if it was the last).
     try {
       stream.getTracks().forEach((t) => t.stop());
     } catch (x) {
       /* ignore */
     }
-    // Mirror disconnectTab cleanup: the re-capture path may have emptied `streams` and resumed the
-    // context, so re-suspend when idle and refresh the popup (which would otherwise still list the tab).
-    if (audioContext && Object.keys(streams).length === 0) audioContext.suspend().catch((x) => dlog('suspend failed:', x && x.message));
+    if (entry) disconnectEntry(entry);
+    releaseTab(tab.id);
     broadcastStatus();
     reportEngineError('startCapture: building chain failed', e);
+  }
+}
+
+// Disconnect every node a chain entry owns. Tolerant of partial entries — buildChain
+// assigns as it goes, so a chain that threw mid-build is cleaned up by the same loop.
+function disconnectEntry(e) {
+  for (const node of [e.source, e.preGain, ...(e.filters || []), e.postGain, e.analyzer]) {
+    if (node) {
+      try {
+        node.disconnect();
+      } catch (x) {
+        /* already gone */
+      }
+    }
   }
 }
 
@@ -250,27 +272,31 @@ function stopStream(tabId) {
   } catch (x) {
     /* ignore */
   }
-  for (const node of [e.source, e.preGain, ...(e.filters || []), e.postGain, e.analyzer]) {
-    if (node) {
-      try {
-        node.disconnect();
-      } catch (x) {
-        /* already gone */
-      }
-    }
-  }
+  disconnectEntry(e);
   delete streams[tabId];
 }
 
-function disconnectTab(tabId) {
-  pending.delete(tabId); // cancel an in-flight capture for this tab (startCapture stops its stream)
+// The ONE teardown every branch converges on — Stop, re-capture, chain-build failure and
+// track end all release a tab through here. It cancels the tab's in-flight capture (a
+// getUserMedia that lands afterwards stops its own stream — see startCapture), stops the
+// live chain's tracks and disconnects its nodes. When the LAST chain goes away it also
+// resets the shared limiter — its lookahead buffer and gain-reduction envelope belong to
+// the mix that just ended and must not be replayed into the next capture — and suspends
+// the now-idle context. A re-capture building a replacement re-resumes immediately; the
+// limiter reset is the part it actually needed.
+function releaseTab(tabId) {
+  pending.delete(tabId);
   stopStream(tabId);
-  if (audioContext && Object.keys(streams).length === 0) {
+  if (Object.keys(streams).length === 0) {
     // Clear the delayed samples before an idle/resume cycle, so a later capture cannot replay
     // the final 5 ms of the old tab or inherit its gain-reduction envelope.
     outputLimiter?.port.postMessage({ type: 'reset' });
-    audioContext.suspend().catch((e) => dlog('suspend failed:', e && e.message));
+    if (audioContext) audioContext.suspend().catch((e) => dlog('suspend failed:', e && e.message));
   }
+}
+
+function disconnectTab(tabId) {
+  releaseTab(tabId);
   broadcastStatus();
 }
 
