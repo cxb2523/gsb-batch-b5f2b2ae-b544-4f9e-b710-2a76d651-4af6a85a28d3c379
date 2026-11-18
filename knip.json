@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "workspaces": {
+    "apps/*": {},
+    "apps/web": {
+      "ignoreDependencies": ["@tailwindcss/postcss"]
+    },
+    "packages/*": {}
+  },
+  "ignoreDependencies": ["postcss-load-config"],
+  "ignoreUnresolved": ["next"],
+  "ignoreExportsUsedInFile": {
+    "interface": true,
+    "type": true
+  }
+}

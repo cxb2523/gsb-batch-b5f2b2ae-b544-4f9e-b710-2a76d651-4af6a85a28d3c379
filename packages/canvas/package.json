@@ -1,0 +1,41 @@
+{
+  "name": "@workspace/canvas",
+  "version": "0.0.1",
+  "description": "React Flow canvas components and hooks for Flowpocus",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "exports": {
+    "./lib/*": "./src/lib/*.ts",
+    "./components/*": "./src/components/*.tsx",
+    "./components/nodes/*": "./src/components/nodes/*.tsx",
+    "./components/plugins/*": "./src/components/plugins/*.tsx",
+    "./hooks/*": "./src/hooks/*.ts",
+    "./types/*": "./src/types/*.ts"
+  },
+  "dependencies": {
+    "@workspace/commands": "workspace:*",
+    "@xyflow/react": "^13.0.1",
+    "cn": "^0.5.2",
+    "lucide-react": "^1.73.0",
+    "motion": "^14.14.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "zustand": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@workspace/typescript-config": "workspace:*",
+    "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "@workspace/ui": "workspace:*"
+  }
+}
