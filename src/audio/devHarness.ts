@@ -5,17 +5,26 @@
 import { Soundscape } from './soundscape.ts';
 import { VOICE_NAMES, VOICE_PANEL } from './voices.ts';
 import { runOfflineTest } from './offlineTest.ts';
-import type { TestRow } from './offlineTest.ts';
+import type { SwitchRow, TestRow } from './offlineTest.ts';
 import type { CueName } from './cues.ts';
 import type { SoundMode } from './soundscape.ts';
 import type { VoiceType } from './voices.ts';
 import type { PanelId, Scene } from '../scene.ts';
 
+type Row = TestRow | SwitchRow;
+
 declare global {
   interface Window {
     __soundscape?: Soundscape;
-    __audioTest?: { rows: TestRow[]; summary: string; done: boolean };
+    __audioTest?: { rows: Row[]; summary: string; done: boolean };
+    // live mode-switch probe: switches, steps the mix by hand and reports
+    __soundscapeSwitch?: () => Promise<SwitchReport>;
   }
+}
+
+interface SwitchReport {
+  pass: boolean;
+  notes: string[];
 }
 
 // every element the harness looks up is in dev/audio.html
@@ -95,7 +104,14 @@ async function main() {
 
   $('#start').addEventListener('click', async () => { await sc.start(); $('#start').textContent = 'Audio running'; });
   $('#mute').addEventListener('change', (e) => sc.setMuted((e.target as HTMLInputElement).checked));
-  $('#mode').addEventListener('change', (e) => sc.setMode((e.target as HTMLSelectElement).value as SoundMode));
+  $('#mode').addEventListener('change', (e) => {
+    sc.setMode((e.target as HTMLSelectElement).value as SoundMode);
+    // the switch is atomic: report the levels it applied, before any update()
+    const lv = sc.mixLevels, pr = sc.pendingRelease;
+    console.log(`mode ${sc.mode}: duck ${lv.duck.toFixed(2)}, music ${lv.musicMaster.toFixed(2)}, `
+      + `${sc.activeVoices.length} active voices, retiring ${pr.music} music / ${pr.voices} voices`);
+    renderActive();
+  });
   sc.setMode($<HTMLSelectElement>('#mode').value as SoundMode);
   $('#volume').addEventListener('input', (e) => sc.setVolume(+(e.target as HTMLInputElement).value));
   for (const name of ['open', 'poi', 'tour', 'thunder', 'close'] satisfies CueName[]) {
@@ -128,12 +144,15 @@ async function main() {
   }
 
   function renderActive() {
+    const modes = sc.activeModes;
     const act = sc.activeVoices.sort((a, b) => b.gain - a.gain);
     $('#active').replaceChildren(...act.map((a) => el('li', {},
       el('span', { class: 'name' }, a.type), ` ${a.title ? a.title : a.id} `,
-      el('span', { class: 'dim' }, `g ${a.gain.toFixed(2)} pan ${a.pan.toFixed(2)}`))));
+      el('span', { class: 'dim' }, `g ${a.gain.toFixed(2)} pan ${a.pan.toFixed(2)} [${modes[a.id]}]`))));
     const bw = sc.bedWeights;
-    $('#beds').textContent = `mode ${sc.mode} | beds eden ${bw.eden.toFixed(2)} garden ${bw.garden.toFixed(2)} hell ${bw.hell.toFixed(2)}  | voices ${act.length}  | ctx ${sc.context ? sc.context.state : 'none'}`;
+    const lv = sc.mixLevels;
+    const pr = sc.pendingRelease;
+    $('#beds').textContent = `mode ${sc.mode} | duck ${lv.duck.toFixed(2)} music ${lv.musicMaster.toFixed(2)} | beds eden ${bw.eden.toFixed(2)} garden ${bw.garden.toFixed(2)} hell ${bw.hell.toFixed(2)}  | voices ${act.length}  | retiring music ${pr.music} voices ${pr.voices} | ctx ${sc.context ? sc.context.state : 'none'}`;
   }
 
   let frames = 0;
@@ -154,18 +173,106 @@ async function main() {
     table.append(body);
     out.replaceChildren(table);
     const rows = await runOfflineTest({
+      scene,
       onRow: (r) => body.append(el('tr', { class: r.pass ? 'pass' : 'fail' },
-        el('td', {}, r.kind), el('td', {}, r.name), el('td', {}, r.mode), el('td', {}, String(r.seconds)), el('td', {}, String(r.peakDb)), el('td', {}, String(r.rmsDb)), el('td', {}, String(r.rawPeakDb)), el('td', {}, String(r.rawRmsDb)), el('td', {}, String(r.musicBuilt)), el('td', {}, String(r.nan)), el('td', {}, r.pass ? 'PASS' : 'FAIL'))),
+        el('td', {}, r.kind), el('td', {}, r.name), el('td', {}, r.mode), el('td', {}, String(r.seconds)), el('td', {}, String(r.peakDb)), el('td', {}, String(r.rmsDb)), el('td', {}, String(r.rawPeakDb)), el('td', {}, String(r.rawRmsDb)), el('td', {}, String(r.musicBuilt)), el('td', {}, String(r.nan)), el('td', {}, String(r.pass ? 'PASS' : 'FAIL')))),
     });
     const failed = rows.filter((r) => !r.pass);
     const summary = `offline test: ${rows.length - failed.length}/${rows.length} pass` + (failed.length ? ` FAILED: ${failed.map((r) => r.name).join(', ')}` : '');
     out.append(el('p', { id: 'testSummary', class: failed.length ? 'fail' : 'pass' }, summary));
+    // the mode-switch row's own measurements, one line each
+    const sw = rows.find((r) => r.kind === 'switch');
+    if (sw && sw.kind === 'switch') {
+      out.append(el('p', { class: 'dim' }, 'mode switch:'), el('ul', { class: 'notes' }, ...sw.notes.map((n) => el('li', { class: 'dim' }, n))));
+    }
     console.table(rows);
     console.log(summary);
     window.__audioTest = { rows, summary, done: true };
   }
   $('#runTest').addEventListener('click', runTest);
   if (new URLSearchParams(location.search).has('test')) runTest();
+
+  // --- live mode-switch probe
+  // Drives the Soundscape through nature -> period -> nature on the live context,
+  // stepping the mix by hand between switches, and checks that the retired
+  // voices are frozen and only the new mode's voices are generated. Disposal
+  // timing is measured by the offline render, where sample offsets are exact.
+  const activeWithMode = () => sc.activeVoices.map((a) => ({ ...a, mode: sc.activeModes[a.id] }));
+  const consortCount = () => Object.values(sc.beds).filter((b) => b.music).length;
+
+  async function probeSwitch(): Promise<SwitchReport> {
+    const notes: string[] = [];
+    let pass = true;
+    await sc.start();
+    sc.setMode('nature');
+    view.time = 0;
+    sc.update(view);
+    const oldIds = sc.activeVoices.map((a) => a.id);
+    notes.push(`nature: ${oldIds.length} active voices (${oldIds.join(', ') || 'none'}), ${consortCount()} consorts`);
+    if (oldIds.length === 0 || consortCount() !== 0) pass = false;
+
+    const duckNature = sc.mixLevels.duck;
+    sc.setMode('period');
+    // no update() yet: the period duck, music level and consorts must be in force now
+    notes.push(`setMode(period), before any update: duck ${duckNature.toFixed(2)} -> ${sc.mixLevels.duck.toFixed(2)}, `
+      + `music ${sc.mixLevels.musicMaster.toFixed(2)}, ${consortCount()} consorts, `
+      + `${sc.pendingRelease.voices} voices / ${sc.pendingRelease.music} music retiring`);
+    if (duckNature !== 1 || sc.mixLevels.duck !== 0.6) pass = false;
+    if (consortCount() !== 3) pass = false;
+    if (sc.pendingRelease.voices !== oldIds.length) pass = false;
+    if (sc.activeVoices.length !== 0) pass = false; // the old voices left the pool at once
+
+    sc.update(view);
+    if (sc.activeVoices.length === 0 || activeWithMode().some((a) => a.mode !== 'period')) pass = false;
+    notes.push(`period after one update: ${sc.activeVoices.length} voices (${sc.activeVoices.map((a) => a.id).join(', ')})`);
+
+    sc.setMode('nature');
+    if (sc.mixLevels.duck !== 1) pass = false;
+    if (consortCount() !== 0) pass = false;
+    if (sc.pendingRelease.music !== 3) pass = false;
+    sc.update(view);
+    if (activeWithMode().some((a) => a.mode !== 'nature')) pass = false;
+
+    // rapid toggles: no stale voice may survive in activeVoices
+    for (const m of ['period', 'nature', 'period', 'nature'] as SoundMode[]) { sc.setMode(m); sc.update(view); }
+    const stale = activeWithMode().filter((a) => a.mode !== 'nature');
+    if (stale.length) { pass = false; notes.push(`stale after rapid toggles: ${stale.map((a) => `${a.id}[${a.mode}]`).join(', ')}`); }
+    notes.push(`after rapid toggles: ${sc.activeVoices.length} active, ${consortCount()} consorts, `
+      + `${sc.pendingRelease.music} music / ${sc.pendingRelease.voices} voices retiring`);
+
+    // Disposal happens after the fade, never before it. Measure in audio-clock
+    // seconds, not wall time: a headless or background tab runs the clock slower.
+    const ctx = sc.context;
+    const switchAt = ctx ? ctx.currentTime : 0;
+    let musicDelay = -1;
+    const t0 = performance.now();
+    while (performance.now() - t0 < 8000) {
+      sc.update(view);
+      await new Promise((r) => setTimeout(r, 50));
+      const music = sc.disposeLog.filter((e) => e.kind === 'music' && e.at >= switchAt);
+      if (musicDelay < 0 && music.length) musicDelay = music[0].at - switchAt;
+      if (sc.pendingRelease.music === 0 && sc.pendingRelease.voices === 0) break;
+    }
+    const elapsed = ctx ? ctx.currentTime - switchAt : 0;
+    notes.push(`after ${elapsed.toFixed(2)} s of audio: retired music disposed at `
+      + `${musicDelay >= 0 ? `+${musicDelay.toFixed(2)} s` : 'never'}, `
+      + `${sc.pendingRelease.music} music / ${sc.pendingRelease.voices} voices still retiring`);
+    if (musicDelay < 0) pass = false;
+    if (musicDelay >= 0 && musicDelay < 0.45) pass = false; // earlier than MODE_TC, the music fade's time constant
+    if (sc.pendingRelease.voices > 0) pass = false;
+    if (sc.pendingRelease.music > 0) pass = false;
+    return { pass, notes };
+  }
+  window.__soundscapeSwitch = probeSwitch;
+  $('#runSwitch').addEventListener('click', async () => {
+    const out = $('#switchOut');
+    out.replaceChildren(el('p', {}, 'Switching...'));
+    const r = await probeSwitch();
+    out.replaceChildren(
+      el('p', { class: r.pass ? 'pass' : 'fail' }, `live mode switch: ${r.pass ? 'PASS' : 'FAIL'}`),
+      el('ul', {}, ...r.notes.map((n) => el('li', { class: 'dim' }, n))),
+    );
+  });
 }
 
 main().catch((e) => { console.error(e); document.body.append(el('pre', { class: 'fail' }, String(e.stack || e))); });

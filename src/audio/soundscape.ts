@@ -1,5 +1,13 @@
 // Soundscape: the public audio API for the app. Owns the AudioContext, the
 // master chain, the three section beds and the pool of positional voices.
+//
+// A mode change is one atomic state transition. setMode() first freezes the
+// outgoing music and positional voices (their gain targets are set to fade out
+// once and are never written again), takes them out of the active pool, and
+// only then builds the new mode's music. The new mode's ambience duck and music
+// level are applied on that same frame, without waiting for the next update().
+// Retired voices are disposed after their fade has finished, never before the
+// fade time constant, so no panner or music voice is left behind.
 
 import { clamp, gainNode } from './dsp.ts';
 import { createMaster } from './master.ts';
@@ -20,8 +28,26 @@ export type SoundMode = 'nature' | 'period';
 export interface SoundView { cx: number; cy: number; scale: number; viewW: number; viewH: number; time: number }
 // Where a voice sounds: a zone, or the dev harness's solo voice in the view centre.
 type Source = Pick<Zone, 'id' | 'type' | 'panel' | 'x' | 'y' | 'r'> & { poiTitle?: string | null };
-interface Bed { bed: Voice; fade: GainNode; music: Voice | null; musicFade: GainNode }
-interface Active { zone: Source; voice: Voice; fade: GainNode; panner: StereoPannerNode; gain: number; pan: number; dying: boolean }
+interface Bed { bed: Voice; fade: GainNode; music: Voice | null; musicFade: GainNode | null }
+interface Active {
+  zone: Source; voice: Voice; fade: GainNode; panner: StereoPannerNode;
+  gain: number; pan: number; mode: SoundMode; dying: boolean;
+}
+// A voice that has left the active set but is still fading out. `releaseAt` is
+// in AudioContext time and is never earlier than the fade time constant.
+// Exported so tests can instrument the retired fades.
+export interface Retired {
+  voice: Voice; fade: GainNode; panner: StereoPannerNode | null;
+  releaseAt: number; disposed: boolean; timer: ReturnType<typeof setTimeout> | null;
+}
+// Everything the mix needs for one view under the current mode.
+interface Mix {
+  weights: Record<PanelId, number>; duck: number;
+  voiceMaster: number; bedMaster: number; musicMaster: number;
+  tc: number;
+}
+// What a caller may inject; a live AudioContext is made on demand in start().
+export interface SoundscapeOptions { ctx?: BaseAudioContext }
 
 const MAX_VOICES = 12;
 const MAX_PER_TYPE = 2;
@@ -29,6 +55,12 @@ const NEAR_FACTOR = 2.5;      // build voices within this many view radii
 const LOOKAHEAD = 0.5;        // seconds of events scheduled ahead of the clock
 const FADE_TC = 0.2;          // time constant: ~0.6 s to settle
 const MODE_TC = 0.45;         // mode switch crossfade: ~1.5 s to settle
+// A retired voice is disposed only once its fade has finished: at least this
+// long after the release, and never before FADE_SETTLE_TC time constants. An
+// exact zero is scheduled at releaseAt, so disposal cannot cut a tail.
+const MUSIC_RELEASE_SEC = 2.0;
+const VOICE_RELEASE_SEC = 0.9;
+const FADE_SETTLE_TC = 4;    // a setTarget fade is below -30 dB after this many time constants
 const MODES: SoundMode[] = ['nature', 'period'];
 const SCALE_OVERVIEW = 0.006;
 const SCALE_CLOSE = 0.1;
@@ -42,10 +74,11 @@ export class Soundscape {
   scene: Scene;
   zones: Zone[];
   zoneById: Map<string, Zone>;
-  ctx: AudioContext | null;
+  ctx: BaseAudioContext | null; // made in start(), or injected (offline tests)
   master: Master | null; // made with ctx
   beds: Record<PanelId, Bed>;
   active: Map<string, Active>;
+  retiring: Retired[];
   _mode: SoundMode;
   slowFadeUntil: number;
   focusId: string | null;
@@ -54,15 +87,24 @@ export class Soundscape {
   volume: number;
   bedWeights: Record<PanelId, number>;
   lastView: SoundView | null;
+  lastMix: Mix;
+  offline: boolean;   // the context was injected: no user gesture needed, no timers
+  disposed: boolean;
+  // When each retired voice was disposed, in AudioContext time: the dev harness
+  // and the offline test check that music disposal never precedes its fade.
+  disposeLog: { kind: 'music' | 'voice'; at: number }[];
 
-  constructor(scene: Scene) {
+  constructor(scene: Scene, options: SoundscapeOptions = {}) {
     this.scene = scene;
     this.zones = buildZones(scene);
     this.zoneById = new Map(this.zones.map((z) => [z.id, z]));
-    this.ctx = null;
+    this.ctx = options.ctx ?? null;
+    this.offline = !!options.ctx;
+    this.disposed = false;
     this.master = null;
     this.beds = {} as Record<PanelId, Bed>; // filled by start(), before anything reads it
-    this.active = new Map(); // zone id -> { zone, voice, fade, panner, gain, pan }
+    this.active = new Map(); // zone id -> { zone, voice, fade, panner, gain, pan, mode }
+    this.retiring = []; // voices taken out of the active set, fading out until disposed
     this._mode = 'nature';
     this.slowFadeUntil = 0;
     this.focusId = null;
@@ -71,14 +113,26 @@ export class Soundscape {
     this.volume = 1;
     this.bedWeights = { eden: 0, garden: 0, hell: 0 };
     this.lastView = null;
+    this.lastMix = this.mixFor(null);
+    this.disposeLog = [];
   }
 
-  get context(): AudioContext | null { return this.ctx; }
+  get context(): AudioContext | null { return this.ctx as AudioContext | null; }
+
+  // Update and cue may run when the context is live and running, or when it is
+  // an OfflineAudioContext that is being rendered (its state is not 'running'
+  // between suspend callbacks).
+  get audible(): boolean {
+    const ctx = this.ctx;
+    if (!ctx || this.disposed) return false;
+    return this.offline ? ctx.state !== 'closed' : ctx.state === 'running';
+  }
 
   async start(): Promise<void> {
-    if (!this.ctx) {
-      const ctx = new AudioContext({ latencyHint: 'playback' });
-      this.ctx = ctx;
+    if (this.disposed) return; // torn down: make a new Soundscape instead
+    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: 'playback' });
+    const ctx = this.ctx;
+    if (!this.master) {
       this.master = createMaster(ctx);
       this.master.setVolume(this.volume);
       this.master.setMuted(this.muted);
@@ -87,45 +141,61 @@ export class Soundscape {
         const bed = BEDS[panel](ctx, seed++);
         const fade = gainNode(ctx, 0);
         bed.out.connect(fade).connect(this.master.sections[panel].bus);
-        const musicFade = gainNode(ctx, 0);
-        musicFade.connect(this.master.sections[panel].bus);
-        this.beds[panel] = { bed, fade, music: null, musicFade };
+        this.beds[panel] = { bed, fade, music: null, musicFade: null };
       }
-      if (this._mode === 'period') this.buildMusic();
     }
-    if (this.ctx.state !== 'running') await this.ctx.resume();
+    if (this._mode === 'period') this.buildMusic();
+    // An OfflineAudioContext starts suspended and only resumes while rendering;
+    // only a live AudioContext is resumed here (it needs a user gesture).
+    if (typeof AudioContext !== 'undefined' && ctx instanceof AudioContext && ctx.state !== 'running') await ctx.resume();
     if (this.lastView) this.update(this.lastView);
   }
 
   get mode(): SoundMode { return this._mode; }
-  /** 'nature': ambience only. 'period': ambience plus consort music. Crossfades ~1.5 s. */
+
+  /**
+   * 'nature': ambience only. 'period': ambience plus consort music. Crossfades
+   * ~1.5 s. The switch is atomic: the old music and positional voices are
+   * frozen and retired at once, and the new mode's duck and music level take
+   * effect on this frame.
+   */
   setMode(mode: SoundMode): void {
-    if (!MODES.includes(mode) || mode === this._mode) return;
+    if (!MODES.includes(mode) || mode === this._mode || this.disposed) return;
     this._mode = mode;
     const ctx = this.ctx;
-    if (!ctx) return;
+    if (!ctx) {
+      // no audio yet: remember the mode and report its levels, which start()
+      // applies when the context is made
+      this.mixFor(this.lastView);
+      return;
+    }
     const now = ctx.currentTime;
     this.slowFadeUntil = now + 1.5;
+    // 1. Freeze the outgoing state before anything new exists, so no later
+    //    update() can raise these gains again.
+    this.retireMusic(now);
+    this.retireVoices(now);
+    // 2. Only the new mode builds music.
     if (mode === 'period') this.buildMusic();
-    else {
-      for (const b of Object.values(this.beds)) {
-        const m = b.music;
-        if (!m) continue;
-        b.music = null;
-        b.musicFade.gain.setTargetAtTime(0, now, MODE_TC);
-        setTimeout(() => m.dispose(), 2000);
-      }
-    }
-    // positional voices carry mode-specific parts: let them go and respawn on the next update
-    for (const [id, a] of [...this.active]) this.release(id, a, MODE_TC, 2000);
+    // 3. Apply the new mode's ambience duck and music level immediately.
+    const mix = this.mixFor(this.lastView);
+    this.applyBedMix(now, mix.tc, mix);
   }
 
   buildMusic(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.master) return;
     let seed = 301;
     for (const [panel, b] of Object.entries(this.beds) as [PanelId, Bed][]) {
       if (b.music) continue;
-      b.music = MUSIC_BEDS[panel](this.ctx!, seed++);
-      b.music.out.connect(b.musicFade);
+      const voice = MUSIC_BEDS[panel](ctx, seed++);
+      // each music instance owns its fade node: a retiring instance keeps its
+      // own curve even if the mode switches back and a new consort is built
+      const fade = gainNode(ctx, 0);
+      fade.connect(this.master.sections[panel].bus);
+      voice.out.connect(fade);
+      b.music = voice;
+      b.musicFade = fade;
     }
   }
 
@@ -136,51 +206,26 @@ export class Soundscape {
   solo(type: VoiceType | null): void { this.soloType = type || null; }
 
   cue(name: CueName, gain = 1): void {
-    if (!this.ctx || this.ctx.state !== 'running' || gain <= 0) return;
-    playCue(name, this.ctx, this.master!.sections.cue.bus, undefined, undefined, gain);
+    if (!this.master || !this.audible || gain <= 0) return;
+    playCue(name, this.ctx!, this.master.sections.cue.bus, undefined, undefined, gain);
   }
 
   update(view: SoundView): void {
     this.lastView = view;
     const ctx = this.ctx;
-    if (!ctx || ctx.state !== 'running') return;
+    if (!ctx || !this.master || !this.audible) return;
     const now = ctx.currentTime;
+    this.pruneRetired(now);
+
     const { cx, cy, scale, viewW, viewH } = view;
-
-    // 0 at the whole-painting overview, 1 once zoomed into a scene
-    const z = clamp((Math.log(scale) - Math.log(SCALE_OVERVIEW)) / (Math.log(SCALE_CLOSE) - Math.log(SCALE_OVERVIEW)), 0, 1);
+    const mix = this.mixFor(view);
+    const tc = mix.tc;
     const focusing = this.focusId != null;
-    const tc = now < this.slowFadeUntil ? MODE_TC : FADE_TC;
-    // In 'period' the consort leads: it plays well above the ambience, which ducks under it,
-    // and it stays clearly present when zoomed into a scene.
-    const period = this._mode === 'period';
-    const duck = period ? AMBIENCE_DUCK : 1;
-    let voiceMaster = (0.12 + 0.88 * Math.pow(z, 0.8)) * duck;
-    let bedMaster = (1 - 0.5 * z) * (focusing ? 0.65 : 1) * duck;
-    const musicMaster = MUSIC_LEVEL * (1 - 0.35 * z) * (focusing ? 0.7 : 1);
+    const voiceMaster = mix.voiceMaster;
 
-    // --- beds: crossfade by visible panel width plus where the centre sits
-    const halfW = viewW / (2 * scale);
-    const x0 = cx - halfW, x1 = cx + halfW;
-    const weights = {} as Record<PanelId, number>; // every panel, filled below
-    let sum = 0;
-    for (const p of this.scene.panels) {
-      const overlap = Math.max(0, Math.min(x1, p.x1) - Math.max(x0, p.x0)) / (x1 - x0);
-      const dCentre = cx < p.x0 ? p.x0 - cx : cx > p.x1 ? cx - p.x1 : 0;
-      const centre = Math.max(0, 1 - dCentre / 12000);
-      weights[p.id] = overlap + 0.6 * centre;
-      sum += weights[p.id];
-    }
-    for (const p of this.scene.panels) {
-      const w = sum > 0 ? Math.sqrt(weights[p.id] / sum) : 0; // equal-power
-      this.bedWeights[p.id] = w;
-      const target = this.soloType ? 0 : w * bedMaster;
-      const b = this.beds[p.id];
-      b.fade.gain.setTargetAtTime(target, now, tc);
-      if (b.music) b.musicFade.gain.setTargetAtTime(this.soloType ? 0 : w * musicMaster, now, tc);
-    }
+    this.applyBedMix(now, tc, mix);
 
-    // --- positional voices
+    // --- positional voices: only the current mode's voices are ever generated
     const viewR = 0.5 * Math.hypot(viewW, viewH) / scale;
     const wanted: { zone: Source; gain: number; pan: number; pinned?: boolean }[] = [];
     if (this.soloType) {
@@ -214,18 +259,26 @@ export class Soundscape {
     for (const w of wanted) {
       keep.add(w.zone.id);
       let a = this.active.get(w.zone.id);
-      if (!a) a = this.spawn(w.zone);
+      if (!a || a.dying) {
+        a = this.spawn(w.zone);
+        a.gain = w.gain; a.pan = w.pan;
+        // a new voice starts silent and rises into its first target
+        a.fade.gain.setValueAtTime(0, now);
+      }
       a.gain = w.gain; a.pan = w.pan;
       a.fade.gain.setTargetAtTime(w.gain, now, tc);
       a.panner.pan.setTargetAtTime(w.pan, now, 0.1);
     }
-    for (const [id, a] of this.active) {
+    for (const [id, a] of [...this.active]) {
       if (!keep.has(id)) this.release(id, a);
     }
 
-    // --- lookahead scheduling of every running pattern
+    // --- lookahead scheduling of every running pattern: current voices only
     const until = now + LOOKAHEAD;
-    for (const b of Object.values(this.beds)) { b.bed.schedule(until); if (b.music) b.music.schedule(until); }
+    for (const b of Object.values(this.beds)) {
+      b.bed.schedule(until);
+      if (b.music) b.music.schedule(until);
+    }
     for (const a of this.active.values()) a.voice.schedule(until);
   }
 
@@ -233,29 +286,199 @@ export class Soundscape {
     return this.zoneById.get(`poi-${poiId}`) || this.zones.find((z) => z.poiId === poiId) || null;
   }
 
+  // The mix for a view under the current mode. Kept separate from update() so
+  // setMode() can apply the new mode's levels without scheduling any voice.
+  mixFor(view: SoundView | null): Mix {
+    const period = this._mode === 'period';
+    const duck = period ? AMBIENCE_DUCK : 1;
+    const focusing = this.focusId != null;
+    let z = 0;
+    const weights = { eden: 0, garden: 0, hell: 0 } as Record<PanelId, number>;
+    if (view) {
+      // 0 at the whole-painting overview, 1 once zoomed into a scene
+      z = clamp((Math.log(view.scale) - Math.log(SCALE_OVERVIEW)) / (Math.log(SCALE_CLOSE) - Math.log(SCALE_OVERVIEW)), 0, 1);
+      const cx = view.cx, cy = view.cy;
+      const halfW = view.viewW / (2 * view.scale);
+      const x0 = cx - halfW, x1 = cx + halfW;
+      let sum = 0;
+      for (const p of this.scene.panels) {
+        const overlap = Math.max(0, Math.min(x1, p.x1) - Math.max(x0, p.x0)) / (x1 - x0);
+        const dCentre = cx < p.x0 ? p.x0 - cx : cx > p.x1 ? cx - p.x1 : 0;
+        const centre = Math.max(0, 1 - dCentre / 12000);
+        weights[p.id] = overlap + 0.6 * centre;
+        sum += weights[p.id];
+      }
+      for (const p of this.scene.panels) {
+        weights[p.id] = sum > 0 ? Math.sqrt(weights[p.id] / sum) : 0; // equal-power
+      }
+    }
+    // In 'period' the consort leads: it plays well above the ambience, which ducks under it,
+    // and it stays clearly present when zoomed into a scene.
+    const voiceMaster = (0.12 + 0.88 * Math.pow(z, 0.8)) * duck;
+    const bedMaster = (1 - 0.5 * z) * (focusing ? 0.65 : 1) * duck;
+    const musicMaster = MUSIC_LEVEL * (1 - 0.35 * z) * (focusing ? 0.7 : 1);
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    const tc = now < this.slowFadeUntil ? MODE_TC : FADE_TC;
+    this.lastMix = { weights, duck, voiceMaster, bedMaster, musicMaster, tc };
+    return this.lastMix;
+  }
+
+  // Levels of the mix currently in force, for verification in the dev harness.
+  get mixLevels(): { duck: number; bedMaster: number; voiceMaster: number; musicMaster: number } {
+    const m = this.lastMix;
+    return { duck: m.duck, bedMaster: m.bedMaster, voiceMaster: m.voiceMaster, musicMaster: m.musicMaster };
+  }
+
+  // How many voices are still fading out and will be disposed, by kind.
+  get pendingRelease(): { music: number; voices: number } {
+    let music = 0, voices = 0;
+    for (const r of this.retiring) { if (r.panner) voices++; else music++; }
+    return { music, voices };
+  }
+
+  // Writes the current mix's bed and consort levels. Safe to call twice a frame.
+  private applyBedMix(now: number, tc: number, mix: Mix): void {
+    for (const p of this.scene.panels) {
+      const w = mix.weights[p.id] ?? 0;
+      this.bedWeights[p.id] = w;
+    }
+    if (!this.master) return;
+    for (const p of this.scene.panels) {
+      const b = this.beds[p.id];
+      if (!b) continue;
+      const w = mix.weights[p.id] ?? 0;
+      b.fade.gain.setTargetAtTime(this.soloType ? 0 : w * mix.bedMaster, now, tc);
+      if (b.music && b.musicFade) {
+        b.musicFade.gain.setTargetAtTime(this.soloType ? 0 : w * mix.musicMaster, now, tc);
+      }
+    }
+  }
+
   spawn(zone: Source): Active {
     const ctx = this.ctx!;
-    const voice = createVoice(zone.type, ctx, hashSeed(zone.id), { music: this._mode === 'period' });
+    const mode = this._mode;
+    const voice = createVoice(zone.type, ctx, hashSeed(zone.id), { music: mode === 'period' });
     const fade = gainNode(ctx, 0);
     const panner = ctx.createStereoPanner();
     const bus = this.master!.sections[zone.panel]?.bus || this.master!.sections.garden.bus;
     voice.out.connect(fade).connect(panner).connect(bus);
-    const a: Active = { zone, voice, fade, panner, gain: 0, pan: 0, dying: false };
+    const a: Active = { zone, voice, fade, panner, gain: 0, pan: 0, mode, dying: false };
     this.active.set(zone.id, a);
     return a;
   }
 
-  release(id: string, a: Active, tc = FADE_TC, disposeMs = 900): void {
+  // Fade a voice out and schedule its disposal; it leaves the active pool now.
+  release(id: string, a: Active, tc = FADE_TC, delaySec = VOICE_RELEASE_SEC): void {
     if (a.dying) return;
-    a.dying = true;
-    this.active.delete(id);
-    a.fade.gain.setTargetAtTime(0, this.ctx!.currentTime, tc);
-    setTimeout(() => { a.voice.dispose(); try { a.panner.disconnect(); } catch { /* detached */ } }, disposeMs);
+    if (this.active.get(id) === a) this.active.delete(id);
+    this.retireVoice(a, this.ctx!.currentTime, tc, delaySec);
   }
 
-  // Snapshot for the dev harness
+  private retireVoices(now: number): void {
+    for (const [id, a] of [...this.active]) {
+      if (this.active.get(id) === a) this.active.delete(id);
+      this.retireVoice(a, now, MODE_TC, VOICE_RELEASE_SEC);
+    }
+  }
+
+  private retireVoice(a: Active, now: number, tc: number, delaySec: number): void {
+    if (a.dying) return;
+    a.dying = true;
+    // Freeze the target: no later update() touches a retired voice's gain, so
+    // this fade is the last word. The voice has already left the active pool.
+    const releaseAt = now + Math.max(FADE_SETTLE_TC * tc, delaySec);
+    a.fade.gain.setTargetAtTime(0, now, tc);
+    a.fade.gain.setValueAtTime(0, releaseAt); // exact silence before disposal
+    this.scheduleDispose({ voice: a.voice, fade: a.fade, panner: a.panner, releaseAt, disposed: false, timer: null });
+  }
+
+  // Only the current consort per panel exists in beds[].music. Switching away
+  // moves it into the retired list with its own fade node and no further writes.
+  private retireMusic(now: number): void {
+    for (const b of Object.values(this.beds)) {
+      const voice = b.music, fade = b.musicFade;
+      if (!voice || !fade) continue;
+      b.music = null;
+      b.musicFade = null;
+      const releaseAt = now + Math.max(FADE_SETTLE_TC * MODE_TC, MUSIC_RELEASE_SEC);
+      fade.gain.setTargetAtTime(0, now, MODE_TC);
+      fade.gain.setValueAtTime(0, releaseAt);
+      this.scheduleDispose({ voice, fade, panner: null, releaseAt, disposed: false, timer: null });
+    }
+  }
+
+  private scheduleDispose(r: Retired): void {
+    this.retiring.push(r);
+    if (this.offline) return; // OfflineAudioContext time advances only during rendering
+    // A suspended (hidden) tab stops advancing currentTime, so poll rather than
+    // trust one long timeout; pruneRetired() in update() also disposes it.
+    const ctx = this.ctx!;
+    const tick = () => {
+      r.timer = null;
+      if (r.disposed) return;
+      if (ctx.currentTime >= r.releaseAt - 1e-3) { this.disposeRetired(r); return; }
+      r.timer = setTimeout(tick, Math.max(100, Math.min(1000, (r.releaseAt - ctx.currentTime) * 1000 + 30)));
+    };
+    r.timer = setTimeout(tick, Math.max(100, Math.min(1000, (r.releaseAt - ctx.currentTime) * 1000 + 30)));
+  }
+
+  private pruneRetired(now: number): void {
+    for (let i = this.retiring.length - 1; i >= 0; i--) {
+      const r = this.retiring[i];
+      if (now >= r.releaseAt - 1e-3) this.disposeRetired(r);
+    }
+  }
+
+  private disposeRetired(r: Retired): void {
+    if (r.disposed) return;
+    r.disposed = true;
+    if (r.timer !== null) { clearTimeout(r.timer); r.timer = null; }
+    const i = this.retiring.indexOf(r);
+    if (i >= 0) this.retiring.splice(i, 1);
+    this.disposeLog.push({ kind: r.panner ? 'voice' : 'music', at: this.ctx ? this.ctx.currentTime : 0 });
+    if (this.disposeLog.length > 200) this.disposeLog.splice(0, this.disposeLog.length - 200);
+    r.voice.dispose();
+    try { r.fade.disconnect(); } catch { /* detached */ }
+    if (r.panner) { try { r.panner.disconnect(); } catch { /* detached */ } }
+  }
+
+  // Teardown: stop every voice, including retired ones. A torn-down Soundscape
+  // cannot be restarted; make a new one instead.
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const r of [...this.retiring]) this.disposeRetired(r);
+    for (const [id, a] of [...this.active]) {
+      if (this.active.get(id) === a) this.active.delete(id);
+      a.dying = true;
+      a.voice.dispose();
+      try { a.fade.disconnect(); } catch { /* detached */ }
+      try { a.panner.disconnect(); } catch { /* detached */ }
+    }
+    for (const b of Object.values(this.beds)) {
+      b.music?.dispose();
+      b.bed.dispose();
+      try { b.fade.disconnect(); } catch { /* detached */ }
+      if (b.musicFade) { try { b.musicFade.disconnect(); } catch { /* detached */ } }
+      b.music = null;
+      b.musicFade = null;
+    }
+    this.master?.dispose();
+    this.master = null;
+  }
+
+  // Snapshot for the dev harness. Every voice in the pool belongs to the
+  // current mode: setMode() retires the old ones before any new one is built.
   get activeVoices() {
     return [...this.active.values()].map((a) => ({ id: a.zone.id, type: a.zone.type, title: a.zone.poiTitle, gain: a.gain, pan: a.pan }));
+  }
+
+  // The mode each active voice was spawned for, by zone id (a verification aid:
+  // after a switch to nature every entry is 'nature').
+  get activeModes(): Record<string, SoundMode> {
+    const out: Record<string, SoundMode> = {};
+    for (const [id, a] of this.active) out[id] = a.mode;
+    return out;
   }
 }
 
