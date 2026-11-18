@@ -141,11 +141,111 @@ function disposeSceneGraph(root: THREE.Object3D): void {
   })
 }
 
+/**
+ * A pre-filtered environment map of `scene`, keeping the render target: `PMREMGenerator.fromScene`
+ * allocates a render target around the texture, and only disposing that target frees the
+ * framebuffer as well as the texture. The scene itself is freed once baked.
+ */
+export function bakeEnvironmentTarget(pmrem: THREE.PMREMGenerator, scene: THREE.Scene, blur: number): THREE.WebGLRenderTarget {
+  const target = pmrem.fromScene(scene, blur)
+  disposeSceneGraph(scene)
+  return target
+}
+
 /** A pre-filtered environment map of `scene`; the scene itself is freed once baked. */
 export function bakeEnvironment(pmrem: THREE.PMREMGenerator, scene: THREE.Scene, blur: number): THREE.Texture {
-  const texture = pmrem.fromScene(scene, blur).texture
-  disposeSceneGraph(scene)
-  return texture
+  return bakeEnvironmentTarget(pmrem, scene, blur).texture
+}
+
+/**
+ * The rooms the studio can shoot in. Several stage/finish combinations share one: the wall takes
+ * the studio for glass, metal and colour, the floor a neutral room for glass, metal and liquid,
+ * and only Liquid on the wall gets its own black room.
+ */
+export type EnvironmentKind = 'studio' | 'room' | 'liquid'
+
+/** The stage and finish combinations the studio can be switched between. */
+export type StudioStage = 'wall' | 'floor'
+
+/** Which room each stage and finish combination shoots in; `null` means lit by the lights alone. */
+const ENVIRONMENTS: Readonly<Record<StudioStage, Readonly<Record<Finish, EnvironmentKind | null>>>> = {
+  wall: { glass: 'studio', metal: 'studio', print: 'studio', liquid: 'liquid' },
+  floor: { glass: 'room', metal: 'room', liquid: 'room', print: null },
+}
+
+/** Every room some combination of stage and finish can select: the cache never needs more. */
+const STUDIO_ENVIRONMENTS: ReadonlySet<EnvironmentKind> = (() => {
+  const kinds = new Set<EnvironmentKind>()
+  for (const byStage of Object.values(ENVIRONMENTS)) {
+    for (const kind of Object.values(byStage)) if (kind) kinds.add(kind)
+  }
+  return kinds
+})()
+
+/**
+ * Environments baked on demand and shared by every stage/finish combination that uses the same
+ * room. A room is baked at most once: coming back to a combination reuses its map instead of
+ * baking another, so the number of live maps is bounded by the rooms in `EnvironmentKind`, however
+ * often the stage and finish are switched.
+ *
+ * Ownership is explicit. `prune` keeps only the rooms some stage/finish combination can still
+ * select, freeing the rest; `release` frees one outright; `releaseAll` empties the cache when the
+ * studio is torn down. Freeing goes through the render target the PMREM was baked into, which owns
+ * both the framebuffer and the texture.
+ */
+export class EnvironmentCache {
+  private entries = new Map<EnvironmentKind, THREE.WebGLRenderTarget>()
+
+  constructor(private readonly bake: (kind: EnvironmentKind) => THREE.WebGLRenderTarget) {}
+
+  /** How many rooms are currently baked. */
+  get size(): number { return this.entries.size }
+
+  has(kind: EnvironmentKind): boolean { return this.entries.has(kind) }
+
+  /** The baked texture of `kind`, baking it the first time it is asked for. */
+  acquire(kind: EnvironmentKind): THREE.Texture {
+    let target = this.entries.get(kind)
+    if (!target) {
+      target = this.bake(kind)
+      this.entries.set(kind, target)
+    }
+    return target.texture
+  }
+
+  /** The texture of an already baked room, without baking `kind`. */
+  texture(kind: EnvironmentKind): THREE.Texture | null {
+    return this.entries.get(kind)?.texture ?? null
+  }
+
+  /** Every kind currently baked, in insertion order. */
+  kinds(): EnvironmentKind[] {
+    return [...this.entries.keys()]
+  }
+
+  /** Free one baked room; returns whether there was one. */
+  release(kind: EnvironmentKind): boolean {
+    const target = this.entries.get(kind)
+    if (!target) return false
+    this.entries.delete(kind)
+    // The render target owns the framebuffer and the texture: disposing the target releases both,
+    // where disposing the texture alone would leak the framebuffer.
+    target.texture.dispose()
+    target.dispose()
+    return true
+  }
+
+  /** Free every room no stage/finish combination in `keep` can select any more. */
+  prune(keep: ReadonlySet<EnvironmentKind>): EnvironmentKind[] {
+    const dropped = this.kinds().filter(kind => !keep.has(kind))
+    for (const kind of dropped) this.release(kind)
+    return dropped
+  }
+
+  /** Free every baked room. */
+  releaseAll(): void {
+    for (const kind of this.kinds()) this.release(kind)
+  }
 }
 
 const sameCrop = (a: Crop, b: Crop): boolean => a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
@@ -166,6 +266,18 @@ function pathMapped(ctx: CanvasRenderingContext2D, polygons: readonly TracedPoly
 const WHITE = new THREE.Color(0xffffff)
 
 export type ViewName = 'angle' | 'front' | 'side' | 'top'
+
+/**
+ * The room a stage and finish shoot in, or `null` when the combination wants no environment at
+ * all. The room follows the stage and finish, so a combination that comes round again asks for the
+ * same room and reuses its baked map instead of baking another.
+ *
+ * The Color finish on the floor is lit by the four lights alone, as the reference look-dev rig
+ * lights it: its own roughness map carries the surface and never sees a room reflection.
+ */
+export function environmentFor(stage: StudioStage, finish: Finish): EnvironmentKind | null {
+  return ENVIRONMENTS[stage][finish]
+}
 
 export interface ModelDimensions {
   widthMm: number
@@ -229,10 +341,15 @@ export class GlassStudio {
   private hemi: THREE.HemisphereLight
   private fill: THREE.DirectionalLight
   /** Which rig is up: `null` until the first `apply`. */
-  private stage: 'wall' | 'floor' | null = null
-  private envStudio: THREE.Texture
-  private envRoom: THREE.Texture | null = null
-  private envLiquid: THREE.Texture | null = null
+  private stage: StudioStage | null = null
+  /**
+   * The rooms baked so far, shared by every stage/finish combination that asks for one. A room
+   * is baked at most once and reused when its combination comes round again; all of them are
+   * released when the studio is disposed.
+   */
+  private environments: EnvironmentCache
+  /** The room `scene.environment` currently points at, so a no-op switch touches no map. */
+  private envKind: EnvironmentKind | null = null
   private backdrop: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>
   private backdropUniforms: BackdropUniforms
   private shadowPlane: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>
@@ -345,8 +462,13 @@ export class GlassStudio {
     this.controls.maxDistance = 4000
 
     this.pmrem = new THREE.PMREMGenerator(this.renderer)
-    this.envStudio = bakeEnvironment(this.pmrem, createStudioEnvironment(), 0.02)
-    this.scene.environment = this.envStudio
+    this.environments = new EnvironmentCache((kind) => {
+      if (kind === 'room') return bakeEnvironmentTarget(this.pmrem, new RoomEnvironment(), 0.04)
+      if (kind === 'liquid') return bakeEnvironmentTarget(this.pmrem, createLiquidEnvironment(), 0.035)
+      return bakeEnvironmentTarget(this.pmrem, createStudioEnvironment(), 0.02)
+    })
+    this.scene.environment = this.environments.acquire('studio')
+    this.envKind = 'studio'
     this.renderer.transmissionResolutionScale = 1
     this.scene.background = new THREE.Color(this.params.background)
 
@@ -443,6 +565,7 @@ export class GlassStudio {
    * canvas keeps its size and nothing reallocates mid-drag. Exports ignore it.
    */
   setFocus(shift: number, scale: number): void {
+    if (this.disposed) return
     if (shift === this.focus.shift && scale === this.focus.scale) return
     this.focus = { shift, scale }
     // The phone sheet moves the focus every frame of a drag: the same cheaper refraction as an
@@ -468,6 +591,7 @@ export class GlassStudio {
    *   (sidebar collapsing) would otherwise show a blank frame until the next tick of the loop.
    */
   resize(paint = false): void {
+    if (this.disposed) return
     const w = this.canvas.clientWidth || 1
     const h = this.canvas.clientHeight || 1
     this.renderer.setSize(w, h, false)
@@ -760,6 +884,7 @@ export class GlassStudio {
 
   /** Push the eased parameters into materials, camera and scene. */
   private apply() {
+    if (this.disposed) return
     this.invalidate()
     const p = this.params
     const prevFinish = this.mesh?.material === this.metal ? 'metal' : this.mesh?.material === this.print ? 'print' : this.drawnFinish
@@ -864,7 +989,8 @@ export class GlassStudio {
    * lights alone and shows no room reflections on its rims. Glass and metal cannot do without
    * reflections, so they keep a neutral room while on the floor.
    */
-  private setStage(stage: 'wall' | 'floor') {
+  private setStage(stage: StudioStage) {
+    if (this.disposed) return
     if (this.stage === stage) { this.applyEnvironment(); return }
     this.stage = stage
     const product = stage === 'floor'
@@ -892,16 +1018,31 @@ export class GlassStudio {
     this.fill.position.copy(GlassStudio.RIGS.floor.fillDir).applyAxisAngle(GlassStudio.UP, a)
   }
 
-  private applyEnvironment() {
-    const product = this.stage === 'floor'
-    // The Color finish is lit by the four lights alone, as the reference look-dev rig lights
-    // it: its own roughness map carries the surface and never sees a room reflection.
-    const bare = product && this.params.finish === 'print'
-    if (product && !bare && !this.envRoom) this.envRoom = bakeEnvironment(this.pmrem, new RoomEnvironment(), 0.04)
-    const liquid = !product && this.params.finish === 'liquid'
-    if (liquid && !this.envLiquid) this.envLiquid = bakeEnvironment(this.pmrem, createLiquidEnvironment(), 0.035)
-    const env = bare ? null : product ? this.envRoom : liquid ? this.envLiquid : this.envStudio
-    if (this.scene.environment !== env) this.scene.environment = env
+  /**
+   * Point `scene.environment` at the room the current stage and finish shoot in, baking it the
+   * first time that combination comes round and reusing the baked map afterwards.
+   *
+   * The assignment happens before the cache is touched again, so the first frame after a switch
+   * already draws with the new room and never with the previous one. The Color finish on the floor
+   * points the scene at no map at all, as it is lit by the lights alone.
+   *
+   * A room some stage/finish combination can still select stays baked, so a combination that comes
+   * round again reuses it instead of baking another. Every room in `ENVIRONMENTS` is selectable for
+   * as long as the studio lives, so the live set is the three rooms the table defines; a room the
+   * table could no longer produce would be released here, and `dispose` frees all of them. A
+   * destroyed studio bakes nothing, hands out no map and leaves the scene alone.
+   */
+  private applyEnvironment(): void {
+    if (this.disposed) return
+    const kind = environmentFor(this.stage ?? 'wall', this.params.finish)
+    if (kind !== this.envKind) {
+      // Assign before anything can free the previous map: the next frame must already reflect the
+      // new combination, and the map it points at must still be alive.
+      const env = kind ? this.environments.acquire(kind) : null
+      this.scene.environment = env
+      this.environments.prune(STUDIO_ENVIRONMENTS)
+      this.envKind = kind
+    }
     this.applyEnvironmentLight()
   }
 
@@ -950,6 +1091,7 @@ export class GlassStudio {
    *   resolution (capped) so print detail is not limited by the trace raster.
    */
   setTrace(trace: TraceResult | null, source: HTMLImageElement | null = null): void {
+    if (this.disposed) return
     this.invalidate()
     const first = !this.mesh
     this.trace = trace
@@ -966,6 +1108,7 @@ export class GlassStudio {
 
   /** Height grid for the Relief geometry; `null` drops back to the extruded silhouette. */
   setRelief(relief: ReliefData | null): void {
+    if (this.disposed) return
     this.invalidate()
     const hadMesh = !!this.mesh
     const cropChanged = !!relief && !!this.relief && !sameCrop(relief.crop, this.relief.crop)
@@ -1077,22 +1220,25 @@ export class GlassStudio {
   }
 
   setParams(next: Partial<GlassParams>): void {
+    if (this.disposed) return
     Object.assign(this.target, next)
   }
 
   /**
    * Set parameters without easing. With `applyNow` false the values only land on the state,
    * for the caller that is about to trigger a rebuild anyway (a new trace) and does not want
-   * a second one from the easing loop.
+   * a second one from the easing loop. Either way the scene's environment follows the new
+   * finish at once, so the frame drawn after this call never reflects the old material.
    */
   snapParams(next: Partial<GlassParams>, applyNow = true): void {
+    if (this.disposed) return
     this.invalidate()
     Object.assign(this.target, next)
     Object.assign(this.params, next)
     // A rebuild replaces the geometry, never the finish: the materials take the values now
     // either way, or a preset's roughness would wait for the next eased change.
     if (applyNow) this.apply()
-    else this.applyMaterials()
+    else { this.applyMaterials(); this.applyEnvironment() }
   }
 
   /** Build the Print finish texture from the source image, once per trace. */
@@ -1260,6 +1406,7 @@ export class GlassStudio {
 
   /** Named camera angles; `frame()` re-fits the distance. `instant` cuts instead of gliding. */
   setView(view: ViewName, instant = false): void {
+    if (this.disposed) return
     this.view = view
     this.frame(true, instant)
   }
@@ -1269,6 +1416,7 @@ export class GlassStudio {
    * a transform on the shown mesh only, so exports keep the upright geometry.
    */
   setPose(pose: SamplePose | null): void {
+    if (this.disposed) return
     const spin = pose ? THREE.MathUtils.degToRad(pose.spinDeg) : 0
     this.pose = pose ? { spin, dir: new THREE.Vector3(...pose.view).normalize() } : null
     if (this.mesh) this.mesh.rotation.z = spin
@@ -1301,6 +1449,7 @@ export class GlassStudio {
    * camera at once instead of gliding: a keyboard command answers without animating.
    */
   frame(named = false, instant = false): void {
+    if (this.disposed) return
     this.invalidate()
     const box = this.modelBox()
     if (!box) return
@@ -1431,9 +1580,9 @@ export class GlassStudio {
     this.relief = null
     this.printTex?.dispose()
     this.dropSurface()
-    this.envRoom?.dispose()
-    this.envLiquid?.dispose()
-    this.envStudio.dispose()
+    // Release so the scene stops pointing at a freed map, then free every baked room.
+    this.scene.environment = null
+    this.environments.releaseAll()
     this.print.dispose()
     this.floor.geometry.dispose()
     this.floor.material.dispose()
