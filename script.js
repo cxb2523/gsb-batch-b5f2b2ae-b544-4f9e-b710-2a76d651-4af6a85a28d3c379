@@ -1,11 +1,11 @@
 // players
 let players = {
-    fred: { powerup: { toClear: [] }, score: 0, ready: false },
-    greenlee: { powerup: { toClear: [] }, score: 0, ready: false },
-    pinkney: { powerup: { toClear: [] }, score: 0, ready: false },
-    bluebell: { powerup: { toClear: [] }, score: 0, ready: false },
-    willem: { powerup: { toClear: [] }, score: 0, ready: false },
-    greydon: { powerup: { toClear: [] }, score: 0, ready: false },
+    fred: { powerup: {}, score: 0, ready: false },
+    greenlee: { powerup: {}, score: 0, ready: false },
+    pinkney: { powerup: {}, score: 0, ready: false },
+    bluebell: { powerup: {}, score: 0, ready: false },
+    willem: { powerup: {}, score: 0, ready: false },
+    greydon: { powerup: {}, score: 0, ready: false },
 }
 
 let achtung = {
@@ -15,7 +15,7 @@ let achtung = {
     gameEnded: true, // are noone alive?
     winner: false, // do we have a winner?
     sides: 0, // can all players go out of screen and come out the other side
-    clearSides: 0, // to clear timeone if leftover time from last round
+    timers: [], // pending game-time timers: { expiresAt (in tFrame frames), fn }
     playing: [], // who's playing
     powerups: [
         "g_slow",
@@ -102,15 +102,10 @@ function newSize() {
 
 function init() {
     achtung.powerupsOnScreen = [] // clear powerups on screen
-    clearTimeout(achtung.clearSides) // clear timeout if sides powerup leftover time from last round
+    achtung.timers = [] // drop all pending powerup timers: leftover effects from last round expire instantly and never touch the new round
     achtung.sides = 0 // reset sides
 
     for (const player in players) {
-        // clear timeout if powerup leftover time from last round
-        for (let i = 0; i < players[player].powerup.toClear.length; i++) {
-            clearTimeout(players[player].powerup.toClear[i])
-        }
-
         // reset players object to default values before starting a new round
         players[player].x = 0
         players[player].y = 0
@@ -130,7 +125,6 @@ function init() {
         players[player].powerup.invisible = 0
         players[player].powerup.side = 0
         players[player].powerup.powerupArray = []
-        players[player].powerup.toClear = [] // to clear timeout at the end of rounds if leftover time
     }
 
     // clear everything
@@ -314,6 +308,15 @@ function draw(timestamp) {
 // dt is in 60fps frames: 1 at 60Hz, ~0.5 at 120Hz
 function tick(dt) {
     tFrame += dt
+
+    // run due game-time timers (powerup expirations etc.). They only advance
+    // while the loop runs, so pausing freezes remaining effect time.
+    for (let i = achtung.timers.length - 1; i >= 0; i--) {
+        if (achtung.timers[i].expiresAt <= tFrame) {
+            const timer = achtung.timers.splice(i, 1)[0]
+            timer.fn()
+        }
+    }
 
     // clear
     ctxTH.clearRect(h, 0, w - h, h)
@@ -661,10 +664,16 @@ const drawGameUI = () => {
     ctxUI.fillText("ESCAPE to quit", UIcenter, +h - w100th * 3)
 }
 
+// schedules fn to run after `frames` of game time (60fps frames). Driven by
+// tFrame in tick(), so timers freeze while paused and are dropped by init().
+function scheduleGameTimer(frames, fn) {
+    achtung.timers.push({ expiresAt: tFrame + frames, fn })
+}
+
 // executes powerups
 function doPowerups(puPlayer, index) {
-    let gTimeout = 8000
-    let rTimeout = 5000
+    const gFrames = 480 // 8000ms at 60fps
+    const rFrames = 300 // 5000ms at 60fps
     let powName = players[puPlayer].powerup.powerupArray[index]
 
     // powerup starts
@@ -673,33 +682,33 @@ function doPowerups(puPlayer, index) {
     }
     if (powName == "g_slow") {
         players[puPlayer].powerup.speed *= 0.5
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => (players[puPlayer].powerup.speed *= 2), gTimeout)
+        scheduleGameTimer(gFrames, () => (players[puPlayer].powerup.speed *= 2))
     }
     if (powName == "g_fast") {
         players[puPlayer].powerup.speed *= 2
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => (players[puPlayer].powerup.speed *= 0.5), gTimeout)
+        scheduleGameTimer(gFrames, () => (players[puPlayer].powerup.speed *= 0.5))
     }
     if (powName == "g_thin") {
         players[puPlayer].powerup.size *= 0.5
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => (players[puPlayer].powerup.size *= 2), gTimeout)
+        scheduleGameTimer(gFrames, () => (players[puPlayer].powerup.size *= 2))
     }
     if (powName == "g_robot") {
         players[puPlayer].powerup.robot++
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => players[puPlayer].powerup.robot--, gTimeout)
+        scheduleGameTimer(gFrames, () => players[puPlayer].powerup.robot--)
     }
     if (powName == "g_side") {
         players[puPlayer].powerup.side++
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => players[puPlayer].powerup.side--, gTimeout)
+        scheduleGameTimer(gFrames, () => players[puPlayer].powerup.side--)
     }
     if (powName == "g_invisible") {
         players[puPlayer].powerup.invisible++
-        players[puPlayer].powerup.toClear[index] = setTimeout(() => players[puPlayer].powerup.invisible--, gTimeout)
+        scheduleGameTimer(gFrames, () => players[puPlayer].powerup.invisible--)
     }
     if (powName == "r_slow") {
         for (const otherPlayers in players) {
             if (otherPlayers != puPlayer) {
                 players[otherPlayers].powerup.speed *= 0.5
-                players[otherPlayers].powerup.toClear[index] = setTimeout(() => (players[otherPlayers].powerup.speed *= 2), rTimeout)
+                scheduleGameTimer(rFrames, () => (players[otherPlayers].powerup.speed *= 2))
             }
         }
     }
@@ -707,7 +716,7 @@ function doPowerups(puPlayer, index) {
         for (const otherPlayers in players) {
             if (otherPlayers != puPlayer) {
                 players[otherPlayers].powerup.speed *= 2
-                players[otherPlayers].powerup.toClear[index] = setTimeout(() => (players[otherPlayers].powerup.speed *= 0.5), rTimeout)
+                scheduleGameTimer(rFrames, () => (players[otherPlayers].powerup.speed *= 0.5))
             }
         }
     }
@@ -715,7 +724,7 @@ function doPowerups(puPlayer, index) {
         for (const otherPlayers in players) {
             if (otherPlayers != puPlayer) {
                 players[otherPlayers].powerup.size *= 2
-                players[otherPlayers].powerup.toClear[index] = setTimeout(() => (players[otherPlayers].powerup.size *= 0.5), rTimeout)
+                scheduleGameTimer(rFrames, () => (players[otherPlayers].powerup.size *= 0.5))
             }
         }
     }
@@ -723,7 +732,7 @@ function doPowerups(puPlayer, index) {
         for (const otherPlayers in players) {
             if (otherPlayers != puPlayer) {
                 players[otherPlayers].powerup.robot++
-                players[otherPlayers].powerup.toClear[index] = setTimeout(() => players[otherPlayers].powerup.robot--, rTimeout)
+                scheduleGameTimer(rFrames, () => players[otherPlayers].powerup.robot--)
             }
         }
     }
@@ -731,7 +740,7 @@ function doPowerups(puPlayer, index) {
         for (const otherPlayers in players) {
             if (otherPlayers != puPlayer) {
                 players[otherPlayers].powerup.reverse++
-                players[otherPlayers].powerup.toClear[index] = setTimeout(() => players[otherPlayers].powerup.reverse--, rTimeout)
+                scheduleGameTimer(rFrames, () => players[otherPlayers].powerup.reverse--)
             }
         }
     }
@@ -739,13 +748,13 @@ function doPowerups(puPlayer, index) {
         ctxTH.clearRect(0, 0, h, h)
     }
     if (powName == "b_more") {
-        setTimeout(powerupSpawner, 100)
-        setTimeout(powerupSpawner, 200)
-        setTimeout(powerupSpawner, 300)
+        scheduleGameTimer(6, powerupSpawner) // ~100ms at 60fps
+        scheduleGameTimer(12, powerupSpawner) // ~200ms
+        scheduleGameTimer(18, powerupSpawner) // ~300ms
     }
     if (powName == "b_sides") {
         achtung.sides++
-        achtung.clearSides = setTimeout(() => achtung.sides--, gTimeout)
+        scheduleGameTimer(gFrames, () => achtung.sides--)
     }
 }
 
