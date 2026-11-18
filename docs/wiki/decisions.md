@@ -64,6 +64,19 @@ Principio operativo:
 - `plannedTransition` unica condivisa da scoring, UI e player;
 - test set reale per verificare miglioramenti.
 
+## Piano Di Transizione Per-Coppia, Non Globale
+
+Decisione: la `plannedTransition` vale solo per la coppia (uscente → entrante)
+per cui è stata calcolata. È timbrata con `fromTrackId`/`toTrackId` e il player
+la ignora se il target non combacia, consumandola dopo l'avvio del deck entrante.
+Inoltre auto e takeover manuale condividono una sola `transitionSession`, con
+finalize idempotente e annullamento che ripristina gain/EQ e stato manuale.
+
+Motivo: un piano "globale" resta appeso alla coppia precedente e applica entry/
+durata/curva sbagliati; un timer automatico sopravvissuto al takeover può chiudere
+la transizione una seconda volta sul deck sbagliato. Entrambi sono bug di stato,
+non di musica, quindi si risolvono con un lifecycle esplicito e testabile.
+
 ## Platter/Scratch
 
 Decisione: implementare uno scratch browser base.

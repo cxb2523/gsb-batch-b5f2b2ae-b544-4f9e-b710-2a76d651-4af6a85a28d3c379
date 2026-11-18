@@ -58,6 +58,11 @@ export class AutoDjPlayer {
     // for the upcoming pair, the player follows its entry/mix/duration/curve/EQ;
     // otherwise it falls back to its own per-track heuristics.
     this.plannedTransition = null;
+    // One live transition at a time. Both the automatic and the manual paths
+    // create a session so finalize/cancel happen exactly once and the two paths
+    // cannot leave the decks in a half-transition state.
+    this.transitionSession = null;
+    this.transitionSerial = 0;
   }
 
   async start(firstTrack, getNextTrack, crossfadeSeconds) {
@@ -78,6 +83,13 @@ export class AutoDjPlayer {
 
   stop() {
     this.stopMonitor();
+    // Kill whatever transition lifecycle is live, including a manual takeover
+    // and its armed auto-finish timer, so nothing can finalize after stop().
+    if (this.transitionSession) {
+      this.abortTransition(this.transitionSession);
+    } else {
+      this.clearTransitionTimer(null);
+    }
     if (this.transitionTimer) {
       window.clearTimeout(this.transitionTimer);
       this.transitionTimer = null;
@@ -86,7 +98,9 @@ export class AutoDjPlayer {
     this.manualTransition = false;
     this.manualLoading = false;
     this.manualNext = null;
+    this.manualOrigin = 0;
     this.faderRaw = null;
+    this.plannedTransition = null;
     for (const deck of this.decks) {
       this.clearGlide(deck);
       deck.audio.pause();
@@ -241,6 +255,12 @@ export class AutoDjPlayer {
   handleDeckError(deck) {
     const code = deck.audio.error?.code;
     this.log(`Errore deck ${deck.name}${code ? ` (media code ${code})` : ""}.`);
+    // A deck that dies mid-transition (outgoing or incoming) kills the whole
+    // lifecycle: abort it instead of leaving a timer/glide to fire later.
+    const session = this.transitionSession;
+    if (session && (deck === this.decks[session.fromIndex] || deck === this.decks[session.toIndex])) {
+      this.abortTransition(session);
+    }
     if (deck === this.decks[this.activeDeckIndex]) {
       this.isTransitioning = false;
       this.handleDeckEnded(deck);
@@ -303,14 +323,22 @@ export class AutoDjPlayer {
       const conservativeCueOut = duration
         ? Math.min(duration, Math.max(cueOut, cueIn + (duration - cueIn) * MIN_AUTO_PLAY_FRACTION))
         : cueOut;
-      // Crossfade length is capped to the vocal-free outro so we never fade over vocals.
-      const fade = this.transitionLength(this.currentTrack, null);
-      // currentTime advances in real seconds; convert the fade lead-in by playback rate.
-      const latest = Math.max(cueIn, conservativeCueOut - fade * deck.rate);
       // Where to begin the fade. Priority: shared plan mix point, then a user
       // mix point, then the outgoing track's last phrase boundary before `latest`.
       const nextPeek = this.getNextTrack?.(this.currentTrack, { peek: true });
-      const planMix = this.planFor(nextPeek)?.fromMixPoint;
+      // The plan only counts when it targets this exact next track; a leftover
+      // plan from a previous pair must not move the current mix point.
+      const plan = this.planFor(nextPeek);
+      // Crossfade length is capped to the vocal-free outro so we never fade over
+      // vocals. When (and only when) a plan matches the incoming track, its own
+      // duration drives the lead-in; otherwise the legacy per-track fade is used
+      // unchanged.
+      const fade = plan
+        ? this.transitionLength(this.currentTrack, nextPeek, plan)
+        : this.transitionLength(this.currentTrack, null);
+      // currentTime advances in real seconds; convert the fade lead-in by playback rate.
+      const latest = Math.max(cueIn, conservativeCueOut - fade * deck.rate);
+      const planMix = plan?.fromMixPoint;
       const mixPoint = Number.isFinite(planMix) ? planMix : analysis.mixPoint;
       const transitionAt = this.radioEditMode && this.isUsableMixPoint(analysis, mixPoint, latest, duration)
         ? Math.max(cueIn, mixPoint)
@@ -378,10 +406,9 @@ export class AutoDjPlayer {
   // Crossfade length, clamped so it fits inside both the outgoing vocal-free outro
   // and (when known) the incoming vocal-free intro. In auto mode the base length
   // adapts to the track; otherwise it is the user's fixed setting.
-  transitionLength(fromTrack, toTrack) {
+  transitionLength(fromTrack, toTrack, plan = toTrack ? this.planFor(toTrack) : null) {
     // A shared plan's duration (radio-edit crossfade, independent from the club
     // crossfade slider) wins when present and we have an incoming track to match.
-    const plan = toTrack ? this.planFor(toTrack) : null;
     let fade = Number.isFinite(plan?.durationSeconds)
       ? plan.durationSeconds
       : this.autoCrossfade
@@ -413,11 +440,10 @@ export class AutoDjPlayer {
   // Symmetric beatmatch: the two tracks meet at the geometric-mean tempo, each
   // bending half the (octave-folded) difference. Returns the outgoing deck's new
   // rate and the incoming deck's rate. Outside tolerance, neither is stretched.
-  matchRatesSymmetric(fromTrack, toTrack) {
+  matchRatesSymmetric(fromTrack, toTrack, plan = this.planFor(toTrack)) {
     const fromDeck = this.decks[this.activeDeckIndex];
     const noChange = { fromRate: fromDeck.rate, toRate: 1 };
     // The shared plan can explicitly disable beatmatch (e.g. far-apart BPMs).
-    const plan = this.planFor(toTrack);
     if (plan && plan.beatmatch === false) return noChange;
     if (!this.beatmatch) return noChange;
 
@@ -476,24 +502,42 @@ export class AutoDjPlayer {
     return aligned >= 0 ? aligned : startAt;
   }
 
-  // The shared plan, if it was assembled for this exact incoming track.
+  // The shared plan, if it was assembled for this exact incoming track. A plan
+  // left over from a previous pair must never drive the next mix, so a plan
+  // without a matching target identity is ignored (the caller then falls back
+  // to the per-track heuristics for entry/duration/curve/beatmatch).
   planFor(nextTrack) {
     const plan = this.plannedTransition;
-    if (!plan || !nextTrack?.analysis) return null;
+    if (!plan || plan.consumed || !nextTrack?.analysis) return null;
+    const targetId = planTargetId(plan);
+    if (targetId === null || !sameTrackId(targetId, nextTrack.id)) return null;
+    const sourceId = planSourceId(plan);
+    if (sourceId !== null && this.currentTrack?.id != null && !sameTrackId(sourceId, this.currentTrack.id)) {
+      return null;
+    }
     return plan;
+  }
+
+  // A plan is single-use: once its incoming track has actually started, drop it
+  // so the same decision cannot be applied twice (and mark it, in case the
+  // frontend still holds a reference and re-assigns it).
+  consumePlan(plan) {
+    if (!plan) return;
+    plan.consumed = true;
+    if (this.plannedTransition === plan) this.plannedTransition = null;
   }
 
   // Entry point for an incoming track: the manual override if the user set one,
   // then the shared plannedTransition entry, then the phrase-aligned auto start.
-  entryFor(nextTrack) {
+  entryFor(nextTrack, plan = this.planFor(nextTrack)) {
     const manual = nextTrack.analysis?.entryPoint;
-    const plan = this.planFor(nextTrack);
     if (this.radioEditMode && Number.isFinite(plan?.toEntryPoint)) return plan.toEntryPoint;
     if (this.radioEditMode && Number.isFinite(manual)) return manual;
     return this.phraseAlignedStart(this.currentTrack, nextTrack, nextTrack.analysis?.cueIn ?? 0);
   }
 
   async transitionNow() {
+    if (this.isTransitioning) return;
     const nextTrack = this.getNextTrack?.(this.currentTrack, { peek: true });
     if (!nextTrack) {
       if (this.noNextNoticeTrackId !== this.currentTrack?.id) {
@@ -504,38 +548,51 @@ export class AutoDjPlayer {
     }
 
     this.noNextNoticeTrackId = null;
-    this.isTransitioning = true;
-    this.manualNext = nextTrack; // remembered so a manual takeover can finalize
-
     const fromIndex = this.activeDeckIndex;
     const toIndex = fromIndex === 0 ? 1 : 0;
     const fromDeck = this.decks[fromIndex];
     const toDeck = this.decks[toIndex];
-    const duration = this.transitionLength(this.currentTrack, nextTrack);
+    // Resolve the plan once, before any await: the queue commit below re-renders
+    // the UI (which may replace plannedTransition), and a stale re-read must not
+    // silently drop the decision this transition was built on.
+    const plan = this.planFor(nextTrack);
+    const duration = this.transitionLength(this.currentTrack, nextTrack, plan);
     const now = this.context.currentTime;
+
+    const session = this.beginTransitionSession("auto", nextTrack, fromIndex, toIndex);
+    session.plan = plan;
+    session.fromGain = fromDeck.gain.gain.value;
 
     // Symmetric beatmatch: incoming starts at its meeting rate; outgoing bends
     // toward the same meeting tempo across its outro (the crossfade window).
     this.clearGlide(fromDeck);
     this.clearGlide(toDeck);
-    const { fromRate, toRate } = this.matchRatesSymmetric(this.currentTrack, nextTrack);
-    const startAt = this.entryFor(nextTrack);
+    const { fromRate, toRate } = this.matchRatesSymmetric(this.currentTrack, nextTrack, plan);
+    const startAt = this.entryFor(nextTrack, plan);
 
     try {
       await this.playOnDeck(toIndex, nextTrack, startAt, 0, toRate);
-      this.getNextTrack?.(this.currentTrack, { commitId: nextTrack.id });
     } catch (error) {
-      this.clearGlide(fromDeck);
-      this.clearGlide(toDeck);
-      toDeck.audio.pause();
-      toDeck.audio.src = "";
-      toDeck.rate = 1;
-      this.resetEq(toDeck, now);
-      toDeck.gain.gain.cancelScheduledValues(now);
-      toDeck.gain.gain.value = 0;
-      this.isTransitioning = false;
-      this.manualNext = null;
+      this.abortTransition(session);
       this.log(`Mix annullato: ${nextTrack.name} non parte (${error?.message ?? error})`);
+      return;
+    }
+
+    // stop() or another transition may have superseded this session while the
+    // incoming deck was loading.
+    if (!this.isCurrentSession(session)) return;
+    session.state = "running";
+
+    // The incoming track is actually playing: the plan has been applied, so it
+    // is consumed and can never drive a later pair.
+    this.consumePlan(plan);
+    this.getNextTrack?.(this.currentTrack, { commitId: nextTrack.id });
+
+    // A manual takeover during the load now owns the blend; the fader drives it
+    // and this path must not schedule a crossfade or an auto-finish timer. Apply
+    // the current fader position now that the incoming deck is actually playing.
+    if (session.kind !== "auto") {
+      this.applyManualBlend(session);
       return;
     }
 
@@ -546,7 +603,6 @@ export class AutoDjPlayer {
     // Selectable crossfader curve. The shared plan may override it (e.g. "cut"
     // when both tracks have vocals); otherwise use the user's setting. "power"
     // is the DJ default for avoiding the perceived centre dip.
-    const plan = this.planFor(nextTrack);
     const curve = ["power", "smooth", "cut"].includes(plan?.curve) ? plan.curve : this.crossfadeCurve;
     const fadeOut = new Float32Array(CURVE_POINTS);
     const fadeIn = new Float32Array(CURVE_POINTS);
@@ -598,29 +654,154 @@ export class AutoDjPlayer {
     const rateNote = toRate !== 1 ? ` | beatmatch ×${toRate.toFixed(3)}` : "";
     this.log(`Mix: ${this.currentTrack.name} -> ${nextTrack.name} (${duration.toFixed(1)}s${rateNote})`);
 
-    this.transitionTimer = window.setTimeout(() => {
+    this.armTransitionTimer(session, duration);
+  }
+
+  // Start a fresh transition lifecycle. Only one session exists at a time and it
+  // owns the auto-finish timer, the closing glide and the manual flags, so an
+  // automatic and a manual transition can never finalize/cancel each other's
+  // state.
+  beginTransitionSession(kind, nextTrack, fromIndex, toIndex) {
+    if (this.transitionSession) this.abortTransition(this.transitionSession);
+    const session = {
+      id: ++this.transitionSerial,
+      kind, // "auto" | "manual"
+      state: "loading", // loading | running | done | aborted
+      nextTrack,
+      fromIndex,
+      toIndex,
+      fromGain: this.decks[fromIndex]?.gain.gain.value ?? 1,
+      plan: null,
+      timer: null
+    };
+    this.transitionSession = session;
+    this.transitionTimer = null;
+    this.isTransitioning = true;
+    this.manualTransition = kind === "manual";
+    // The fader only owns the blend once a fresh manual load has landed.
+    this.manualLoading = kind === "manual";
+    this.manualNext = nextTrack;
+    return session;
+  }
+
+  isCurrentSession(session) {
+    return !!session && this.transitionSession === session && session.state !== "done" && session.state !== "aborted";
+  }
+
+  // Schedule the automatic finish. Kept on the session so a manual takeover or
+  // stop() can cancel exactly this timer and nothing else.
+  armTransitionTimer(session, seconds) {
+    this.clearTransitionTimer(session);
+    const timer = window.setTimeout(() => {
+      if (session.timer === timer) session.timer = null;
+      if (this.transitionTimer === timer) this.transitionTimer = null;
+      if (this.transitionSession !== session || session.state !== "running") return;
+      if (session.kind !== "auto") return;
+      this.finalizeTransition(session);
+    }, Math.max(0, seconds) * 1000);
+    session.timer = timer;
+    this.transitionTimer = timer;
+  }
+
+  clearTransitionTimer(session = this.transitionSession) {
+    if (session?.timer != null) {
+      window.clearTimeout(session.timer);
+      if (this.transitionTimer === session.timer) this.transitionTimer = null;
+      session.timer = null;
+      return;
+    }
+    if (this.transitionTimer != null && !session) {
+      window.clearTimeout(this.transitionTimer);
       this.transitionTimer = null;
-      this.finalizeTransition(fromIndex, toIndex, nextTrack);
-    }, duration * 1000);
+    }
+  }
+
+  // Cancel only what the automatic path owns (finish timer + outgoing tempo
+  // glide) when a human takes over; the blend itself keeps running.
+  cancelAutoFinish(session) {
+    this.clearTransitionTimer(session);
+    if (session) this.clearGlide(this.decks[session.fromIndex]);
+  }
+
+  // Freeze the deck gains at their current value and drop any pending fade
+  // automation so the manual fader owns the blend from here on. EQ ramps are
+  // deliberately left running: they self-resolve back to 0 and freezing them
+  // mid-swap (e.g. a −26 dB bass cut) would leave the deck sounding broken.
+  cancelScheduledGains(session) {
+    const now = this.context?.currentTime ?? 0;
+    for (const index of [session.fromIndex, session.toIndex]) {
+      const deck = this.decks[index];
+      if (!deck) continue;
+      holdGainAtCurrentValue(deck.gain.gain, now);
+    }
+  }
+
+  // Abort a transition that never landed (incoming failed to start, stop, or a
+  // superseding session). Restores both decks and every manual flag so no
+  // half-transition is left behind.
+  abortTransition(session) {
+    if (!session) return;
+    session.state = "aborted";
+    if (this.transitionSession === session) this.transitionSession = null;
+    this.clearTransitionTimer(session);
+
+    const now = this.context?.currentTime ?? 0;
+    const fromDeck = this.decks[session.fromIndex];
+    const toDeck = this.decks[session.toIndex];
+    if (fromDeck) {
+      this.clearGlide(fromDeck);
+      fromDeck.gain.gain.cancelScheduledValues(now);
+      fromDeck.gain.gain.value = session.fromGain;
+      this.resetEq(fromDeck, now);
+    }
+    if (toDeck) {
+      this.clearGlide(toDeck);
+      toDeck.audio.pause();
+      toDeck.audio.src = "";
+      toDeck.audio.playbackRate = 1;
+      toDeck.rate = 1;
+      this.resetEq(toDeck, now);
+      toDeck.gain.gain.cancelScheduledValues(now);
+      toDeck.gain.gain.value = 0;
+    }
+    this.isTransitioning = false;
+    this.manualTransition = false;
+    this.manualLoading = false;
+    this.manualNext = null;
+    this.manualOrigin = 0;
   }
 
   // Swap decks once a transition (auto or manual) reaches the incoming track.
-  finalizeTransition(fromIndex, toIndex, nextTrack) {
+  // Idempotent per session: finalize can only run once.
+  finalizeTransition(session) {
+    if (!session || session.state !== "running" || this.transitionSession !== session) return;
+    session.state = "done";
+    this.clearTransitionTimer(session);
+    this.transitionSession = null;
+
+    const { fromIndex, toIndex, nextTrack } = session;
     const fromDeck = this.decks[fromIndex];
     const toDeck = this.decks[toIndex];
+    const now = this.context?.currentTime ?? 0;
     this.clearGlide(fromDeck);
+    this.clearGlide(toDeck);
     fromDeck.audio.pause();
     fromDeck.audio.currentTime = 0;
     fromDeck.audio.playbackRate = 1;
     fromDeck.rate = 1;
-    this.resetEq(fromDeck, this.context.currentTime);
-    toDeck.gain.gain.cancelScheduledValues(this.context.currentTime);
+    this.resetEq(fromDeck, now);
+    fromDeck.gain.gain.cancelScheduledValues(now);
+    fromDeck.gain.gain.value = 0;
+    toDeck.gain.gain.cancelScheduledValues(now);
     toDeck.gain.gain.value = 1;
+    this.resetEq(toDeck, now);
     this.activeDeckIndex = toIndex;
     this.currentTrack = nextTrack;
     this.isTransitioning = false;
     this.manualTransition = false;
     this.manualLoading = false;
+    this.manualNext = null;
+    this.manualOrigin = 0;
     this.onNowPlaying?.(nextTrack);
     // Body of the track plays native: ease the new deck from its meeting rate
     // back to 1.0 over the resync window.
@@ -646,16 +827,22 @@ export class AutoDjPlayer {
 
     const fromIndex = this.activeDeckIndex;
     const toIndex = fromIndex === 0 ? 1 : 0;
+    const session = this.transitionSession;
 
-    // Take over an automatic transition that is already running.
-    if (this.isTransitioning && !this.manualTransition) {
-      if (this.transitionTimer) {
-        window.clearTimeout(this.transitionTimer);
-        this.transitionTimer = null;
-      }
-      this.clearGlide(this.decks[fromIndex]);
+    // Take over an automatic transition that is already running (or still
+    // loading): kill its finish timer and the outgoing rate glide so it can no
+    // longer fire a second finalize behind our back.
+    if (session && session.kind === "auto" && (session.state === "running" || session.state === "loading")) {
+      this.cancelAutoFinish(session);
+      session.kind = "manual";
       this.manualTransition = true;
       this.manualOrigin = pos - moved;
+      // A finish timer may have been armed a second time by the async auto path
+      // just before this message; cancel by the session, not the raw field.
+      this.clearTransitionTimer(session);
+      // Drop the scheduled crossfade curves so the fader takes over immediately
+      // instead of fighting the automation for the rest of the window.
+      this.cancelScheduledGains(session);
     }
 
     // Or start a fresh manual transition into the next track.
@@ -667,14 +854,25 @@ export class AutoDjPlayer {
       return;
     }
 
-    if (!this.manualTransition) return;
+    // Incoming still loading: the load-completion hook applies the blend with
+    // the fader's last position.
+    if (!this.manualTransition || !this.isCurrentSession(session) || session.state !== "running") return;
+
+    this.applyManualBlend(session);
+  }
+
+  // Apply the hand-ridden crossfade to the two decks of `session`. Reused by the
+  // fader events and by the load-completion hook, so a takeover that happened
+  // while the deck was loading still lands on the current fader position.
+  applyManualBlend(session) {
+    if (!session || session.state !== "running" || this.faderRaw === null) return;
 
     // Blend = how far the fader has travelled from where the mix started.
     const span = Math.max(0.05, this.manualOrigin, 1 - this.manualOrigin);
-    const blend = clamp(Math.abs(pos - this.manualOrigin) / span, 0, 1);
+    const blend = clamp(Math.abs(this.faderRaw - this.manualOrigin) / span, 0, 1);
 
-    const fromDeck = this.decks[fromIndex];
-    const toDeck = this.decks[toIndex];
+    const fromDeck = this.decks[session.fromIndex];
+    const toDeck = this.decks[session.toIndex];
     const now = this.context.currentTime;
     fromDeck.gain.gain.cancelScheduledValues(now);
     toDeck.gain.gain.cancelScheduledValues(now);
@@ -683,37 +881,37 @@ export class AutoDjPlayer {
     toDeck.gain.gain.value = inGain;
 
     if (blend >= 0.98) {
-      this.finalizeTransition(fromIndex, toIndex, this.manualNext);
-      this.manualNext = null;
+      this.finalizeTransition(session);
     }
   }
 
   async beginManualTransition(nextTrack, toIndex) {
+    const fromIndex = this.activeDeckIndex;
+    const plan = this.planFor(nextTrack);
+    const session = this.beginTransitionSession("manual", nextTrack, fromIndex, toIndex);
+    session.plan = plan;
+    session.fromGain = this.decks[fromIndex].gain.gain.value;
     this.manualLoading = true;
-    this.isTransitioning = true;
-    this.manualNext = nextTrack;
-    const { toRate } = this.matchRatesSymmetric(this.currentTrack, nextTrack);
-    const startAt = this.entryFor(nextTrack);
+    const { toRate } = this.matchRatesSymmetric(this.currentTrack, nextTrack, plan);
+    const startAt = this.entryFor(nextTrack, plan);
     try {
       await this.playOnDeck(toIndex, nextTrack, startAt, 0, toRate);
-      this.getNextTrack?.(this.currentTrack, { commitId: nextTrack.id });
-      this.manualTransition = true;
-      this.log(`Mix manuale: ${this.currentTrack.name} -> ${nextTrack.name}`);
     } catch (error) {
-      const deck = this.decks[toIndex];
-      const now = this.context.currentTime;
-      deck.audio.pause();
-      deck.audio.src = "";
-      deck.rate = 1;
-      this.resetEq(deck, now);
-      deck.gain.gain.cancelScheduledValues(now);
-      deck.gain.gain.value = 0;
-      this.isTransitioning = false;
-      this.manualNext = null;
+      this.abortTransition(session);
       this.log(`Mix manuale annullato: ${nextTrack.name} non parte (${error?.message ?? error})`);
-    } finally {
-      this.manualLoading = false;
+      return;
     }
+    if (!this.isCurrentSession(session)) return;
+
+    this.consumePlan(plan);
+    this.getNextTrack?.(this.currentTrack, { commitId: nextTrack.id });
+    session.state = "running";
+    this.manualTransition = true;
+    this.manualLoading = false;
+    this.log(`Mix manuale: ${this.currentTrack.name} -> ${nextTrack.name}`);
+    // The fader may already be past the origin (it triggered the mix): land the
+    // blend at its current position now that the deck is playing.
+    this.applyManualBlend(session);
   }
 
   // EQ knobs drive the active deck's bands live (−26..+6 dB, centre = 0).
@@ -805,6 +1003,52 @@ export class AutoDjPlayer {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+// Freeze an AudioParam at its currently-audible value and drop whatever was
+// scheduled. This keeps a running fade from snapping when a manual takeover /
+// abort interrupts it mid-curve.
+function holdGainAtCurrentValue(param, at) {
+  if (!param) return;
+  if (typeof param.cancelAndHoldAtTime === "function") {
+    param.cancelAndHoldAtTime(at);
+    return;
+  }
+  const held = typeof param.value === "number" ? param.value : 0;
+  param.cancelScheduledValues(at);
+  param.setValueAtTime(held, at);
+}
+
+// Identify which tracks a shared plan was assembled for. The frontend stamps
+// `toTrackId`/`fromTrackId`; the aliases keep externally-built plans usable
+// without silently matching the wrong track. Values may be ids or track-like
+// objects (their `.id` is used).
+function planTargetId(plan) {
+  for (const key of ["toTrackId", "targetTrackId", "nextTrackId", "toTrack", "targetTrack"]) {
+    const id = asTrackId(plan?.[key]);
+    if (id !== null) return id;
+  }
+  return null;
+}
+
+function planSourceId(plan) {
+  for (const key of ["fromTrackId", "sourceTrackId", "fromTrack", "sourceTrack"]) {
+    const id = asTrackId(plan?.[key]);
+    if (id !== null) return id;
+  }
+  return null;
+}
+
+function asTrackId(value) {
+  const raw = value && typeof value === "object" ? value.id : value;
+  if (raw == null) return null;
+  return typeof raw === "string" ? (raw.length ? raw : null) : raw;
+}
+
+function sameTrackId(a, b) {
+  const ida = asTrackId(a);
+  const idb = asTrackId(b);
+  return ida !== null && idb !== null && String(ida) === String(idb);
 }
 
 function smoothstep(value) {

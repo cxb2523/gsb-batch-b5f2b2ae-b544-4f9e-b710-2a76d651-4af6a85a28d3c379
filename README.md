@@ -64,6 +64,16 @@ Poi apri:
 http://localhost:5173
 ```
 
+Test locali del motore di mix (nessun browser, backend o Demucs richiesto):
+
+```bash
+npm test
+```
+
+I test coprono l'identità della `plannedTransition` (un piano vale solo per la
+coppia per cui è stato calcolato) e il ciclo di vita condiviso tra transizione
+automatica e takeover manuale, con un fake Web Audio in `test/`.
+
 ## Controllo MIDI (es. Hercules DJControl Inpulse 200)
 
 Il pannello **MIDI** usa la Web MIDI API (contesto sicuro: `localhost`/`127.0.0.1`).

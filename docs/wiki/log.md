@@ -4,6 +4,30 @@ Registro append-only in stile LLM Wiki (Karpathy). Una riga di intestazione per
 evento, prefisso coerente `## [AAAA-MM-GG] tipo | titolo`, così è filtrabile con
 strumenti unix. Non riscrivere le voci passate: si aggiunge in fondo.
 
+## [2026-11-19] fix | Piano di transizione per-coppia + lifecycle unico auto/manuale
+
+Bug: la `plannedTransition` restava appesa alla coppia precedente (entry/durata/
+curva/beatmatch sbagliati sulla coppia successiva) e un takeover manuale non
+disarmava il timer di fine automatico (rischio di secondo finalize e deck
+sbagliato). Vedi [[current-status]], [[analysis-mix-engine]].
+
+- `planTransition` (main.js) timbra `fromTrackId`/`toTrackId`; `player.planFor`
+  restituisce il piano solo se il target combacia con la prossima traccia (e, se
+  presente, la sorgente con quella in onda), altrimenti `null` → fallback ai
+  criteri per-brano invariati. Il piano senza identità è ignorato.
+- Piano monouso: `transitionNow`/`beginManualTransition` risolvono il piano una
+  volta e lo consumano (`consumed`) dopo che il deck entrante è partito, così
+  non può essere riapplicato.
+- Lifecycle unico (`transitionSession`): auto e manuale condividono la stessa
+  sessione con stato `loading/running/done/aborted`; `finalizeTransition` è
+  idempotente e solo la sessione corrente può chiudere. Il takeover manuale
+  cancella timer + glide + curve di gain programmate.
+- `abortTransition` ripristina gain/EQ dei due deck e azzera `isTransitioning`,
+  `manualTransition`, `manualNext`, `manualOrigin`; `stop()` aborta la sessione
+  e scarta anche il piano.
+- Test locali senza browser né backend: `npm test` (`node --test`, fake Web
+  Audio in `test/fake-web-audio.mjs`).
+
 ## [2026-06-06] sessione | Precisione intro/outro + voce Demucs
 
 Lavoro guidato da feedback reale dell'utente ("parte a metà / esce a 2/3 / cantato

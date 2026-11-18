@@ -77,12 +77,15 @@ Pipeline spiegabile implementata (analysis `version=2`, analyzer
   ordinati best-first; i campi singoli back-compat puntano al candidato migliore.
 - Metriche loudness/dinamica: `truePeak`, `lra`, `crest`.
 - `plannedTransition` assemblata nel frontend (`scoreTransition`/`planTransition`):
-  `fromMixPoint`, `toEntryPoint`, `durationBeats`, `durationSeconds`, `curve`
-  (power/smooth/cut), `beatmatch`, `eqStrategy`, `reasons`. La durata radio-edit è
-  indipendente dal crossfade club.
+  `fromTrackId`/`toTrackId`, `fromMixPoint`, `toEntryPoint`, `durationBeats`,
+  `durationSeconds`, `curve` (power/smooth/cut), `beatmatch`, `eqStrategy`,
+  `reasons`. La durata radio-edit è indipendente dal crossfade club.
 - Player consuma la `plannedTransition` (entry/mix, durata, curva, EQ, beatmatch)
-  con fallback al comportamento precedente; coda transazionale e gestione
-  ended/error invariate.
+  solo se `toTrackId` combacia con la prossima traccia (e `fromTrackId` con quella
+  in onda): un piano residuo di un'altra coppia viene ignorato e si ricade sui
+  criteri per-brano. Dopo l'avvio del deck entrante il piano è consumato
+  (`consumed`), quindi è monouso. Coda transazionale e gestione ended/error
+  invariate.
 - Pannello debug UI con candidati (punteggio+motivazioni) e motivazioni del piano.
 
 ### Precisione inizio/fine brano (priorità primaria)

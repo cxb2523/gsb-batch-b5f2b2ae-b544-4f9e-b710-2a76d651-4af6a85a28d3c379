@@ -41,6 +41,14 @@ vocal risk sempre attivo e `plannedTransition` condivisa tra scoring, UI e playe
   le transizioni fallite non rimuovono piu brani dalla playlist.
 - Il player gestisce `ended`/`error` sui deck e non lascia la UI in stato live
   quando non c'e piu audio.
+- La `plannedTransition` e legata alla coppia per cui e stata calcolata
+  (`fromTrackId`/`toTrackId`): il player la ignora se la prossima traccia cambia
+  e la consuma dopo l'avvio del deck entrante, quindi non resta appesa alla
+  coppia successiva.
+- Auto e takeover manuale condividono un'unica `transitionSession`: il manuale
+  disarma timer di fine + glide, il finalize e idempotente, e un mix annullato
+  ripristina gain/EQ e stato manuale senza lasciare mezze transizioni.
+- `npm test` esegue i test locali del player (fake Web Audio, nessun backend).
 
 ## Problemi noti
 

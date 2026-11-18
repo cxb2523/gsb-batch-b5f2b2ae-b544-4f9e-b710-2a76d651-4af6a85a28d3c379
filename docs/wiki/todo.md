@@ -80,3 +80,8 @@ Il sistema deve poter rispondere a tre domande per ogni transizione:
 - [x] Transizioni live transazionali: peek del prossimo brano e commit solo dopo
   `play()` riuscito.
 - [x] Fine brano/errori media non lasciano la UI in stato live incoerente.
+- [x] `plannedTransition` per-coppia: identità `fromTrackId`/`toTrackId`, piano
+  monouso, fallback invariato ai criteri per-brano quando non combacia.
+- [x] Lifecycle unico auto/manuale: il takeover disarma timer e glide, il
+  finalize è idempotente, un mix annullato ripristina gain/EQ e stato manuale.
+- [x] Test locali del player con fake Web Audio (`npm test`, nessun backend).

@@ -1,5 +1,5 @@
 import { analyzeTrack } from "./analyzer.js";
-import { AutoDjPlayer } from "./player.js?v=20260605-1";
+import { AutoDjPlayer } from "./player.js?v=20261119-1";
 import {
   saveTrackRecord,
   deleteTrackRecord,
@@ -1043,6 +1043,9 @@ function selectNextTrackId(currentTrack, options = {}) {
   if (!readyIds.length) return null;
 
   if (!elements.smartModeInput.checked || !currentTrack?.analysis) {
+    // No plan is assembled in this mode: never leave a previous pair's plan
+    // behind for the player to pick up.
+    player.plannedTransition = null;
     return readyIds[0];
   }
 
@@ -1052,12 +1055,12 @@ function selectNextTrackId(currentTrack, options = {}) {
     .sort((a, b) => b.score - a.score)[0]?.id ?? readyIds[0];
   // Build the shared plannedTransition for the chosen next track and hand it to
   // the player + debug panel. Recomputed each time the selection is evaluated.
+  // The plan carries the ids of the pair it was built for, so the player can
+  // discard it if the queue changes before the mix happens.
   const chosen = getTrack(scored);
-  if (chosen) {
-    const plan = planTransition(currentTrack, chosen);
-    player.plannedTransition = plan;
-    updateDebugPanel(currentTrack, chosen, plan);
-  }
+  const plan = chosen ? planTransition(currentTrack, chosen) : null;
+  player.plannedTransition = plan;
+  if (chosen) updateDebugPanel(currentTrack, chosen, plan);
   return scored;
 }
 
@@ -1217,6 +1220,11 @@ function planTransition(current, candidate) {
   const eqStrategy = bothVocal ? "bass-swap-mid-duck" : "bass-swap";
 
   return {
+    // Identity of the pair this plan was built for. The player refuses a plan
+    // that targets any other incoming track, so a leftover plan can never drive
+    // the following mix.
+    fromTrackId: current?.id ?? null,
+    toTrackId: candidate?.id ?? null,
     fromMixPoint: fromMix.t,
     toEntryPoint: toEntry.t,
     durationBeats,
