@@ -1,0 +1,56 @@
+{
+  "name": "mattermost-voice-messages-webapp",
+  "private": true,
+  "scripts": {
+    "build": "vite build && npm run build:frame",
+    "build:frame": "vite build --config vite.frame.config.mts && node scripts/write-transcription-frame-html.mjs",
+    "build:watch": "vite build --watch",
+    "lint": "biome check --write --assist-enabled=true . && tsc --noEmit && npm run react-doctor",
+    "biome:ci": "biome ci .",
+    "typecheck": "tsc --noEmit",
+    "react-doctor": "react-doctor -y --no-score --blocking warning .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@mattermost/types": "11.9.0",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "26.6.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "jsdom": "31.0.1",
+    "react": "19.3.1",
+    "react-doctor": "0.9.23",
+    "react-dom": "19.3.1",
+    "redux": "5.0.1",
+    "sass-embedded": "1.108.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vite-plugin-css-injected-by-js": "5.0.3",
+    "vitest": "5.1.0"
+  },
+  "dependencies": {
+    "browser-whisper": "2.0.0"
+  },
+  "overrides": {
+    "@mattermost/types": {
+      "typescript": "$typescript"
+    },
+    "@huggingface/transformers": {
+      "sharp": "0.35.5"
+    },
+    "onnxruntime-node": {
+      "global-agent": "4.1.7"
+    }
+  },
+  "allowScripts": {
+    "@parcel/watcher@2.6.0": true,
+    "fsevents@2.3.3": true,
+    "protobufjs@7.6.6": true,
+    "sharp@0.35.5": true,
+    "onnxruntime-node@1.30.0": false
+  }
+}
