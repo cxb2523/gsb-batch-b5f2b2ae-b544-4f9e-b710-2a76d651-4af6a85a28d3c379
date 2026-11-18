@@ -27,5 +27,6 @@
     "noPropertyAccessFromIndexSignature": true,
     "erasableSyntaxOnly": true,
     "noImplicitOverride": true
-  }
+  },
+  "include": ["src"]
 }

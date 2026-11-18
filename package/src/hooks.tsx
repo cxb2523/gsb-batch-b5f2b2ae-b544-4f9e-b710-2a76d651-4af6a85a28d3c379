@@ -1,6 +1,6 @@
 import { defaults, directiveRegex, idPrefix, spaceDelimiter, specialSymbol } from "@/constants";
 import { composeProps, createElementWithProps } from "@/lib/dom";
-import { addToQueue, clearQueue, clearQueueHook, clearQueueUnload, dequeue, emit, removeFromQueue, speakFromQueue, subscribe } from "@/lib/queue";
+import { addToQueue, clearQueue, clearQueueHook, clearQueueUnload, dequeue, isQueued, removeFromQueue, restartQueueHead, speakFromQueue, subscribe } from "@/lib/queue";
 import { findCharIndex, getIndex, indexText, isParent, isSetStateFunction, nodeToKey, nodeToWords, parent, stripDirectives, toText } from "@/lib/react";
 import { setState, state } from "@/lib/state";
 import { cancel, getProgress, isMobile, parse, sanitize, shouldHighlightNextPart, splitNode, textToChunks } from "@/lib/utils";
@@ -14,7 +14,6 @@ import type {
   SpeechSynthesisEventName,
   SpeechSynthesisUtteranceProps,
   SpeechUtterancesQueue,
-  State,
   UpdateMode,
   UseSpeakOptions,
   UseSpeechOptions,
@@ -111,6 +110,8 @@ export function useSpeechInternal({
   const [speakingWord, speakingWordRef, setSpeakingWord] = useStateRef<SpeakingWord>(null);
   const { utteranceRef, updateProps } = useSpeechSynthesisUtterance();
   const highlightRef = useRef(false);
+  const onQueueChangeRef = useRef(onQueueChange);
+  onQueueChangeRef.current = onQueueChange;
   const directiveRef = useRef<{ event: DirectiveEvent; delay: number; abortDelay?: VoidFunction }>({ event: null, delay: 0 });
 
   const uniqueId = useMemo(() => `${idPrefix}${id ?? crypto.randomUUID()}`, [id]);
@@ -212,6 +213,19 @@ export function useSpeechInternal({
     }
 
     async function stopEventHandler() {
+      if (!isQueued(utterance)) {
+        // The utterance was already removed from the queue synchronously (stop, unmount,
+        // clearQueue or beforeunload). Only local cleanup remains; never touch the queue.
+        if (state.stopReason === "auto") onBoundary?.({ progress: 100 });
+        window.removeEventListener("beforeunload", clearQueueUnload);
+        setSpeechStatus("stopped");
+        setSpeakingWord(null);
+        utterance.onstart = null;
+        utterance.onend = null;
+        utterance.onerror = null;
+        utterance.onboundary = null;
+        return;
+      }
       if (state.stopReason === "auto" && currentChunk < chunks.length - 1) {
         processedTextLength += currentText.length;
         currentText = chunks[++currentChunk] ?? "";
@@ -246,8 +260,7 @@ export function useSpeechInternal({
       utterance.onend = null;
       utterance.onerror = null;
       utterance.onboundary = null;
-      removeFromQueue(utterance, onQueueChange);
-      speakFromQueue();
+      removeFromQueue(utterance);
       onStop?.();
     }
 
@@ -269,7 +282,7 @@ export function useSpeechInternal({
     utterance.onboundary = boundaryEventHandler;
 
     if (!preserveUtteranceQueue) clearQueue();
-    addToQueue({ text: speechText, utterance, setSpeechStatus }, onQueueChange);
+    addToQueue({ text: speechText, utterance, setSpeechStatus });
     setSpeechStatus("started");
     if (!synth.speaking) return speakFromQueue();
     if (preserveUtteranceQueue && speechStatus !== "started") return setSpeechStatus("queued");
@@ -285,17 +298,17 @@ export function useSpeechInternal({
     }
   }
 
-  function stop({ status = speechStatusRef.current, stopReason }: { status?: SpeechStatus; stopReason?: State["stopReason"] } = {}) {
+  function stop() {
+    const status = speechStatusRef.current;
     if (status === "stopped") return;
-    if (status === "queued") {
-      removeFromQueue(utteranceRef.current!, onQueueChange);
-      return setSpeechStatus("stopped");
-    }
-    if (directiveRef.current.delay || directiveRef.current.event === "pause") {
-      reset();
-      speakFromQueue();
-    }
-    cancel(stopReason);
+    // Abort any pending directive-delay transition so it cannot speak a stale
+    // utterance after the entry is gone.
+    reset();
+    // Synchronously remove the entry (if present) and reset its status to "stopped",
+    // so the queue snapshot and speechStatus stay consistent even if the browser
+    // never fires onend/onerror (e.g. component unmount, beforeunload, mocks).
+    const removedIndex = removeFromQueue(utteranceRef.current!);
+    if (removedIndex === -1) setSpeechStatus("stopped");
   }
 
   function highlightedText(node: ReactNode, index = ""): ReactNode {
@@ -316,8 +329,21 @@ export function useSpeechInternal({
   }
 
   useEffect(() => {
-    return () => stop({ status: speechStatusRef.current });
+    return () => {
+      // On unmount (or text/key change), synchronously drop the entry and reset its
+      // status to "stopped" instead of relying on an asynchronous onend callback
+      // that may never fire once the component is gone.
+      reset();
+      removeFromQueue(utteranceRef.current!);
+    };
   }, [enableDirectives, key]);
+
+  useEffect(
+    // Subscribe once: every queue mutation (add/remove/clear/restart) emits a
+    // snapshot that is already consistent with the underlying queue length.
+    () => subscribe((utteranceQueue) => onQueueChangeRef.current?.(utteranceQueue)),
+    [],
+  );
 
   useLayoutEffect(() => {
     highlightRef.current = false;
@@ -359,8 +385,9 @@ export function useSpeechInternal({
     const timeout = setTimeout(() => {
       updateProps({ pitch, rate, volume, lang, voiceURI });
       if (directiveRef.current.delay) return;
-      stop({ stopReason: "change" });
-      emit(onQueueChange);
+      // Interrupt and restart only the current (head) utterance. Waiting items keep
+      // their place in the queue and their "queued" status.
+      restartQueueHead(utteranceRef.current!);
     }, 500);
     return () => clearTimeout(timeout);
   }, [pitch, rate, volume, lang, stringifiedVoices]);
