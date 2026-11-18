@@ -144,14 +144,18 @@ export class Vista3D {
     this.progetto = progetto;
     this.opzioni = opzioni;
     this.stato = { selezione, primario, esploso, gizmo, misura, maniglie };
+    // Si butta via tutto il giro precedente: la mappa degli oggetti si azzera subito, così durante
+    // la ricostruzione nessuno può raggiungere le risorse già liberate. Di ogni oggetto rimosso si
+    // liberano geometria e materiali; i materiali condivisi (metallo, errore, colori dei fissaggi)
+    // restano vivi perché li usano anche gli oggetti che restano in scena e quelli appena creati.
+    this.oggetti = new Map();
     for (const c of [...this.gruppo.children, ...this.extra.children, ...this.maniglie.children]) {
       c.parent.remove(c);
       c.traverse(o => {
-        if (o.material && !CONDIVISI.has(o.material)) o.material.dispose();
-        if (o.geometry && o.userData.propria) o.geometry.dispose();
+        if (o.geometry) o.geometry.dispose();
+        for (const m of [o.material].flat()) if (m && !CONDIVISI.has(m)) m.dispose();
       });
     }
-    this.oggetti = new Map();
     const centro = esploso ? this.centroProgetto(progetto) : null;
     for (const p of progetto.pezzi) {
       const g = geometriaPezzo(p);
