@@ -12,6 +12,7 @@ Everything of 0.2.0 works as before.
 - `httpSource( … ).stats()` also gives `url`, `etag` (of the first response that had one) and `pending` (the ranges asked and not yet answered).
 - TypeScript declarations in `src/index.d.ts` (`types` in `package.json`), with the `ByteSource` and `SourceStats` types.
 - The `Archive3tz` constructor's `guessBytes` defaults to `DEFAULT_GUESS_BYTES`.
+- Aborts and releases. The plugin's `fetchData` answers the renderer's `AbortSignal`: it rejects with an `AbortError` as soon as the signal aborts, and the Range request in flight is cancelled (`ByteSource` `tail`/`read`, `Archive3tz.open` and `Archive3tz#read` take an optional `AbortSignal`, passed to `fetch`). `Tiles3tzPlugin#release( url )` drops one archive — found by its base URL, its `.3tz` URL, or the root address `addFile`/`addURL` returned — aborting its requests in flight; the next request for the same URL opens the archive again. `dispose()` releases every archive.
 
 ## 0.2.0 — 2026-11-06
 

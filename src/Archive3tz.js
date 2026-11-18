@@ -35,10 +35,11 @@ export class Archive3tz {
 	/**
 	 * @param {import('./sources.js').ByteSource} source
 	 * @param {{ tailBytes?: number, maxDirectoryBytes?: number, guessBytes?: number, maxEntryBytes?: number,
-	 *   requireIndex?: boolean, yieldEvery?: number }} [options]
+	 *   requireIndex?: boolean, yieldEvery?: number, signal?: AbortSignal }} [options]
 	 *   `requireIndex: false` also opens a plain ZIP, without `@3dtilesIndex1@`
 	 *   (a tileset zipped by hand): its entries are found through the central
 	 *   directory, with the same limits as a .3tz.
+	 *   `signal` aborts the requests of the open, which then rejects with an AbortError.
 	 */
 	static async open( source, options = {} ) {
 
@@ -48,7 +49,8 @@ export class Archive3tz {
 		const maxEntryBytes = options.maxEntryBytes ?? DEFAULT_MAX_ENTRY_BYTES;
 		const requireIndex = options.requireIndex ?? true;
 		const yieldEvery = options.yieldEvery ?? DEFAULT_YIELD_EVERY;
-		const end = await readEnd( source, { tailBytes, maxDirectoryBytes } );
+		const signal = options.signal;
+		const end = await readEnd( source, { tailBytes, maxDirectoryBytes, signal } );
 
 		// the whole central directory: path → location of every entry
 		const byDirectory = async ( directory, requests ) => {
@@ -84,7 +86,7 @@ export class Archive3tz {
 
 		// the index holds 24 bytes per file: never more than the archive has entries
 		if ( location.compressedSize > end.entries * RECORD_BYTES ) throw new Error( `Damaged .3tz: ${ INDEX_NAME } is larger than its ${ end.entries } entries need.` );
-		const index = await readEntryAt( source, INDEX_NAME, location.offset, location, 0, maxEntryBytes );
+		const index = await readEntryAt( source, INDEX_NAME, location.offset, location, 0, maxEntryBytes, signal );
 		if ( index.length % RECORD_BYTES !== 0 ) throw new Error( 'The .3tz index length is not a multiple of 24.' );
 		return new Archive3tz( source, { entries: null, index, guessBytes, maxEntryBytes, openRequests: end.requests() + 1, zip64: end.zip64 } );
 
@@ -130,20 +132,21 @@ export class Archive3tz {
 	/**
 	 * The bytes of `path`, or null when the archive does not hold it.
 	 * @param {string} path
+	 * @param {AbortSignal} [signal]  aborts the requests of this read
 	 * @returns {Promise<Uint8Array | null>}
 	 */
-	async read( path ) {
+	async read( path, signal ) {
 
 		const p = normalizePath( path );
 		if ( this._entries ) {
 
 			const location = this._entries.get( p );
-			return location ? readEntryAt( this.source, p, location.offset, location, 0, this._maxEntryBytes ) : null;
+			return location ? readEntryAt( this.source, p, location.offset, location, 0, this._maxEntryBytes, signal ) : null;
 
 		}
 
 		const offset = lookup( this._index, p );
-		return offset === null ? null : readEntryAt( this.source, p, offset, null, Math.min( this._guessBytes, this._maxEntryBytes ), this._maxEntryBytes );
+		return offset === null ? null : readEntryAt( this.source, p, offset, null, Math.min( this._guessBytes, this._maxEntryBytes ), this._maxEntryBytes, signal );
 
 	}
 

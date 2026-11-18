@@ -24,6 +24,11 @@ import { blobSource, httpSource } from './sources.js';
  * const tiles = new TilesRenderer( plugin.addFile( file ) );
  * tiles.registerPlugin( plugin );
  * ```
+ *
+ * Requests answer the renderer's `AbortSignal`: when it aborts, `fetchData`
+ * rejects with an AbortError and the Range request in flight is cancelled.
+ * `release( url )` drops one archive (its cache and its requests in flight);
+ * the next request for the same URL opens it again. `dispose()` releases all.
  */
 export class Tiles3tzPlugin {
 
@@ -48,6 +53,10 @@ export class Tiles3tzPlugin {
 		this.archiveOnly = !! options.archiveOnly;
 		/** @type {Map<string, Promise<Archive3tz>>} base URL (ending in "/") → archive */
 		this.archives = new Map();
+		// base → controller that aborts the archive's requests (on release/dispose)
+		this._controllers = new Map();
+		// base → how to open it; kept after a release, so the URL can open again
+		this._openers = new Map();
 		this._fileCount = 0;
 
 	}
@@ -67,7 +76,8 @@ export class Tiles3tzPlugin {
 
 		const origin = globalThis.location && /^https?:$/.test( globalThis.location.protocol ) ? globalThis.location.origin : 'https://3tz.invalid';
 		const base = `${ origin }/__3tz__/${ ++ this._fileCount }/`;
-		this.archives.set( base, Archive3tz.open( blobSource( blob ), this.archiveOptions ) );
+		this._openers.set( base, signal => Archive3tz.open( blobSource( blob ), { ...this.archiveOptions, signal } ) );
+		this._open( base );
 		return base + 'tileset.json';
 
 	}
@@ -81,22 +91,40 @@ export class Tiles3tzPlugin {
 
 		const absolute = resolve( url );
 		const base = absolute.split( /[?#]/ )[ 0 ] + '/';
-		if ( ! this.archives.has( base ) ) {
+		if ( ! this._openers.has( base ) ) {
 
-			const fetchOptions = this.tiles ? this.tiles.fetchOptions : {};
-			const source = httpSource( absolute, { fetch: this.fetch || undefined, fetchOptions, maxDownloadBytes: this.maxDownloadBytes } );
-			this.archives.set( base, Archive3tz.open( source, this.archiveOptions ) );
+			this._openers.set( base, signal => {
+
+				const fetchOptions = this.tiles ? this.tiles.fetchOptions : {};
+				const source = httpSource( absolute, { fetch: this.fetch || undefined, fetchOptions, maxDownloadBytes: this.maxDownloadBytes } );
+				return Archive3tz.open( source, { ...this.archiveOptions, signal } );
+
+			} );
 
 		}
 
+		if ( ! this.archives.has( base ) ) this._open( base );
 		return base + 'tileset.json';
 
 	}
 
-	/** The archive serving `url`, or null. */
+	// Open the archive behind `base`, its requests tied to a controller that
+	// release() and dispose() abort. A failed or aborted open rejects quietly
+	// for anyone not awaiting it.
+	_open( base ) {
+
+		const controller = new AbortController();
+		const open = this._openers.get( base )( controller.signal );
+		open.catch( () => {} );
+		this._controllers.set( base, controller );
+		this.archives.set( base, open );
+
+	}
+
+	/** The base URL of the archive serving `url` (open, opening, or released), or null. */
 	baseFor( url ) {
 
-		for ( const base of this.archives.keys() ) {
+		for ( const base of this._openers.keys() ) {
 
 			if ( url.startsWith( base ) ) return base;
 
@@ -126,25 +154,102 @@ export class Tiles3tzPlugin {
 
 		}
 
+		const signal = options && options.signal;
+		if ( ! this.archives.has( base ) ) this._open( base ); // released meanwhile: open it again
+		const open = this.archives.get( base );
+		const released = this._controllers.get( base ).signal;
 		const path = decodeURIComponent( url.slice( base.length ).split( /[?#]/ )[ 0 ] );
 
-		return this.archives.get( base ).then( async archive => {
+		return waitFor( open, signal ).then( async archive => {
 
-			const bytes = await archive.read( path );
-			if ( options && options.signal && options.signal.aborted ) throw new DOMException( 'Aborted', 'AbortError' );
-			if ( bytes === null ) return new Response( null, { status: 404, statusText: `${ path } is not in the archive` } );
-			return new Response( bytes, { status: 200 } );
+			// the read stops when the renderer's signal aborts, and also when
+			// the archive is released while the read is in flight
+			const linked = linkSignals( [ signal, released ] );
+			try {
+
+				if ( linked.signal && linked.signal.aborted ) throw abortError();
+				const bytes = await archive.read( path, linked.signal );
+				if ( linked.signal && linked.signal.aborted ) throw abortError();
+				if ( bytes === null ) return new Response( null, { status: 404, statusText: `${ path } is not in the archive` } );
+				return new Response( bytes, { status: 200 } );
+
+			} finally {
+
+				linked.detach();
+
+			}
 
 		} );
 
 	}
 
+	/**
+	 * Release the archive serving `url` — its base URL (`.../site.3tz/`, or the
+	 * `.3tz` URL itself) or the root address `addFile`/`addURL` returned. Its
+	 * cache is dropped and its requests in flight are aborted; the next request
+	 * for the same URL opens the archive again.
+	 * @param {string} url
+	 * @returns {boolean} false when no archive serves `url`
+	 */
+	release( url ) {
+
+		const u = resolve( String( url ) );
+		const base = this.baseFor( u ) || this.baseFor( u.split( /[?#]/ )[ 0 ] + '/' );
+		if ( base === null ) return false;
+		const controller = this._controllers.get( base );
+		this.archives.delete( base );
+		this._controllers.delete( base );
+		if ( controller ) controller.abort();
+		return true;
+
+	}
+
+	/** Release every archive: all caches dropped, all requests in flight aborted. */
 	dispose() {
 
-		this.archives.clear();
+		for ( const base of [ ...this._controllers.keys() ] ) this.release( base );
+		this._openers.clear();
 		this.tiles = null;
 
 	}
+
+}
+
+const abortError = () => new DOMException( 'Aborted', 'AbortError' );
+
+// `promise`, but rejected with an AbortError as soon as `signal` aborts. The
+// promise itself is left running: an open shared with other requests is not
+// cancelled because one waiter went away.
+function waitFor( promise, signal ) {
+
+	if ( ! signal ) return promise;
+	if ( signal.aborted ) return Promise.reject( abortError() );
+	return new Promise( ( resolve, reject ) => {
+
+		const onAbort = () => reject( abortError() );
+		signal.addEventListener( 'abort', onAbort, { once: true } );
+		promise.then(
+			value => { signal.removeEventListener( 'abort', onAbort ); resolve( value ); },
+			error => { signal.removeEventListener( 'abort', onAbort ); reject( error ); },
+		);
+
+	} );
+
+}
+
+// One signal out of several: it aborts when the first of them does. `detach`
+// removes the listeners (a long-lived signal would otherwise collect one per
+// read).
+function linkSignals( signals ) {
+
+	const list = signals.filter( s => s );
+	if ( list.some( s => s.aborted ) ) return { signal: AbortSignal.abort(), detach() {} };
+	if ( list.length === 0 ) return { signal: undefined, detach() {} };
+	if ( list.length === 1 ) return { signal: list[ 0 ], detach() {} };
+	const controller = new AbortController();
+	const abort = () => controller.abort();
+	for ( const s of list ) s.addEventListener( 'abort', abort, { once: true } );
+	return { signal: controller.signal, detach: () => list.forEach( s => s.removeEventListener( 'abort', abort ) ) };
 
 }
 

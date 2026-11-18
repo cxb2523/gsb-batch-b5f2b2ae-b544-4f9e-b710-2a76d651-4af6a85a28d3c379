@@ -16,9 +16,12 @@
  * that does not match the range) carries `range`, the `Range` header asked
  * (`'bytes=a-b'` or `'bytes=-n'`), and `status` when a response came.
  *
+ * Both `tail` and `read` take an optional `AbortSignal`: an aborted signal
+ * stops the request (for `httpSource`, the `fetch` itself is aborted).
+ *
  * @typedef {object} ByteSource
- * @property {(length: number) => Promise<{ bytes: Uint8Array, size: number }>} tail
- * @property {(offset: number, length: number) => Promise<Uint8Array>} read
+ * @property {(length: number, signal?: AbortSignal) => Promise<{ bytes: Uint8Array, size: number }>} tail
+ * @property {(offset: number, length: number, signal?: AbortSignal) => Promise<Uint8Array>} read
  * @property {() => SourceStats} stats
  */
 
@@ -42,8 +45,9 @@ export function blobSource( blob ) {
 	let requests = 0;
 	let bytes = 0;
 
-	const read = async ( offset, length ) => {
+	const read = async ( offset, length, signal ) => {
 
+		if ( signal && signal.aborted ) throw new DOMException( 'Aborted', 'AbortError' );
 		requests ++;
 		const end = Math.min( blob.size, offset + length );
 		const out = new Uint8Array( await blob.slice( offset, end ).arrayBuffer() );
@@ -53,10 +57,10 @@ export function blobSource( blob ) {
 	};
 
 	return {
-		async tail( length ) {
+		async tail( length, signal ) {
 
 			const start = Math.max( 0, blob.size - length );
-			return { bytes: await read( start, blob.size - start ), size: blob.size };
+			return { bytes: await read( start, blob.size - start, signal ), size: blob.size };
 
 		},
 		read,
@@ -91,14 +95,14 @@ export function httpSource( url, options = {} ) {
 
 	// Every error leaves with the range asked and, when a response came, its
 	// status: a log can then say which bytes did not arrive.
-	const ask = async ( range, wanted ) => {
+	const ask = async ( range, wanted, signal ) => {
 
 		requests ++;
 		pending.add( range );
 		let status;
 		try {
 
-			return await answer( range, wanted, s => { status = s; } );
+			return await answer( range, wanted, s => { status = s; }, signal );
 
 		} catch ( error ) {
 
@@ -125,10 +129,12 @@ export function httpSource( url, options = {} ) {
 	// in Content-Range, the very range asked for (a suffix range: at most
 	// `suffix` bytes ending at the end of the file), and its body is read up
 	// to that length and no further.
-	const answer = async ( range, { offset = null, length = null, suffix = null }, setStatus ) => {
+	const answer = async ( range, { offset = null, length = null, suffix = null }, setStatus, signal ) => {
 
 		const headers = { ...( baseOptions.headers || {} ), Range: range };
-		const res = await fetchFn( url, { ...baseOptions, headers } );
+		const init = { ...baseOptions, headers };
+		if ( signal ) init.signal = signal;
+		const res = await fetchFn( url, init );
 		setStatus( res.status );
 		if ( etag === null && res.headers.get( 'etag' ) ) etag = res.headers.get( 'etag' );
 
@@ -174,13 +180,13 @@ export function httpSource( url, options = {} ) {
 	};
 
 	return {
-		async tail( length ) {
+		async tail( length, signal ) {
 
 			if ( ! whole ) {
 
 				// a "suffix" range: the last `length` bytes, and the total size
 				// in the Content-Range header
-				const out = await ask( `bytes=-${ length }`, { suffix: length } );
+				const out = await ask( `bytes=-${ length }`, { suffix: length }, signal );
 				if ( out ) {
 
 					if ( size === null ) throw new Error( `${ url }: the server did not say the file size` );
@@ -193,11 +199,11 @@ export function httpSource( url, options = {} ) {
 			return { bytes: whole.subarray( Math.max( 0, whole.byteLength - length ) ), size: whole.byteLength };
 
 		},
-		async read( offset, length ) {
+		async read( offset, length, signal ) {
 
 			if ( ! whole ) {
 
-				const out = await ask( `bytes=${ offset }-${ offset + length - 1 }`, { offset, length } );
+				const out = await ask( `bytes=${ offset }-${ offset + length - 1 }`, { offset, length }, signal );
 				if ( out ) return out;
 
 			}

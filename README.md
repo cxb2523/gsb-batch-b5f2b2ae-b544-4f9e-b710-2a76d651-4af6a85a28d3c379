@@ -48,6 +48,8 @@ Reading the archive takes three steps.
 
 If the server ignores `Range` and returns the whole file, the plugin keeps that single download and serves tiles from it. Each archive is then transferred once, as a plain download would be.
 
+Requests answer the renderer's `AbortSignal`: when a request is cancelled (the camera moved, the tileset was swapped), `fetchData` rejects with an `AbortError` and the Range request in flight is cancelled too. `plugin.release( url )` — with the archive's base URL or the root address `addFile` returned — drops one archive: its cache is freed, its requests in flight are aborted, and the next request for the same URL opens the archive again. `dispose()` releases every archive.
+
 A long central directory is read in slices of 16 384 records (`yieldEvery`), and the page is let go between two slices: a directory of 16 MB does not freeze the page while it is read.
 
 The code is in five short files, with their type declarations:
@@ -157,7 +159,8 @@ The tests use Node 18 or later and need no installed packages. They build small 
 - `names()`, through the directory and through the index;
 - a directory of 50 000 records read in slices, with a timer that keeps running;
 - `normalizePath` and `INDEX_NAME`; `status` and `range` on source errors; the ETag and the pending ranges in `stats()`; every export declared in `index.d.ts`;
-- the limits for untrusted archives: a zip bomb, an entry over the size limit (through the directory and through the index), a directory that does not end where it should, a directory offset moved back, the whole-file fallback over its limit, an index over the entry limit, a `206` answer that is not the range asked for or is longer than it, and `archiveOnly`.
+- the limits for untrusted archives: a zip bomb, an entry over the size limit (through the directory and through the index), a directory that does not end where it should, a directory offset moved back, the whole-file fallback over its limit, an index over the entry limit, a `206` answer that is not the range asked for or is longer than it, and `archiveOnly`;
+- aborting a request (while the archive opens and while a tile reads: the Range request is cancelled and `pending` empties), releasing an archive by its base or root address and opening it again on the next request, and `dispose()` releasing every archive.
 
 ## How this was written
 

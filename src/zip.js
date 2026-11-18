@@ -54,12 +54,12 @@ export function concat( a, b ) {
  * .3tz index instead.
  *
  * @param {import('./sources.js').ByteSource} source
- * @param {{ tailBytes: number, maxDirectoryBytes: number }} limits
+ * @param {{ tailBytes: number, maxDirectoryBytes: number, signal?: AbortSignal }} limits
  */
-export async function readEnd( source, { tailBytes, maxDirectoryBytes } ) {
+export async function readEnd( source, { tailBytes, maxDirectoryBytes, signal } ) {
 
 	let requests = 1;
-	const { bytes: tail, size } = await source.tail( tailBytes );
+	const { bytes: tail, size } = await source.tail( tailBytes, signal );
 	const tailStart = size - tail.length;
 	const tv = viewOf( tail );
 
@@ -84,7 +84,7 @@ export async function readEnd( source, { tailBytes, maxDirectoryBytes } ) {
 
 		if ( at >= tailStart && at + length <= size ) return tail.subarray( at - tailStart, at - tailStart + length );
 		requests ++;
-		return source.read( at, length );
+		return source.read( at, length, signal );
 
 	};
 
@@ -245,8 +245,9 @@ export async function parseDirectory( directory, { yieldEvery = 0 } = {} ) {
  * @param {number} [maxEntryBytes]  the most an entry may take, compressed or
  *   once decompressed: a larger one is refused (a damaged or hostile archive,
  *   a "zip bomb")
+ * @param {AbortSignal} [signal]  aborts the requests of this read
  */
-export async function readEntryAt( source, path, offset, known, guessBytes, maxEntryBytes = Infinity ) {
+export async function readEntryAt( source, path, offset, known, guessBytes, maxEntryBytes = Infinity, signal ) {
 
 	const wanted = normalizePath( path );
 	const tooLarge = what => new Error( `${ path }: ${ what } is over the limit of ${ maxEntryBytes } bytes (maxEntryBytes).` );
@@ -254,10 +255,10 @@ export async function readEntryAt( source, path, offset, known, guessBytes, maxE
 	const nameLength = known ? known.nameLength : new TextEncoder().encode( wanted ).length;
 	const first = 30 + nameLength + EXTRA_MARGIN + ( known ? known.compressedSize : guessBytes );
 
-	let buffer = await source.read( offset, first );
+	let buffer = await source.read( offset, first, signal );
 	const ensure = async n => {
 
-		if ( buffer.length < n ) buffer = concat( buffer, await source.read( offset + buffer.length, n - buffer.length ) );
+		if ( buffer.length < n ) buffer = concat( buffer, await source.read( offset + buffer.length, n - buffer.length, signal ) );
 
 	};
 

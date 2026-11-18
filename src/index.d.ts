@@ -19,9 +19,9 @@ export interface SourceStats {
 /** Where the bytes of an archive come from. */
 export interface ByteSource {
 	/** the last `length` bytes, and the size of the file */
-	tail( length: number ): Promise<{ bytes: Uint8Array; size: number }>;
+	tail( length: number, signal?: AbortSignal ): Promise<{ bytes: Uint8Array; size: number }>;
 	/** `length` bytes from `offset` (fewer at the end of the file) */
-	read( offset: number, length: number ): Promise<Uint8Array>;
+	read( offset: number, length: number, signal?: AbortSignal ): Promise<Uint8Array>;
 	stats(): SourceStats;
 }
 
@@ -54,6 +54,8 @@ export interface ArchiveOptions {
 	requireIndex?: boolean;
 	/** central-directory records read between two yields to the page; 0 = one piece (default `DEFAULT_YIELD_EVERY`) */
 	yieldEvery?: number;
+	/** aborts the requests of the open, which then rejects with an AbortError */
+	signal?: AbortSignal;
 }
 
 /** Where an entry's local header is, as the central directory says. */
@@ -83,7 +85,7 @@ export class Archive3tz {
 	names(): string[] | null;
 	has( path: string ): boolean;
 	/** the bytes of `path`, or null when the archive does not hold it */
-	read( path: string ): Promise<Uint8Array | null>;
+	read( path: string, signal?: AbortSignal ): Promise<Uint8Array | null>;
 }
 
 export interface Tiles3tzPluginOptions {
@@ -107,6 +109,14 @@ export class Tiles3tzPlugin {
 	baseFor( url: string ): string | null;
 	preprocessURL( url: string, tile: unknown ): string;
 	fetchData( url: string, options?: RequestInit ): Promise<Response> | null;
+	/**
+	 * Release the archive serving `url` (its base URL, the `.3tz` URL, or the root
+	 * address `addFile`/`addURL` returned): its cache is dropped and its requests
+	 * in flight are aborted; the next request for the same URL opens it again.
+	 * Returns false when no archive serves `url`.
+	 */
+	release( url: string ): boolean;
+	/** release every archive */
 	dispose(): void;
 }
 
