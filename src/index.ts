@@ -7,7 +7,7 @@
  * @module
  */
 /// <reference path="./env.d.ts" />
-import { ContextNotReadyError, SeslenError } from "./errors.ts"
+import { ContextClosedError, ContextNotReadyError, SeslenError } from "./errors.ts"
 import { watchReducedMotion } from "./_a11y.ts"
 import { createAnalyser } from "./_analyser.ts"
 import { createBuses } from "./_buses.ts"
@@ -38,7 +38,13 @@ import type {
   VoiceStealStrategy,
 } from "./_types.ts"
 
-export { SeslenError, ContextNotReadyError, DecodeError, LoadError } from "./errors.ts"
+export {
+  SeslenError,
+  ContextNotReadyError,
+  ContextClosedError,
+  DecodeError,
+  LoadError,
+} from "./errors.ts"
 export type {
   AnalyserTap,
   BusHandle,
@@ -121,6 +127,16 @@ export function createSeslen<TName extends string = string>(
   let analyser: AnalyserTap | null = null
   let stopReducedMotion: (() => void) | null = null
 
+  // Bumped on every (re)boot and every teardown. An async play that resumes
+  // after `close()` compares against this and bails instead of starting a
+  // voice on a dead context.
+  let epoch = 0
+  // Aborts the in-flight URL loads owned by the live context; replaced on
+  // every (re)boot and fired on `close()`.
+  let loadAbort: AbortController | null = null
+  // Shared teardown promise makes concurrent `close()` calls idempotent.
+  let closing: Promise<void> | null = null
+
   let volume = clamp01(persisted.volume ?? opts.volume ?? 1)
   let mutedFlag = persisted.muted ?? false
   let preMuteVolume = volume
@@ -155,25 +171,77 @@ export function createSeslen<TName extends string = string>(
 
   function ensure(): { ctx: AudioContext; master: GainNode } {
     if (ctx && master) return { ctx, master }
-    ctx = createContext()
-    master = ctx.createGain()
-    master.gain.value = effectiveMuted() ? 0 : volume
-    master.connect(ctx.destination)
-    buses = createBuses(ctx, master, opts.buses)
-    urlCache = createCache((url: string) => fetchAndDecode(ctx as AudioContext, url))
+    const c = createContext()
+    const m = c.createGain()
+    m.gain.value = effectiveMuted() ? 0 : volume
+    m.connect(c.destination)
+    const abort = new AbortController()
+    ctx = c
+    master = m
+    loadAbort = abort
+    buses = createBuses(c, m, opts.buses)
+    urlCache = createCache((url: string) => fetchAndDecode(c, url, abort.signal))
     if (opts.respectReducedMotion !== false) {
       stopReducedMotion = watchReducedMotion((reduce) => {
         reducedMotionMute = reduce
         applyVolume()
       })
     }
+    epoch++
     syncState()
-    return { ctx, master }
+    return { ctx: c, master: m }
   }
 
   function track(handle: PlayHandle, name: string): PlayHandle {
     handles.set(handle, name)
     return handle
+  }
+
+  /** Detach the live generation synchronously, then release its resources.
+   *  Safe to call repeatedly: a no-op when no context is live. */
+  async function teardown(): Promise<void> {
+    const deadCtx = ctx
+    if (!deadCtx) return
+    const deadAbort = loadAbort
+    const deadAnalyser = analyser
+    const deadCache = urlCache
+    const stopMotion = stopReducedMotion
+
+    ctx = null
+    master = null
+    buses = null
+    urlCache = null
+    analyser = null
+    stopReducedMotion = null
+    loadAbort = null
+    epoch++
+
+    for (const [h] of handles) {
+      try {
+        h.stop()
+      } catch {
+        // already stopped
+      }
+    }
+    handles.clear()
+    voices.clear()
+    throttle.clear()
+    deadAnalyser?.dispose()
+    stopMotion?.()
+    deadCache?.clear()
+    deadAbort?.abort()
+    if (deadCtx.state !== "closed") {
+      try {
+        await deadCtx.close()
+      } catch {
+        // already closed / unsupported — the reference is dropped either way
+      }
+    }
+    // A concurrent play during the await may have booted a fresh generation
+    // — tear that down too so the end state is always idle. The recursion
+    // emits its own statechange; otherwise sync ourselves.
+    if (ctx && ctx !== deadCtx) await teardown()
+    else syncState()
   }
 
   return {
@@ -220,7 +288,15 @@ export function createSeslen<TName extends string = string>(
         handle = (source as SoundFactory)(c, dest, jittered)
       } else if (typeof source === "string") {
         if (!urlCache) throw new ContextNotReadyError("seslen: cache not initialised")
+        // Snapshot the generation before awaiting: `close()` (or a close +
+        // re-open) must invalidate this whole continuation.
+        const playEpoch = epoch
         const buf = await urlCache.get(source)
+        if (playEpoch !== epoch || ctx !== c) {
+          throw new ContextClosedError(
+            `seslen: play("${name}") cancelled — context was closed while decoding ${source}`,
+          )
+        }
         handle = startBuffer(c, dest, buf, jittered)
       } else {
         handle = startBuffer(c, dest, source, jittered)
@@ -348,7 +424,13 @@ export function createSeslen<TName extends string = string>(
       ensure()
       if (typeof source === "string") {
         if (!urlCache) throw new ContextNotReadyError("seslen: cache not initialised")
+        const preloadEpoch = epoch
         await urlCache.get(source)
+        if (preloadEpoch !== epoch) {
+          throw new ContextClosedError(
+            `seslen: preload("${name}") cancelled — context was closed while decoding ${source}`,
+          )
+        }
       }
     },
 
@@ -493,21 +575,16 @@ export function createSeslen<TName extends string = string>(
     },
 
     async close() {
-      for (const [h] of handles) h.stop()
-      handles.clear()
-      voices.clear()
-      throttle.clear()
-      analyser?.dispose()
-      analyser = null
-      stopReducedMotion?.()
-      stopReducedMotion = null
-      urlCache?.clear()
-      if (ctx && ctx.state !== "closed") await ctx.close()
-      ctx = null
-      master = null
-      buses = null
-      urlCache = null
-      syncState()
+      // Idempotent: a teardown already in flight shares its promise, and a
+      // second call after completion is a silent no-op.
+      if (closing) return closing
+      if (!ctx) return
+      closing = teardown()
+      try {
+        await closing
+      } finally {
+        closing = null
+      }
     },
 
     isReady() {

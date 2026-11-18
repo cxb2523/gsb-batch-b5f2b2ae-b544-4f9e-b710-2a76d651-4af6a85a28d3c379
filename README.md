@@ -214,26 +214,26 @@ frame()
 
 ### `SeslenInstance`
 
-| method                              | returns                                                      | description                                                      |
-| ----------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------- |
-| `play(name, opts?)`                 | `Promise<PlayHandle \| null>`                                | Play a sound. Returns `null` if throttled or dropped             |
-| `playPattern(steps)`                | `Promise<PlayHandle>`                                        | Schedule a timed sequence; combined handle stops every step      |
-| `preload(name)`                     | `Promise<void>`                                              | Fetch + decode (URL sources only)                                |
-| `stop(name)`                        | `number`                                                     | Stop every active handle for one preset; returns the count       |
-| `stopAll()`                         | `void`                                                       | Stop every active `PlayHandle`                                   |
-| `register(name, src, defs?)`        | `void`                                                       | Add or replace a source (with optional defaults)                 |
-| `unregister(name)`                  | `boolean`                                                    | Remove a source; stops live handles for that name                |
-| `has(name)` / `names()`             | `boolean` / `string[]`                                       | Registry introspection                                           |
-| `getVolume()` / `setVolume()`       | `number` / `void`                                            | Master gain accessors (clamped 0..1)                             |
-| `mute()` / `unmute()` / `isMuted()` | —                                                            | Master mute toggle                                               |
-| `bus(name)`                         | `BusHandle`                                                  | Get or create a named sub-mixer (`getVolume`, `mute`, `duck`, …) |
-| `now()` / `latency()`               | `number` / `number`                                          | `AudioContext.currentTime` / `baseLatency + outputLatency`       |
-| `render(name, opts?)`               | `Promise<Blob>`                                              | Render a sound to a 16-bit PCM WAV via `OfflineAudioContext`     |
-| `analyser(opts?)`                   | `AnalyserTap`                                                | Tap an `AnalyserNode` for waveform / spectrum data               |
-| `on(type, fn)` / `off()`            | `() => void` / `void`                                        | Subscribe to `play` / `ended` / `throttled` / `statechange`      |
-| `pause()` / `resume()`              | `Promise<void>`                                              | Suspend / resume the underlying context                          |
-| `close()`                           | `Promise<void>`                                              | Close the `AudioContext`, clear caches, drop analyser            |
-| `isReady()` / `state()`             | `boolean` / `"idle" \| "running" \| "suspended" \| "closed"` | Lifecycle inspection                                             |
+| method                              | returns                                                      | description                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `play(name, opts?)`                 | `Promise<PlayHandle \| null>`                                | Play a sound. Returns `null` if throttled or dropped                                                       |
+| `playPattern(steps)`                | `Promise<PlayHandle>`                                        | Schedule a timed sequence; combined handle stops every step                                                |
+| `preload(name)`                     | `Promise<void>`                                              | Fetch + decode (URL sources only)                                                                          |
+| `stop(name)`                        | `number`                                                     | Stop every active handle for one preset; returns the count                                                 |
+| `stopAll()`                         | `void`                                                       | Stop every active `PlayHandle`                                                                             |
+| `register(name, src, defs?)`        | `void`                                                       | Add or replace a source (with optional defaults)                                                           |
+| `unregister(name)`                  | `boolean`                                                    | Remove a source; stops live handles for that name                                                          |
+| `has(name)` / `names()`             | `boolean` / `string[]`                                       | Registry introspection                                                                                     |
+| `getVolume()` / `setVolume()`       | `number` / `void`                                            | Master gain accessors (clamped 0..1)                                                                       |
+| `mute()` / `unmute()` / `isMuted()` | —                                                            | Master mute toggle                                                                                         |
+| `bus(name)`                         | `BusHandle`                                                  | Get or create a named sub-mixer (`getVolume`, `mute`, `duck`, …)                                           |
+| `now()` / `latency()`               | `number` / `number`                                          | `AudioContext.currentTime` / `baseLatency + outputLatency`                                                 |
+| `render(name, opts?)`               | `Promise<Blob>`                                              | Render a sound to a 16-bit PCM WAV via `OfflineAudioContext`                                               |
+| `analyser(opts?)`                   | `AnalyserTap`                                                | Tap an `AnalyserNode` for waveform / spectrum data                                                         |
+| `on(type, fn)` / `off()`            | `() => void` / `void`                                        | Subscribe to `play` / `ended` / `throttled` / `statechange`                                                |
+| `pause()` / `resume()`              | `Promise<void>`                                              | Suspend / resume the underlying context                                                                    |
+| `close()`                           | `Promise<void>`                                              | Close the `AudioContext`, clear caches, drop analyser; recoverable — the next `play()` rebuilds everything |
+| `isReady()` / `state()`             | `boolean` / `"idle" \| "running" \| "suspended" \| "closed"` | Lifecycle inspection                                                                                       |
 
 ### `PlayOptions`
 
@@ -397,10 +397,22 @@ const ses = createSeslen() // every method is a typed no-op
 ## Errors
 
 ```ts
-import { SeslenError, ContextNotReadyError, DecodeError, LoadError } from "seslen"
+import {
+  SeslenError,
+  ContextNotReadyError,
+  ContextClosedError,
+  DecodeError,
+  LoadError,
+} from "seslen"
 ```
 
 `SeslenError` is the base. Use `instanceof` for targeted recovery.
+
+- `ContextClosedError` — a `play()` / `preload()` was cancelled because `close()` ran while its URL was still fetching/decoding. The call never starts a voice on the dead context.
+
+### Closing and reopening
+
+`close()` is a full, recoverable reset and is safe to call repeatedly. It stops every live voice, disposes the analyser and buses, aborts in-flight URL loads and closes the underlying `AudioContext`. Any `play()` still awaiting a decode at that moment rejects with `ContextClosedError` (it never returns a handle on a closed context). The instance is afterwards indistinguishable from a freshly created one: the next `play()` (or `bus()` / `analyser()`) lazily rebuilds the context, master gain, buses and URL cache, while volume/mute settings are preserved.
 
 ## Auto-unlock + accessibility
 

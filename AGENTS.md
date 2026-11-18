@@ -10,7 +10,7 @@ Zero-dependency, high-DX Web Audio library. A small, ergonomic API on top of `Au
 ```
 src/
   index.ts          # Public API — createSeslen, types, helpers
-  errors.ts         # SeslenError, ContextNotReadyError, DecodeError, LoadError
+  errors.ts         # SeslenError, ContextNotReadyError, ContextClosedError, DecodeError, LoadError
   env.d.ts          # AudioContext / OfflineAudioContext / DOM type declarations
   _types.ts         # PlayOptions, PlayHandle, SeslenOptions, SoundSource, SourceDefaults, BusHandle, AnalyserTap, ...
   _context.ts       # createContext — lazy AudioContext + unlock-on-gesture

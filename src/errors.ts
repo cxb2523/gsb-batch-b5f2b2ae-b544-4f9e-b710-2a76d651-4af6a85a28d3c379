@@ -10,6 +10,14 @@ export class ContextNotReadyError extends SeslenError {
   override name = "ContextNotReadyError"
 }
 
+/** Thrown when a `play()` / `preload()` is cancelled because `close()` was
+ * called while its URL fetch/decode was still in flight. The call never
+ * starts a voice on the closed context — catch this (or `SeslenError`) to
+ * distinguish cancellation from ordinary load/decode failures. */
+export class ContextClosedError extends SeslenError {
+  override name = "ContextClosedError"
+}
+
 /** Thrown when `decodeAudioData` rejects (corrupt or unsupported format). */
 export class DecodeError extends SeslenError {
   override name = "DecodeError"
