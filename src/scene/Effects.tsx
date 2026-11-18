@@ -3,6 +3,16 @@
  *  - DeployBeams: a light column, a spinning floor ring and a stage label over every node
  *    that is deploying right now
  *  - Pulses: a one-off shockwave when a deploy finishes (green / red) or a node goes down / up
+ *
+ * Shockwaves are driven by the live event stream with three guards so a reconnect or a big poll
+ * can never flood the floor:
+ *  - on a session switch the set of already-seen event ids is reset, so events from the previous
+ *    session can never be replayed as if they had just arrived;
+ *  - within one batch of new events a service keeps only its most severe event (a failure / a node
+ *    going down outranks a success / recovery / new node);
+ *  - the number of waves spawned from a single batch is capped.
+ * Every processed event id is consumed exactly once, and every wave removes itself by id when its
+ * animation finishes.
  */
 import { useFrame } from '@react-three/fiber';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -38,19 +48,22 @@ export function DeployBeams({ layout }: { layout: Layout }) {
   const services = useStore((s) => s.services);
   const deployments = useStore((s) => s.deployments);
 
-  // Deploying per Dokploy's status, or with a deploy record in flight.
+  // A beam needs Dokploy reporting "deploying" OR a deploy record in flight. The list is derived
+  // from current state on every render: when a deploy record finishes or the service leaves the
+  // deploying state (so neither condition holds anymore), its Beam unmounts in this same render
+  // cycle — it never lingers until the next layout rebuild.
   const active = useMemo(() => {
     const byService = new Map<string, Deployment>();
     for (const d of Object.values(deployments)) if (isActiveDeploy(d)) byService.set(d.serviceId, d);
     return Object.values(services)
       .filter((s) => layout.slots[s.id] && (s.status === 'deploying' || byService.has(s.id)))
-      .map((s) => ({ slot: layout.slots[s.id], deploy: byService.get(s.id) }));
+      .map((s) => ({ serviceId: s.id, slot: layout.slots[s.id]!, deploy: byService.get(s.id) }));
   }, [services, deployments, layout]);
 
   return (
     <>
-      {active.map(({ slot, deploy }) => (
-        <Beam key={slot.serviceId} slot={slot} deploy={deploy} />
+      {active.map(({ serviceId, slot, deploy }) => (
+        <Beam key={serviceId} slot={slot} deploy={deploy} />
       ))}
     </>
   );
@@ -112,14 +125,24 @@ function Beam({ slot, deploy }: { slot: Slot; deploy?: Deployment }) {
 
 // ---- shockwaves -----------------------------------------------------------------------
 
-const PULSE: Partial<Record<ActivityEvent['kind'], string>> = {
-  'deploy-ok': '#2bff9a',
-  'deploy-fail': '#ff2e55',
-  down: '#ff2e55',
-  up: '#2bff9a',
-  'new-node': '#2de2ff',
-};
 const PULSE_S = 1.8;
+/** Max shockwaves spawned from a single batch of events (e.g. one poll catching up). */
+export const MAX_PULSES_PER_BATCH = 6;
+
+interface PulseSpec {
+  color: string;
+  /** Higher wins when one service reports several events in the same batch. */
+  severity: number;
+}
+
+/** Only these events reach the floor as waves. Failure / outage always outranks success / arrival. */
+const PULSE: Partial<Record<ActivityEvent['kind'], PulseSpec>> = {
+  'deploy-fail': { color: '#ff2e55', severity: 2 },
+  down: { color: '#ff2e55', severity: 2 },
+  'deploy-ok': { color: '#2bff9a', severity: 1 },
+  up: { color: '#2bff9a', severity: 1 },
+  'new-node': { color: '#2de2ff', severity: 1 },
+};
 
 interface Pulse {
   id: string;
@@ -127,28 +150,71 @@ interface Pulse {
   color: string;
 }
 
+interface PickedPulse {
+  pulse: Pulse;
+  severity: number;
+}
+
 export function Pulses({ layout }: { layout: Layout }) {
   const events = useStore((s) => s.events);
+  const session = useStore((s) => s.session);
   const still = useStore((s) => s.reducedMotion);
   const seen = useRef<Set<string> | null>(null);
+  const sessionRef = useRef(session);
   const [pulses, setPulses] = useState<Pulse[]>([]);
 
-  // Only react to events that arrive after mount (the seeded history stays quiet).
   useEffect(() => {
+    // A reconnect starts a new session. Nothing known before the switch may wave again: reset the
+    // seen set to the events the new session currently holds and let in-flight waves die with the
+    // old scene. Only events arriving after this point can spawn a shockwave.
+    if (sessionRef.current !== session) {
+      sessionRef.current = session;
+      seen.current = new Set(events.map((e) => e.id));
+      setPulses((p) => (p.length ? [] : p));
+      return;
+    }
+    // First run of a session: the seeded history stays quiet, only later arrivals play.
     if (!seen.current) {
       seen.current = new Set(events.map((e) => e.id));
       return;
     }
-    const fresh: Pulse[] = [];
-    for (const e of events) {
-      if (seen.current.has(e.id)) continue;
-      seen.current.add(e.id);
-      const color = PULSE[e.kind];
-      const slot = e.serviceId && layout.slots[e.serviceId];
-      if (color && slot && !still) fresh.push({ id: e.id, slot, color });
+
+    const freshEvents = events.filter((e) => !seen.current!.has(e.id));
+    if (!freshEvents.length) return;
+    // Consume every fresh id up front — ids that never become a wave (no pulse color, no slot,
+    // reduced motion, over the cap) must not replay on the next effect run either.
+    for (const e of freshEvents) seen.current!.add(e.id);
+    // Reduced motion: no new waves, but waves already on the floor keep animating to completion.
+    if (still) return;
+
+    // One wave per service per batch: keep the most severe event. Events are newest-first, so at
+    // equal severity the first (most recent) entry wins because we only replace on a strict gain.
+    const picked = new Map<string, PickedPulse>();
+    for (const e of freshEvents) {
+      const spec = PULSE[e.kind];
+      const slot = e.serviceId ? layout.slots[e.serviceId] : undefined;
+      if (!spec || !slot) continue;
+      const prev = picked.get(e.serviceId!);
+      if (!prev) {
+        picked.set(e.serviceId!, { pulse: { id: e.id, slot, color: spec.color }, severity: spec.severity });
+      } else if (spec.severity > prev.severity) {
+        picked.set(e.serviceId!, { pulse: { id: e.id, slot, color: spec.color }, severity: spec.severity });
+      }
     }
-    if (fresh.length) setPulses((p) => [...p, ...fresh]);
-  }, [events, layout, still]);
+
+    // Cap the batch: severest first, ties keep arrival order (stable sort). The dropped events
+    // were already marked seen, so a catch-up poll can never dump dozens of rings in one frame.
+    const waves = [...picked.values()]
+      .sort((a, b) => b.severity - a.severity)
+      .slice(0, MAX_PULSES_PER_BATCH)
+      .map((x) => x.pulse);
+    if (waves.length) {
+      setPulses((p) => {
+        const ids = new Set(p.map((x) => x.id));
+        return [...p, ...waves.filter((w) => !ids.has(w.id))];
+      });
+    }
+  }, [session, events, layout, still]);
 
   return (
     <>
@@ -170,6 +236,7 @@ function Shockwave({ pulse, onDone }: { pulse: Pulse; onDone: () => void }) {
     age.current += dt;
     const t = age.current / PULSE_S;
     if (t >= 1) {
+      // Remove once, by id: a re-render with a new layout object must not remount or re-fire this.
       if (!finished.current) onDone();
       finished.current = true;
       return;
