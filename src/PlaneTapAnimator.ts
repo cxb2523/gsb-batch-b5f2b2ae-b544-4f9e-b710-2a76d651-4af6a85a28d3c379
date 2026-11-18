@@ -1,17 +1,33 @@
 import { easeInOutSine, easeTapZ } from "./Easings";
 
-const DEFAULT_PLANE_COUNT = 4;
 const DEFAULT_DURATION = 2500;
 const DEFAULT_DROP_DEPTH = 30;
 const DEFAULT_HORIZONTAL_OFFSET = 25;
 const DEFAULT_BANKING_OFFSET = 0.35;
 
+interface TapState {
+    /** Animation progress in the 0..1 range. */
+    timer: number;
+    /** Current offsets added to the plane position. */
+    offsetX: number;
+    offsetY: number;
+    offsetZ: number;
+    /** Current random roll added to the plane banking. */
+    offsetBanking: number;
+    /** Random horizontal displacement and banking of the current animation. */
+    randomX: number;
+    randomY: number;
+    randomBanking: number;
+}
+
 /**
- * Animated tap offsets for a fixed number of planes.
+ * Animated tap offsets keyed by plane identity.
  *
- * Offsets and timers are stored in parallel arrays indexed by the plane's draw
- * order. Each tap starts an independent animation for the tapped plane; the
- * renderer reads the current offsets right before drawing that plane.
+ * Offsets and timers are stored per plane key, not per draw order index: a
+ * formation switch changes the draw order (and the number of drawn planes),
+ * but a tap animation always follows the plane it was started for. If that
+ * plane is no longer part of the formation, its animation is discarded
+ * cleanly by `retain()`, so it can never be shown on a different plane.
  */
 export class PlaneTapAnimator {
     private readonly duration: number;
@@ -19,23 +35,10 @@ export class PlaneTapAnimator {
     private readonly horizontalOffset: number;
     private readonly bankingOffset: number;
 
-    /** Animation progress in the 0..1 range, per plane. */
-    private readonly timers: number[];
-    /** Whether an animation is running, per plane. */
-    private readonly running: boolean[];
-    /** Current offsets added to the plane position, per plane. */
-    private readonly offsetsX: number[];
-    private readonly offsetsY: number[];
-    private readonly offsetsZ: number[];
-    /** Current random roll added to the plane banking, per plane. */
-    private readonly offsetsBanking: number[];
-    /** Random horizontal displacement and banking of the current animation, per plane. */
-    private readonly randomX: number[];
-    private readonly randomY: number[];
-    private readonly randomBanking: number[];
+    /** Running and settled animations, keyed by plane identity. */
+    private readonly states = new Map<string, TapState>();
 
     constructor(
-        planeCount = DEFAULT_PLANE_COUNT,
         duration = DEFAULT_DURATION,
         dropDepth = DEFAULT_DROP_DEPTH,
         horizontalOffset = DEFAULT_HORIZONTAL_OFFSET,
@@ -45,79 +48,96 @@ export class PlaneTapAnimator {
         this.dropDepth = dropDepth;
         this.horizontalOffset = horizontalOffset;
         this.bankingOffset = bankingOffset;
-
-        this.timers = new Array(planeCount).fill(0);
-        this.running = new Array(planeCount).fill(false);
-        this.offsetsX = new Array(planeCount).fill(0);
-        this.offsetsY = new Array(planeCount).fill(0);
-        this.offsetsZ = new Array(planeCount).fill(0);
-        this.offsetsBanking = new Array(planeCount).fill(0);
-        this.randomX = new Array(planeCount).fill(0);
-        this.randomY = new Array(planeCount).fill(0);
-        this.randomBanking = new Array(planeCount).fill(0);
     }
 
-    /** Starts the tap animation for the plane with the given draw order index. Does nothing while it is already running. */
-    tap(index: number): void {
-        if (index < 0 || index >= this.timers.length || this.running[index]) {
+    /**
+     * Starts the tap animation for the plane with the given identity key.
+     * Does nothing while that plane's animation is already running.
+     */
+    tap(key: string): void {
+        if (this.states.has(key)) {
             return;
         }
 
-        this.timers[index] = 0;
-        this.running[index] = true;
-        this.randomX[index] = (Math.random() * 2 - 1) * this.horizontalOffset;
-        this.randomY[index] = (Math.random() * 2 - 1) * this.horizontalOffset;
-
         // Random direction, with a visible amount of roll.
         const bankingDirection = Math.random() > 0.5 ? 1 : -1;
-        this.randomBanking[index] = bankingDirection * (0.5 + Math.random() * 0.5) * this.bankingOffset;
+
+        this.states.set(key, {
+            timer: 0,
+            offsetX: 0,
+            offsetY: 0,
+            offsetZ: 0,
+            offsetBanking: 0,
+            randomX: (Math.random() * 2 - 1) * this.horizontalOffset,
+            randomY: (Math.random() * 2 - 1) * this.horizontalOffset,
+            randomBanking: bankingDirection * (0.5 + Math.random() * 0.5) * this.bankingOffset
+        });
+    }
+
+    /**
+     * Drops animations of planes which are not in the given set of keys.
+     *
+     * Called when the formation changes. Animations of planes which are still
+     * part of the formation keep playing, keyed by their identity; animations
+     * of planes which left the formation end immediately and cannot leak onto
+     * another plane.
+     */
+    retain(keys: Iterable<string>): void {
+        const keep = new Set(keys);
+        for (const key of Array.from(this.states.keys())) {
+            if (!keep.has(key)) {
+                this.states.delete(key);
+            }
+        }
+    }
+
+    /** Stops and clears all animations. */
+    clear(): void {
+        this.states.clear();
+    }
+
+    /** Whether the plane with the given key currently plays the tap animation. */
+    isAnimating(key: string): boolean {
+        return this.states.has(key);
     }
 
     /** Advances all running animations by the given number of milliseconds. */
     update(deltaMs: number): void {
-        for (let i = 0; i < this.timers.length; i++) {
-            if (!this.running[i]) {
+        for (const [key, state] of Array.from(this.states.entries())) {
+            state.timer += deltaMs / this.duration;
+            if (state.timer >= 1) {
+                // The animation has fully settled: forget it, offsets read as zero.
+                this.states.delete(key);
                 continue;
             }
 
-            this.timers[i] += deltaMs / this.duration;
-            if (this.timers[i] >= 1) {
-                this.timers[i] = 0;
-                this.running[i] = false;
-                this.offsetsX[i] = 0;
-                this.offsetsY[i] = 0;
-                this.offsetsZ[i] = 0;
-                this.offsetsBanking[i] = 0;
-                continue;
-            }
-
-            const t = this.timers[i];
+            const t = state.timer;
 
             // Fast drop, small wobble, slow return to the original height.
-            this.offsetsZ[i] = easeTapZ(t) * this.dropDepth;
+            state.offsetZ = easeTapZ(t) * this.dropDepth;
 
             // Smooth in-out displacement and roll to the random position and back.
             const horizontalProgress = t < 0.5 ? t * 2 : (1 - t) * 2;
             const horizontalEase = easeInOutSine(horizontalProgress);
-            this.offsetsX[i] = this.randomX[i] * horizontalEase;
-            this.offsetsY[i] = this.randomY[i] * horizontalEase;
-            this.offsetsBanking[i] = this.randomBanking[i] * horizontalEase;
+            state.offsetX = state.randomX * horizontalEase;
+            state.offsetY = state.randomY * horizontalEase;
+            state.offsetBanking = state.randomBanking * horizontalEase;
         }
     }
 
-    getOffsetX(index: number): number {
-        return this.offsetsX[index] ?? 0;
+    getOffsetX(key: string): number {
+        return this.states.get(key)?.offsetX ?? 0;
     }
 
-    getOffsetY(index: number): number {
-        return this.offsetsY[index] ?? 0;
+    getOffsetY(key: string): number {
+        return this.states.get(key)?.offsetY ?? 0;
     }
 
-    getOffsetZ(index: number): number {
-        return this.offsetsZ[index] ?? 0;
+    getOffsetZ(key: string): number {
+        return this.states.get(key)?.offsetZ ?? 0;
     }
 
-    getBankingOffset(index: number): number {
-        return this.offsetsBanking[index] ?? 0;
+    getBankingOffset(key: string): number {
+        return this.states.get(key)?.offsetBanking ?? 0;
     }
 }

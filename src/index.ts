@@ -55,6 +55,13 @@ function initUI(): void {
     setTimeout(() => document.querySelector(".promo")?.classList.remove("transparent"), 4000);
     setTimeout(() => document.querySelector("#toggleFullscreen")?.classList.remove("transparent"), 1800);
 
+    // Expose the renderer for automated browser checks of tap/formation/model
+    // behaviour. Only enabled with `?debug=1` so the normal demo page exposes
+    // nothing extra.
+    if (new URLSearchParams(window.location.search).has("debug")) {
+        (window as unknown as { __planeRenderer?: Renderer }).__planeRenderer = renderer;
+    }
+
     const gui = new GUI();
     const dummyConfig = {
         github: () => window.open("https://github.com/keaukraine/webgl-voxel-airplanes")
@@ -73,7 +80,7 @@ function initUI(): void {
         }
     )
     .name("Formation")
-    .onChange(value => renderer.config.formation = +value);
+    .onChange(value => renderer.setFormation(+value));
 
     gui.add(
         renderer.config,

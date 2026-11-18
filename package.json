@@ -20,13 +20,14 @@
     "@rollup/plugin-json": "^4.0.2",
     "@rollup/plugin-node-resolve": "^7.1.1",
     "@types/dat.gui": "^0.7.7",
-    "@types/node": "^10.11.0",
+    "@types/node": "^20.19.43",
     "http-server": "^14.1.1",
+    "puppeteer-core": "^25.18.1",
     "rimraf": "^3.0.2",
     "rollup": "^2.0.0",
-    "rollup-plugin-terser": "^7.0.2",
     "rollup-plugin-livereload": "^1.0.4",
     "rollup-plugin-serve": "^1.0.1",
+    "rollup-plugin-terser": "^7.0.2",
     "rollup-plugin-typescript2": "^0.26.0",
     "ts-node": "^8.6.2",
     "tslib": "1.11.0",
@@ -35,6 +36,8 @@
   "scripts": {
     "prebuild": "rimraf dist",
     "build": "tsc --module commonjs && rollup -c rollup.config.ts",
+    "test": "rimraf dist-test && tsc -p tsconfig.test.json && node --test \"dist-test/tests/*.test.js\"",
+    "test:browser": "node tests/browser/check.js",
     "server": "http-server -c-1",
     "start": "rollup -c rollup.serve.config.ts -w"
   }

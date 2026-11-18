@@ -1,5 +1,5 @@
 import { BaseRenderer, FullModel, UncompressedTextureLoader, DiffuseShader, CombinedAnimation, TextureUtils, FrameBuffer } from "webgl-framework";
-import { mat4, vec3 } from "gl-matrix";
+import { mat4, vec3, vec4 } from "gl-matrix";
 import { CameraMode } from "./CameraMode";
 import { DiffuseScrollingShader } from "./shaders/DiffuseScrollingShader";
 import { PlaneBodyLitShader } from "./shaders/PlaneBodyLitShader";
@@ -8,13 +8,14 @@ import { DiffuseScrollingFilteredShader } from "./shaders/DiffuseScrollingFilter
 import { DiffuseScrollingFilteredTransitionShader } from "./shaders/DiffuseScrollingFilteredTransitionShader";
 import { WindStripeShader } from "./shaders/WindStripeShader";
 import { PlaneTapAnimator } from "./PlaneTapAnimator";
-import { distancePointToLine, findLinePlaneIntersectionCoords } from "./MathUtils";
+import { findLinePlaneIntersectionCoords } from "./MathUtils";
+import { Formation, PlaneInstance, getFormationPlanes as getFormationPlanesFor } from "./Formations";
+import { PlaneModel } from "./PlaneModel";
+import { PlaneModelCache } from "./PlaneModelCache";
+import { findTappedPlane } from "./TapHit";
 
 const FOV_LANDSCAPE = 25.0;
 const FOV_PORTRAIT = 35.0;
-
-/** Maximum number of planes drawn at once: the center plane plus up to four formation planes. */
-const MAX_FORMATION_PLANES = 5;
 
 enum PlaneState {
     NORMAL,
@@ -27,51 +28,11 @@ enum TerrainState {
     TRANSITION
 }
 
-enum Formation {
-    Single,
-    Triangle,
-    LargeTriangle,
-    Diamond,
-    Cross,
-    Line
-}
-
 interface PlanePreset {
     name: string;
     banking: number;
     props: number[][];
-    modelBody?: FullModel;
-    modelGlass?: FullModel;
 }
-
-interface PlaneInstance {
-    offset: [number, number, number];
-    timersOffset: number;
-    propTimerOffset: number;
-}
-
-const PLANE_CENTER: PlaneInstance = { offset: [0, 0, 0], timersOffset: 0, propTimerOffset: 0 };
-const PLANE_TRIANGLE_1: PlaneInstance = { offset: [90, -90, 0], timersOffset: 0.1, propTimerOffset: 0.1 };
-const PLANE_TRIANGLE_2: PlaneInstance = { offset: [-90, -90, 0], timersOffset: 0.2, propTimerOffset: 0.3 };
-const PLANE_LARGE_TRIANGLE_1: PlaneInstance = { offset: [180, -180, 0], timersOffset: 0.1, propTimerOffset: 0.1 };
-const PLANE_LARGE_TRIANGLE_2: PlaneInstance = { offset: [-180, -180, 0], timersOffset: 0.2, propTimerOffset: 0.3 };
-const PLANE_CROSS_1: PlaneInstance = { offset: [110, -110, 0], timersOffset: 0.1, propTimerOffset: 0.1 };
-const PLANE_CROSS_2: PlaneInstance = { offset: [-110, -110, 0], timersOffset: 0.2, propTimerOffset: 0.3 };
-const PLANE_CROSS_3: PlaneInstance = { offset: [-110, 110, 0], timersOffset: 0.1, propTimerOffset: 0 };
-const PLANE_CROSS_4: PlaneInstance = { offset: [110, 110, 0], timersOffset: 0.2, propTimerOffset: 0.2 };
-const PLANE_LINE_1: PlaneInstance = { offset: [140, 0, 0], timersOffset: 0.1, propTimerOffset: 0.1 };
-const PLANE_LINE_2: PlaneInstance = { offset: [-140, 0, 0], timersOffset: 0.2, propTimerOffset: 0.3 };
-const PLANE_DIAMOND_3: PlaneInstance = { offset: [0, -190, 0], timersOffset: 0.2, propTimerOffset: 0.2 };
-
-/** Planes drawn for every formation, in draw order. The first plane is always the center one. */
-const FORMATION_PLANES: Record<Formation, PlaneInstance[]> = {
-    [Formation.Single]: [PLANE_CENTER],
-    [Formation.Triangle]: [PLANE_CENTER, PLANE_TRIANGLE_1, PLANE_TRIANGLE_2],
-    [Formation.LargeTriangle]: [PLANE_CENTER, PLANE_LARGE_TRIANGLE_1, PLANE_LARGE_TRIANGLE_2, PLANE_TRIANGLE_1, PLANE_TRIANGLE_2],
-    [Formation.Diamond]: [PLANE_CENTER, PLANE_TRIANGLE_1, PLANE_TRIANGLE_2, PLANE_DIAMOND_3],
-    [Formation.Cross]: [PLANE_CENTER, PLANE_CROSS_1, PLANE_CROSS_2, PLANE_CROSS_3, PLANE_CROSS_4],
-    [Formation.Line]: [PLANE_CENTER, PLANE_LINE_1, PLANE_LINE_2],
-};
 
 export class Renderer extends BaseRenderer {
     private lastTime = 0;
@@ -80,8 +41,8 @@ export class Renderer extends BaseRenderer {
 
     private fmQuad = new FullModel();
     private fmCloud = new FullModel();
-    private fmPlaneBody = new FullModel();
-    private fmPlaneGlass = new FullModel();
+    private fmPlaneBody: PlaneModel | undefined;
+    private fmPlaneGlass: PlaneModel | undefined;
     private fmProp = new FullModel();
 
     private textureTerrain: WebGLTexture | undefined;
@@ -146,7 +107,14 @@ export class Renderer extends BaseRenderer {
     protected tmpPosition2: [number, number, number] = [0, 0, 0];
     protected tmpPosition3: [number, number, number] = [0, 0, 0];
 
-    private planeTapAnimator = new PlaneTapAnimator(MAX_FORMATION_PLANES);
+    private planeTapAnimator = new PlaneTapAnimator();
+
+    /**
+     * Models of plane presets keyed by preset index. The preset in use keeps
+     * its models resident; models of the preset which was replaced are
+     * disposed so their WebGL buffers are freed.
+     */
+    private planeModelCache = new PlaneModelCache();
 
     /** Distance from the tap ray to a plane center that still counts as a hit. */
     private readonly TAP_HIT_RADIUS = 35;
@@ -173,6 +141,25 @@ export class Renderer extends BaseRenderer {
         currentTerrain: 0,
         formation: Formation.Triangle
     };
+
+    /**
+     * Switches the active formation.
+     *
+     * Tap animations are keyed by plane identity: planes which remain part of
+     * the new formation keep playing their animation, while animations of
+     * planes which are no longer drawn end immediately instead of being shown
+     * on whichever plane now occupies their draw index.
+     */
+    setFormation(formation: Formation): void {
+        if (formation === this.config.formation) {
+            return;
+        }
+
+        this.config.formation = formation;
+
+        const planes = this.getFormationPlanes(formation);
+        this.planeTapAnimator.retain(planes.map(plane => plane.id));
+    }
 
     private readyCallback: (() => void) | undefined;
 
@@ -322,10 +309,16 @@ export class Renderer extends BaseRenderer {
         await Promise.all([
             this.fmQuad.load("data/models/quad", this.gl),
             this.fmCloud.load("data/models/cloud", this.gl),
-            this.fmPlaneBody.load(`data/models/${plane.name}-plane`, this.gl),
-            this.fmPlaneGlass.load(`data/models/${plane.name}-glass`, this.gl),
             this.fmProp.load("data/models/prop", this.gl),
         ]);
+
+        const models = await this.planeModelCache.acquire(
+            this.gl,
+            this.config.currentPlane,
+            (model, kind) => model.load(`data/models/${plane.name}-${kind}`, this.gl)
+        );
+        this.fmPlaneBody = models.body;
+        this.fmPlaneGlass = models.glass;
 
         [
             this.textureTerrain,
@@ -360,30 +353,46 @@ export class Renderer extends BaseRenderer {
         }
 
         const newPreset = preset ?? (this.config.currentPlane + 1) % this.planePresets.length;
+        if (newPreset === this.config.currentPlane) {
+            return;
+        }
         const plane = this.planePresets[newPreset];
 
         this.setPlaneState(PlaneState.FLY_AWAY);
 
-        const fmNewBody = plane.modelBody ?? new FullModel();
-        const fmNewGlass = plane.modelGlass ?? new FullModel();
+        // Tap animations belong to the outgoing plane models; do not let them
+        // run into the newly loaded models.
+        this.planeTapAnimator.clear();
 
-        const promises = [new Promise<void>((resolve) => setTimeout(resolve, this.PLANE_TRANSITION_PERIOD))];
+        const acquisition = this.planeModelCache.acquire(
+            this.gl,
+            newPreset,
+            (model, kind) => model.load(`data/models/${plane.name}-${kind}`, this.gl)
+        );
 
-        if (plane.modelBody === undefined && plane.modelGlass === undefined) {
-            promises.push(
-                fmNewBody.load(`data/models/${plane.name}-plane`, this.gl),
-                fmNewGlass.load(`data/models/${plane.name}-glass`, this.gl)
-            );
+        let models;
+        try {
+            await Promise.all([
+                new Promise<void>((resolve) => setTimeout(resolve, this.PLANE_TRANSITION_PERIOD)),
+                acquisition
+            ]);
+            models = await acquisition;
+        } catch (error) {
+            // Loading failed: keep the outgoing model, restore the previous
+            // state and re-enable taps instead of leaving the scene stuck.
+            console.error(`Failed to load plane preset ${newPreset}`, error);
+            this.setPlaneState(PlaneState.FLY_IN);
+            return;
         }
 
-        await Promise.all(promises);
-
-        plane.modelBody = fmNewBody;
-        plane.modelGlass = fmNewGlass;
-        this.fmPlaneBody = fmNewBody;
-        this.fmPlaneGlass = fmNewGlass;
+        this.fmPlaneBody = models.body;
+        this.fmPlaneGlass = models.glass;
 
         this.config.currentPlane = newPreset;
+
+        // The replacement is in place: release the outgoing plane's GPU
+        // resources. The new preset stays resident.
+        this.planeModelCache.releaseAllExcept(this.gl, newPreset);
 
         this.setPlaneState(PlaneState.FLY_IN);
     }
@@ -581,14 +590,14 @@ export class Renderer extends BaseRenderer {
 
     private drawPlanes(formation: Formation): void {
         const planes = this.getFormationPlanes(formation);
-        for (let i = 0; i < planes.length; i++) {
-            this.drawPlane(planes[i], i);
+        for (const plane of planes) {
+            this.drawPlane(plane);
         }
     }
 
     /** Returns the planes of the given formation in draw order. The first plane is always the center one. */
-    private getFormationPlanes(formation: Formation): PlaneInstance[] {
-        return FORMATION_PLANES[formation];
+    private getFormationPlanes(formation: Formation): readonly PlaneInstance[] {
+        return getFormationPlanesFor(formation);
     }
 
     /** Calculates the plane's current world position, including its idle movement. Z already includes the plane height. */
@@ -603,23 +612,43 @@ export class Renderer extends BaseRenderer {
         ];
     }
 
-    private drawPlane(plane: PlaneInstance, index: number): void {
+    /**
+     * Calculates the position the plane is actually drawn at: its idle position
+     * plus its tap animation offsets, if any. Used for hit testing and for the
+     * debug screen positions, so both agree with what the user sees.
+     */
+    private getDrawnPlanePosition(plane: PlaneInstance): [number, number, number] {
+        const position = this.getPlanePosition(plane);
+        return [
+            position[0] + this.planeTapAnimator.getOffsetX(plane.id),
+            position[1] + this.planeTapAnimator.getOffsetY(plane.id),
+            position[2] + this.planeTapAnimator.getOffsetZ(plane.id)
+        ];
+    }
+
+    private drawPlane(plane: PlaneInstance): void {
         if (this.shaderPlaneBody === undefined || this.shaderGlass === undefined) {
             return;
         }
+        if (this.fmPlaneBody === undefined || this.fmPlaneGlass === undefined) {
+            return;
+        }
+
+        const planeBody = this.fmPlaneBody;
+        const planeGlass = this.fmPlaneGlass;
 
         const preset = this.planePresets[this.config.currentPlane];
 
         const timeGlass = (this.timerGlass + plane.timersOffset) % 1.0;
         const timeGlass2 = (this.timerGlass2 + plane.timersOffset) % 1.0;
 
-        const position = this.getPlanePosition(plane);
-        let x = position[0] + this.planeTapAnimator.getOffsetX(index);
-        let y = position[1] + this.planeTapAnimator.getOffsetY(index);
-        let z = position[2] + this.planeTapAnimator.getOffsetZ(index);
+        const [x0, y0, z0] = this.getDrawnPlanePosition(plane);
+        let x = x0;
+        let y = y0;
+        let z = z0;
 
         let banking = this.getGroundSideMovementCoefficient() * this.config.planeBanking * preset.banking;
-        banking += this.planeTapAnimator.getBankingOffset(index);
+        banking += this.planeTapAnimator.getBankingOffset(plane.id);
 
         if (this.statePlane === PlaneState.FLY_AWAY) {
             const c1 = Math.pow(this.timerPlaneTransition, 1.5);
@@ -662,7 +691,7 @@ export class Renderer extends BaseRenderer {
 
         this.shaderGlass.drawModel(
             this,
-            this.fmPlaneGlass,
+            planeGlass,
             x, y, z,
             0, banking, 0,
             1, 1, 1
@@ -684,7 +713,7 @@ export class Renderer extends BaseRenderer {
 
         this.shaderPlaneBody.drawModel(
             this,
-            this.fmPlaneBody,
+            planeBody,
             x, y, z,
             0, banking, 0,
             1, 1, 1
@@ -693,7 +722,6 @@ export class Renderer extends BaseRenderer {
 
     /** Handles a tap at the given client coordinates. */
     private handleTap(clientX: number, clientY: number): void {
-console.log(`Tap at ${clientX}, ${clientY}`);
         if (this.statePlane !== PlaneState.NORMAL) {
             return;
         }
@@ -703,39 +731,23 @@ console.log(`Tap at ${clientX}, ${clientY}`);
             return;
         }
 
-        const cameraX = this.vecTapCamera[0];
-        const cameraY = this.vecTapCamera[1];
-        const cameraZ = this.vecTapCamera[2];
-        const forwardX = this.vecTapFar[0] - cameraX;
-        const forwardY = this.vecTapFar[1] - cameraY;
-        const forwardZ = this.vecTapFar[2] - cameraZ;
+        const camera: [number, number, number] = [this.vecTapCamera[0], this.vecTapCamera[1], this.vecTapCamera[2]];
+        const forward: [number, number, number] = [
+            this.vecTapFar[0] - camera[0],
+            this.vecTapFar[1] - camera[1],
+            this.vecTapFar[2] - camera[2]
+        ];
+        const groundPoint: [number, number, number] = [ground[0], ground[1], ground[2]];
 
+        // Resolve the hit against the formation which is currently drawn, using
+        // the same plane instances that are drawn, and key the animation by the
+        // hit plane's identity rather than by its draw order index.
         const planes = this.getFormationPlanes(this.config.formation);
-        let hitIndex = -1;
-        let hitDistance = this.TAP_HIT_RADIUS;
+        const positions = planes.map(plane => this.getDrawnPlanePosition(plane));
+        const hitPlane = findTappedPlane(planes, positions, camera, forward, groundPoint, this.TAP_HIT_RADIUS);
 
-        for (let i = 0; i < planes.length; i++) {
-            const [planeX, planeY, planeZ] = this.getPlanePosition(planes[i]);
-
-            // Ignore planes behind the camera.
-            if ((planeX - cameraX) * forwardX + (planeY - cameraY) * forwardY + (planeZ - cameraZ) * forwardZ <= 0) {
-                continue;
-            }
-
-            const distance = distancePointToLine(
-                planeX, planeY, planeZ,
-                cameraX, cameraY, cameraZ,
-                ground[0], ground[1], ground[2]
-            );
-
-            if (distance < hitDistance) {
-                hitDistance = distance;
-                hitIndex = i;
-            }
-        }
-
-        if (hitIndex !== -1) {
-            this.planeTapAnimator.tap(hitIndex);
+        if (hitPlane !== null) {
+            this.planeTapAnimator.tap(hitPlane.id);
         }
     }
 
@@ -881,7 +893,113 @@ console.log(`Tap at ${clientX}, ${clientY}`);
         // Do nothing in production build.
     }
 
+    /** Whether taps are currently accepted (false while the plane model is changing). */
+    public get isTapEnabled(): boolean {
+        return this.statePlane === PlaneState.NORMAL;
+    }
+
+    /**
+     * Snapshot of the tap/formation/model state, used by automated browser
+     * checks to observe animation ownership and GPU resource usage without
+     * reaching into private fields.
+     */
+    public getDebugState(): RendererDebugState {
+        const formation = this.config.formation;
+        const planes = this.getFormationPlanes(formation);
+
+        return {
+            formation,
+            currentPlane: this.config.currentPlane,
+            currentPalette: this.config.currentPalette,
+            currentTerrain: this.config.currentTerrain,
+            planeState: PlaneState[this.statePlane],
+            tapEnabled: this.isTapEnabled,
+            formationPlaneIds: planes.map(plane => plane.id),
+            animatedPlaneIds: planes.filter(plane => this.planeTapAnimator.isAnimating(plane.id)).map(plane => plane.id),
+            planeModel: {
+                residentPresets: this.planeModelCache.getResidentPresets(),
+                liveBuffers: PlaneModel.getLiveBufferCount(),
+                createdBuffers: PlaneModel.getCreatedBufferCount()
+            }
+        };
+    }
+
     public set ready(callback: () => void) {
         this.readyCallback = callback;
     }
+
+    /**
+     * Screen coordinates (in client pixels) of the drawn planes' centers,
+     * letting automated browser checks click real planes instead of guessing
+     * coordinates. Planes behind the camera are reported with `visible: false`.
+     */
+    public getPlaneScreenPositions(): PlaneScreenPosition[] {
+        const canvas = this.canvas;
+        if (canvas === undefined) {
+            return [];
+        }
+
+        const rect = canvas.getBoundingClientRect();
+        mat4.multiply(this.matTapViewProjection, this.mProjMatrix, this.mVMatrix);
+        if (mat4.invert(this.matTapViewProjectionInverted, this.matTapViewProjection) === null) {
+            return [];
+        }
+
+        const planes = this.getFormationPlanes(this.config.formation);
+        const result: PlaneScreenPosition[] = [];
+        const clip = vec4.create();
+
+        for (const plane of planes) {
+            const position = this.getDrawnPlanePosition(plane);
+            vec4.set(clip, position[0], position[1], position[2], 1);
+            vec4.transformMat4(clip, clip, this.matTapViewProjection);
+
+            const w = clip[3];
+            const inFrontOfCamera = w > 0;
+            const visible = inFrontOfCamera && clip[2] > -w && clip[2] < w;
+            const ndcX = clip[0] / w;
+            const ndcY = clip[1] / w;
+
+            result.push({
+                id: plane.id,
+                x: rect.left + ((ndcX + 1) / 2) * rect.width,
+                y: rect.top + ((1 - ndcY) / 2) * rect.height,
+                visible
+            });
+        }
+
+        return result;
+    }
+}
+
+/** Screen position of a drawn plane, for automated checks. */
+export interface PlaneScreenPosition {
+    id: string;
+    /** Client-space X coordinate of the plane center. */
+    x: number;
+    /** Client-space Y coordinate of the plane center. */
+    y: number;
+    visible: boolean;
+}
+
+/** Machine-readable state for automated browser checks. */
+export interface RendererDebugState {
+    formation: Formation;
+    currentPlane: number;
+    currentPalette: number;
+    currentTerrain: number;
+    planeState: string;
+    tapEnabled: boolean;
+    /** Plane identities currently drawn, in draw order. */
+    formationPlaneIds: string[];
+    /** Plane identities currently playing a tap animation. */
+    animatedPlaneIds: string[];
+    planeModel: {
+        /** Presets whose models are resident (not disposed). */
+        residentPresets: number[];
+        /** WebGL buffers currently alive for plane models. */
+        liveBuffers: number;
+        /** WebGL buffers created for plane models since page load. */
+        createdBuffers: number;
+    };
 }
