@@ -17,6 +17,41 @@ const symbols = Object.freeze({
 });
 
 /**
+ * Combine an instruction failure with a restore() failure into a single
+ * throwable that preserves both for diagnostic purposes. The original
+ * instruction failure takes precedence: it is the value that gets thrown
+ * whenever it is capable of carrying the restore failure as extra data.
+ *
+ * @param {*} failure - The error thrown while executing an atom.
+ * @param {*} restoreError - The error thrown by context.restore().
+ * @return {*} A throwable preserving both failures.
+ */
+function combineFailures(failure, restoreError) {
+  if (failure !== null
+    && (typeof failure === 'object' || typeof failure === 'function')) {
+    try {
+      Object.defineProperty(failure, 'restoreError', {
+        'value': restoreError,
+        'configurable': true,
+        'writable': true,
+      });
+      return failure;
+    }
+    catch (ignore) {
+      // Fall through to the wrapper below if the original failure is frozen
+      // or otherwise cannot be annotated.
+    }
+  }
+  const combined = new Error(
+    'CanvasSequence execution failed and the canvas state could not be '
+    + 'restored; see the "cause" and "restoreError" properties for details.',
+  );
+  combined.cause = failure;
+  combined.restoreError = restoreError;
+  return combined;
+}
+
+/**
  * A CanvasSequence is a linear collection of CanvasAtoms, capable of being
  * executed on a CanvasRenderingContext2D.
  *
@@ -67,12 +102,45 @@ class CanvasSequence {
   /**
    * Execute the sequence on the given context.
    *
+   * The context state is saved before the first atom runs and restored after
+   * the last one, even if an atom throws, so no state leaks to whatever the
+   * caller draws next. Because save/restore is a stack on the context, each
+   * execution only ever restores the layer it saved itself, which makes
+   * nested and reentrant executions safe. All bookkeeping is kept in local
+   * variables, so executing the same sequence twice (or concurrently, e.g.
+   * nested) behaves identically and never mutates the atoms.
+   *
+   * If an atom throws, the original error is rethrown after the context has
+   * been restored; a failing restore() cannot mask it. If restore() itself
+   * fails, that failure is preserved for diagnosis (thrown directly when
+   * nothing else failed, otherwise attached to the original error as
+   * "restoreError").
+   *
    * @param {CanvasRenderingContext2D} context
    */
   execute(context) {
     context.save();
-    this[symbols.sequence].forEach(a => a.execute(context));
-    context.restore();
+    let failed = false;
+    let failure = undefined;
+    try {
+      this[symbols.sequence].forEach(a => a.execute(context));
+    }
+    catch (e) {
+      failed = true;
+      failure = e;
+    }
+    try {
+      context.restore();
+    }
+    catch (restoreError) {
+      if (failed) {
+        throw combineFailures(failure, restoreError);
+      }
+      throw restoreError;
+    }
+    if (failed) {
+      throw failure;
+    }
   }
 
   /**
