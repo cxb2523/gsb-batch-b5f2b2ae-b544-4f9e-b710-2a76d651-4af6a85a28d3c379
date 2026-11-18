@@ -596,17 +596,18 @@ def generate(job: Job, tp: Toolpaths, g: Grid, paths: list[dict], params: Params
             for ln in txt.rstrip("\n").split("\n"):
                 W.emit(ln)
             W.emit("; FilamentChangeGCodeEnd")
-            W.moves.append((2, slot, W.x or 0, W.y or 0, W.z or 0, W.x or 0, W.y or 0, W.z or 0, tc_line))
+            # where the template actually leaves the nozzle and the filament
+            (end_x, end_y, end_z), tc_retract = toolchange.end_state(txt, (W.x or 0, W.y or 0, W.z or 0))
+            W.moves.append((2, slot, W.x or 0, W.y or 0, W.z or 0, end_x, end_y, end_z, tc_line))
             W.flags.append(0)
             stats["toolchanges"] += 1
             stats["purge_mm3"] += pv
             fvs = job.float_at("filament_max_volumetric_speed", slot, 2.0) or 2.0
             stats["time_s"] += 50.0 + pv / fvs
-            # position after the template: unknown XY near the purge chute, Z at max_layer_z+3
-            W.x, W.y = -13.5, 90.0
-            W.z = max(base_z, max_z_seen) + 3.0
+            W.x, W.y, W.z = end_x, end_y, end_z
             W.f = None
-            retracted = job.float_at("retract_length_toolchange", slot, 2.0) + p.prime
+            # re-prime what the template itself retracted, plus the extra prime
+            retracted = tc_retract + p.prime
             last_line = None
             cur_slot = slot
             fan_cmd(slot)

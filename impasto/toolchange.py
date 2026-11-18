@@ -118,3 +118,59 @@ def render_change(job: Job, old: int, new: int, **kw) -> tuple[str, float]:
     tpl = job.template("change_filament_gcode")
     txt = T.render(tpl, env, current_extruder=new)
     return txt, env["_purge_volume"]
+
+
+def end_state(txt: str, pos: tuple[float, float, float]) -> tuple[tuple[float, float, float], float]:
+    """Where the rendered change template actually leaves the machine.
+
+    Returns the final logical position (x, y, z) and how far the filament is
+    retracted when the template ends (its own re-deract length: how far below
+    the highest extruder position reached inside the template it finishes).
+    G92 only redefines coordinates - it moves neither the nozzle nor the
+    filament, so the physical E position is tracked independently."""
+    x, y, z = pos
+    abs_xyz = True
+    abs_e = False                     # the layer block runs M83 (relative E)
+    e_log = 0.0
+    e_phys = 0.0
+    e_peak = 0.0
+    for raw in txt.split("\n"):
+        ln = raw.split(";", 1)[0].strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        cmd = parts[0].upper()
+        args = {}
+        for word in parts[1:]:
+            c = word[0].upper()
+            if c in "XYZE":
+                try:
+                    args[c] = float(word[1:])
+                except ValueError:
+                    pass
+        if cmd == "G90":
+            abs_xyz, abs_e = True, True
+        elif cmd == "G91":
+            abs_xyz, abs_e = False, False
+        elif cmd == "M82":
+            abs_e = True
+        elif cmd == "M83":
+            abs_e = False
+        elif cmd == "G92":
+            x = args.get("X", x)
+            y = args.get("Y", y)
+            z = args.get("Z", z)
+            e_log = args.get("E", e_log)
+        elif cmd in ("G0", "G1"):
+            if "X" in args:
+                x = args["X"] if abs_xyz else x + args["X"]
+            if "Y" in args:
+                y = args["Y"] if abs_xyz else y + args["Y"]
+            if "Z" in args:
+                z = args["Z"] if abs_xyz else z + args["Z"]
+            if "E" in args:
+                d = (args["E"] - e_log) if abs_e else args["E"]
+                e_log = args["E"] if abs_e else e_log + args["E"]
+                e_phys += d
+                e_peak = max(e_peak, e_phys)
+    return (x, y, z), max(0.0, e_peak - e_phys)
