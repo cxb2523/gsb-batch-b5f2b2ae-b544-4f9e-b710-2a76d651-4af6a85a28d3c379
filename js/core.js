@@ -436,6 +436,13 @@ function core_interval_resume(id){
     if(!interval.paused){
         return;
     }
+    if(core_interval_suspended){
+        if(!core_menu_open
+          && !core_intervals_suspended.includes(id)){
+            core_intervals_suspended.push(id);
+        }
+        return;
+    }
 
     interval.lock = false;
     interval.paused = false;
@@ -465,6 +472,23 @@ function core_interval_resume_all(){
     }
 }
 
+function core_interval_suspend(){
+    if(core_interval_suspended){
+        return;
+    }
+
+    core_interval_suspended = true;
+    core_intervals_suspended = [];
+
+    for(const id in core_intervals){
+        if(!core_intervals[id].paused){
+            core_intervals_suspended.push(id);
+        }
+    }
+
+    core_interval_pause_all();
+}
+
 function core_interval_sync(interval){
     if(interval.paused){
         return;
@@ -477,6 +501,26 @@ function core_interval_sync(interval){
       },
       1000 - new Date().getMilliseconds(),
     );
+}
+
+function core_interval_unsuspend(){
+    const suspended = core_intervals_suspended;
+
+    core_interval_suspended = false;
+    core_intervals_suspended = [];
+
+    if(core_menu_open){
+        return;
+    }
+
+    for(const id of suspended){
+        if(core_intervals[id] === void 0
+          || core_intervals[id].lock){
+            continue;
+        }
+
+        core_interval_resume(id);
+    }
 }
 
 function core_keys_rebind(){
@@ -1227,6 +1271,8 @@ function core_ui_update({
 globalThis.core_elements = {};
 globalThis.core_events = {};
 globalThis.core_intervals = {};
+globalThis.core_intervals_suspended = [];
+globalThis.core_interval_suspended = false;
 globalThis.core_key_rebinds = {};
 globalThis.core_key_shift = false;
 globalThis.core_keys = {};
