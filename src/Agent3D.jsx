@@ -3,11 +3,20 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
 } from 'react';
 
 const DEFAULT_BASE_URL = 'https://three.ws';
+
+// Layout timing in the browser (the latch resets before any message can be
+// dispatched), plain passive effect on the server so SSR renders stay
+// warning-free.
+const useIsomorphicLayoutEffect =
+  typeof window !== 'undefined' && typeof window.document !== 'undefined'
+    ? useLayoutEffect
+    : useEffect;
 
 /** Coerce a width/height prop (number → px, string passed through). */
 function toCssSize(value) {
@@ -100,6 +109,9 @@ const Agent3D = forwardRef(function Agent3D(
 
   const post = useCallback(
     (msg) => {
+      // `post` only ever targets the live iframe element; a reloaded frame has
+      // replaced the element (see key={src}), so a message can never reach an
+      // unloaded window.
       iframeRef.current?.contentWindow?.postMessage(msg, targetOrigin);
     },
     [targetOrigin],
@@ -123,25 +135,45 @@ const Agent3D = forwardRef(function Agent3D(
     [post],
   );
 
-  // Latest-callback refs so the message listener never goes stale and we don't
-  // re-bind it on every render.
+  // Latest-prop refs so the message listener is bound once and never goes
+  // stale; re-renders that don't change the embed URL therefore don't re-bind
+  // anything or reload the iframe.
   const onLoadRef = useRef(onLoad);
   const onErrorRef = useRef(onError);
+  const speedRef = useRef(speed);
   onLoadRef.current = onLoad;
   onErrorRef.current = onError;
+  speedRef.current = speed;
+
+  // One readiness latch per loaded frame. Resetting it in a layout effect
+  // (before any message can be delivered) guarantees onLoad fires at most
+  // once for the current scene, including the very first mount.
+  const readyRef = useRef(false);
+  useIsomorphicLayoutEffect(() => {
+    readyRef.current = false;
+  }, [src]);
 
   useEffect(() => {
     function handleMessage(event) {
-      // Strictly reject any origin that isn't the embed origin (XSS guard), and
-      // ignore messages that didn't come from our own iframe.
+      // Strictly reject any origin that isn't the embed origin (XSS guard).
       if (event.origin !== targetOrigin) return;
-      if (iframeRef.current && event.source !== iframeRef.current.contentWindow) return;
+      // Only accept messages from the CURRENT iframe's window. A new embed src
+      // remounts the iframe (key={src}), so an unloaded frame's window can
+      // never match this reference — its late walk:ready/walk:error messages
+      // are dropped here instead of firing callbacks for a stale scene.
+      const currentWindow = iframeRef.current?.contentWindow;
+      if (!currentWindow || event.source !== currentWindow) return;
 
       const data = event.data;
       if (!data || typeof data !== 'object') return;
 
       if (data.type === 'walk:ready') {
-        if (typeof speed === 'number') post({ type: 'walk:config', speed });
+        // Duplicate ready messages from the same live frame are ignored.
+        if (readyRef.current) return;
+        readyRef.current = true;
+        if (typeof speedRef.current === 'number') {
+          currentWindow.postMessage({ type: 'walk:config', speed: speedRef.current }, targetOrigin);
+        }
         onLoadRef.current?.();
       } else if (data.type === 'walk:error') {
         onErrorRef.current?.(new Error(data.error || 'three.ws embed failed to load'));
@@ -150,7 +182,7 @@ const Agent3D = forwardRef(function Agent3D(
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [targetOrigin, speed, post]);
+  }, [targetOrigin]);
 
   const wrapperStyle = {
     position: 'relative',
@@ -162,6 +194,10 @@ const Agent3D = forwardRef(function Agent3D(
   return (
     <div className={className} style={wrapperStyle} {...rest}>
       <iframe
+        // Remount (not mutate) whenever the embed address changes: each scene
+        // gets a fresh element/window, making old vs. current frames
+        // distinguishable by object identity inside the message handler.
+        key={src}
         ref={iframeRef}
         src={src}
         title={title}
