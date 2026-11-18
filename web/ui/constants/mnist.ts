@@ -1,5 +1,5 @@
-import { TENSOR_DEFAULT_GRAY_VALUE } from "@constants/graphics"
-import type { InferenceResponse, OutputNode } from "bridge"
+import { TENSOR_DEFAULT_GRAY_VALUE } from "./graphics"
+import type { InferenceResponse, OutputNode } from "../types/bridge.types"
 
 export const MODEL_URL = "/mnist-12.onnx"
 export const INPUT_TENSOR_DIMENSION = [1, 1, 28, 28]
@@ -17,28 +17,40 @@ const ORDERED_NODE_DIMENSIONS = [
   [1, 16, 4, 4],
 ]
 
-export const ACTIVATION_MAPS_DEFAULT_VALUE: InferenceResponse = {
-  isSuccessful: true,
-  orderedOutputNodes: (() => {
-    const orderedOutputNodes: OutputNode[] = []
+/**
+ * Builds a fresh default inference response.
+ *
+ * A factory (rather than a shared object) is used whenever the UI is reset so
+ * that a cleared canvas never aliases buffers that a previous response (or a
+ * consumer) could still be holding on to.
+ */
+export function createDefaultInferenceResponse(): InferenceResponse {
+  const orderedOutputNodes: OutputNode[] = []
 
-    for (let i = 0; i < ORDERED_NODE_NAMES.length; i += 1) {
-      const tensorDimension = ORDERED_NODE_DIMENSIONS[i]
-      const activationMapLength =
-        tensorDimension[1] * tensorDimension[2] * tensorDimension[3]
+  for (let i = 0; i < ORDERED_NODE_NAMES.length; i += 1) {
+    const tensorDimension = ORDERED_NODE_DIMENSIONS[i]
+    const activationMapLength =
+      tensorDimension[1] * tensorDimension[2] * tensorDimension[3]
 
-      orderedOutputNodes.push({
-        dimension: tensorDimension,
-        activationMaps: new Float32Array(activationMapLength).fill(
-          TENSOR_DEFAULT_GRAY_VALUE,
-        ),
-      })
-    }
+    orderedOutputNodes.push({
+      dimension: tensorDimension,
+      activationMaps: new Float32Array(activationMapLength).fill(
+        TENSOR_DEFAULT_GRAY_VALUE,
+      ),
+    })
+  }
 
-    return orderedOutputNodes
-  })(),
-  predictions: new Float32Array(10).fill(0.1), // Probability of 1 distributed equally among 10 possibilities
+  return {
+    action: "run",
+    isSuccessful: true,
+    requestId: 0,
+    orderedOutputNodes,
+    predictions: new Float32Array(10).fill(0.1), // Probability of 1 distributed equally among 10 possibilities
+  }
 }
+
+export const ACTIVATION_MAPS_DEFAULT_VALUE: InferenceResponse =
+  createDefaultInferenceResponse()
 
 export const INPUT_TENSOR_DEFAULT_VALUE = (() => {
   const newTensor = new Float32Array(

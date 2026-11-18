@@ -26,7 +26,8 @@
       "@components/*": ["ui/components/*"],
       "@utils/*": ["ui/utils/*"],
       "@sharedstate/*": ["ui/sharedstate/*"],
-      "@constants/*": ["ui/constants/*"]
+      "@constants/*": ["ui/constants/*"],
+      "@ui/*": ["ui/*"]
     }
   },
   "include": ["web/**/*.ts", "web/**/*.js", "web/**/*.svelte"]

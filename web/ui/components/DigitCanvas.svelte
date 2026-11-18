@@ -21,13 +21,12 @@
     TENSOR_DEFAULT_GRAY_VALUE,
   } from "@constants/graphics"
   import {
-    ACTIVATION_MAPS_DEFAULT_VALUE,
     FINAL_NODE,
     INPUT_TENSOR_DEFAULT_VALUE,
     INPUT_TENSOR_DIMENSION,
     ORDERED_NODE_NAMES,
   } from "@constants/mnist"
-  import { setInferenceResponse } from "@sharedstate/inference.svelte"
+  import { resetInference } from "@sharedstate/inference.svelte"
   import { isDesktop } from "@sharedstate/mediaquery.svelte"
   import { centerCrop, getCoordinates, getMidpoint } from "@utils/drawing"
   import { runModel } from "bridge"
@@ -58,6 +57,7 @@
   let isUIVisible = true
   let strokes: any = []
   let lastTime = performance.now()
+  let pendingFrame: number | null = null
 
   function preProcess(): {
     inputTensorData: Float32Array
@@ -111,6 +111,13 @@
   }
 
   function clear() {
+    // Stop any queued sampling frame so it cannot submit a fresh inference for
+    // the now-empty canvas after the reset below.
+    if (pendingFrame !== null) {
+      cancelAnimationFrame(pendingFrame)
+      pendingFrame = null
+    }
+
     ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height)
     ctxCenterCrop.clearRect(
       0,
@@ -119,8 +126,11 @@
       ctxCenterCrop.canvas.height,
     )
     ctxScaled.clearRect(0, 0, ctxScaled.canvas.width, ctxScaled.canvas.height)
-    inputTensorData = INPUT_TENSOR_DEFAULT_VALUE
-    setInferenceResponse(ACTIVATION_MAPS_DEFAULT_VALUE)
+
+    // Invalidate every in-flight inference and restore default input,
+    // activation maps and predictions synchronously.
+    resetInference()
+    inputTensorData = new Float32Array(INPUT_TENSOR_DEFAULT_VALUE)
     strokes = []
   }
 
@@ -182,19 +192,23 @@
     }
   }
 
-  function handleMouseMove(e: any) {
-    if (!isDrawing) {
-      return
-    }
-
-    draw(e)
-
-    requestAnimationFrame(function (timestamp: DOMHighResTimeStamp) {
+  function sampleAndRunInference() {
+    pendingFrame = requestAnimationFrame(function (timestamp: DOMHighResTimeStamp) {
       if (timestamp - lastTime < CANVAS_TICK) {
+        // Not time to sample yet. Keep a single frame queued so the final
+        // stroke is still sampled once the tick elapses, even if the pointer
+        // stops moving right now.
+        sampleAndRunInference()
         return
       }
 
+      pendingFrame = null
       lastTime = timestamp
+
+      // Nothing drawn (e.g. the canvas was just cleared) => nothing to infer.
+      if (strokes.length === 0) {
+        return
+      }
 
       const preProcessResult = preProcess()
 
@@ -209,6 +223,22 @@
     })
   }
 
+  function handleMouseMove(e: any) {
+    if (!isDrawing) {
+      return
+    }
+
+    draw(e)
+
+    // Coalesce mouse moves: one sampling frame in flight at a time. This keeps
+    // the sampling rhythm unchanged while letting clear() cancel it.
+    if (pendingFrame !== null) {
+      return
+    }
+
+    sampleAndRunInference()
+  }
+
   function handleMouseDown() {
     showHint = false
   }
@@ -217,6 +247,13 @@
     ctx = canvas.getContext("2d", { willReadFrequently: true })!
     ctxCenterCrop = canvasCenterCrop.getContext("2d")!
     ctxScaled = canvasScaled.getContext("2d", { willReadFrequently: true })!
+
+    return () => {
+      if (pendingFrame !== null) {
+        cancelAnimationFrame(pendingFrame)
+        pendingFrame = null
+      }
+    }
   })
 </script>
 
