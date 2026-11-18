@@ -1,0 +1,15 @@
+{
+  "name": "animeprogram",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "workspaces": ["server", "web"],
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "setup:jmdict": "npm run setup-jmdict -w server --",
+    "verify:start": "node scripts/verify-start.mjs",
+    "test": "npm test -w server && npm test -w web"
+  }
+}

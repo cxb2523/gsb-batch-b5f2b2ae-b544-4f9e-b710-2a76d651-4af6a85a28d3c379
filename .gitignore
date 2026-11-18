@@ -1,0 +1,9 @@
+node_modules/
+dist/
+server/data/
+server/vendor/
+*.log
+.DS_Store
+
+# 一時ファイル
+*.tmp
