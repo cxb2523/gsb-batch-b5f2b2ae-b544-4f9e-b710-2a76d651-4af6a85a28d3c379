@@ -42,10 +42,13 @@ export type {
  * @param options  Optional user-supplied event handlers.
  * @param sourceKey  Identity key for the current source (e.g. from
  *   `sourceIdentityKey`). When this changes, the hook resets `state` and
- *   `progress` to defaults — this prevents stale VOD state (videoId,
- *   duration, progress, playback state) from lingering after a VOD → live
- *   transition or a source change. Pass `undefined` to opt out of resets
- *   (legacy behaviour).
+ *   `progress` to defaults and mints a new event-ownership token — this
+ *   prevents stale VOD state (videoId, duration, progress, playback state)
+ *   from lingering after a VOD → live transition or a source change, and
+ *   drops late events (including `onProgress`) still emitted by the
+ *   previous native instance so they never reach the new source's state or
+ *   the user callbacks. Pass `undefined` to opt out of resets (legacy
+ *   behaviour).
  */
 export function useBunnyStreamPlayer(
   options?: UseBunnyStreamPlayerOptions,
@@ -56,22 +59,25 @@ export function useBunnyStreamPlayer(
   const [state, dispatch] = React.useReducer(playerReducer, DEFAULT_PLAYER_STATE);
   const [progress, setProgress] = React.useState<PlayerProgress>(DEFAULT_PROGRESS);
 
-  // Reset state + progress when the source identity changes. This clears
-  // stale VOD state (videoId, duration, progress, playback state) when
-  // switching to live (which doesn't emit onReady) or between VOD sources.
-  // Uses a ref to track the previous key so the reset only fires on actual
-  // changes, not on every render.
-  const prevSourceKey = React.useRef<string | number | undefined>(sourceKey);
-  React.useEffect(() => {
-    if (prevSourceKey.current !== sourceKey) {
-      prevSourceKey.current = sourceKey;
-      // Reset state + progress to defaults so stale VOD state (videoId,
-      // duration, progress, playback state) doesn't linger after a source
-      // change (e.g. VOD → live, which doesn't emit onReady).
-      dispatch({ type: 'RESET' });
-      setProgress(DEFAULT_PROGRESS);
-    }
-  }, [sourceKey]);
+  // Ownership token binding the event handlers to the current source
+  // identity. Each source change mints a fresh token; handlers created for
+  // a previous token (still held by the torn-down native instance) drop
+  // their events instead of writing stale state.
+  const ownershipRef = React.useRef<object>({});
+  const [prevSourceKey, setPrevSourceKey] = React.useState<string | number | undefined>(sourceKey);
+  if (prevSourceKey !== sourceKey) {
+    // Render-phase adjustment (React's endorsed "adjust state when props
+    // change" pattern): reset state + progress and mint the new ownership
+    // token BEFORE children render and effects fire. This guarantees that
+    // (a) late events from the previous native instance are dropped, and
+    // (b) a configuration error reported by the child player's mount effect
+    // lands AFTER the reset, so it isn't wiped back to isLoading=true.
+    setPrevSourceKey(sourceKey);
+    ownershipRef.current = {};
+    dispatch({ type: 'RESET' });
+    setProgress(DEFAULT_PROGRESS);
+  }
+  const ownership = ownershipRef.current;
 
   // Store user handlers in a ref so the memoised event handlers below have a
   // stable identity even when the user passes inline callbacks.
@@ -97,9 +103,13 @@ export function useBunnyStreamPlayer(
     [],
   );
 
+  // Handlers are re-minted per ownership token: stable across re-renders of
+  // the same source, but a source change gives the new native instance a
+  // fresh set whose token is current — the old set (held by the unmounted
+  // native instance) drops any late events it still receives.
   const eventHandlers = React.useMemo<PlayerEventHandlers>(
-    () => createPlayerEventHandlers(dispatch, setProgress, optionsRef),
-    [],
+    () => createPlayerEventHandlers(dispatch, setProgress, optionsRef, ownershipRef, ownership),
+    [ownership],
   );
 
   return { ref, state, progress, controls, eventHandlers };
