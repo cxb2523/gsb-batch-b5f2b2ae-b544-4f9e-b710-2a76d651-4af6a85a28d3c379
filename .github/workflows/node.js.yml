@@ -1,0 +1,168 @@
+name: Node.js CI
+
+permissions:
+  contents: read
+  issues: write
+
+on:
+  push:
+    branches: ["main", "AudioEngine"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  format-check-on-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+
+      - name: Check Prettier (list different)
+        id: prettier
+        shell: bash
+        run: |
+          set -e
+          OUTPUT="$(npx prettier --ignore-path .gitignore -l .)"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          if [ -n "$OUTPUT" ]; then
+            echo "has_issues=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_issues=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on PR with Prettier results
+        if: steps.prettier.outputs.has_issues == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const files = `${{ steps.prettier.outputs.files }}`.trim();
+            const marker = '<!-- prettier-format-report -->';
+            const body = [
+              marker,
+              'Some files are not formatted by Prettier:',
+              '',
+              '```',
+              files,
+              '```',
+              '',
+              'Run the following to fix formatting:',
+              '',
+              '```sh',
+              'npm run format',
+              '```'
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const list = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = list.data.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail if formatting issues found
+        if: steps.prettier.outputs.has_issues == 'true'
+        run: |
+          echo "Formatting issues detected. Please run 'npm run format'." >&2
+          exit 1
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key:
+            npm-${{ runner.os }}-${{ hashFiles('core/package.json', 'plugins/package.json', 'extension/package.json',
+            'package.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Bootstrap core package
+        run: |
+          # package-lock.json is ignored and no lockfiles are committed for these packages.
+          # core/package.json overrides prism-media's opusscript peer so install has no ERESOLVE.
+          npm -C core install --package-lock=false --no-audit --no-fund
+          npm -C core run build
+
+      - name: Bootstrap plugins package
+        run: |
+          npm -C plugins install --package-lock=false --no-audit --no-fund
+          npm -C plugins run build
+
+      - name: Bootstrap extension package
+        run: |
+          npm -C extension install --package-lock=false --no-audit --no-fund
+          npm -C extension run build
+
+      - name: Bootstrap root package
+        run: npm install --no-save --package-lock=false --no-audit --no-fund ./core
+
+      - name: Run tests
+        id: tests
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee test_output.txt
+          code=${PIPESTATUS[0]}
+          summary=$(grep '^# ' test_output.txt | sed 's/^# //')
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$summary" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          if [ $code -ne 0 ]; then
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "status=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment test results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const marker = '<!-- test-report -->';
+            const status = `${{ steps.tests.outputs.status }}` || 'unknown';
+            const summaryRaw = `${{ steps.tests.outputs.summary }}` || '';
+            const summary = summaryRaw.trim();
+            const icon = status === 'passed' ? ':white_check_mark:' : (status === 'failed' ? ':x:' : ':information_source:');
+            const body = [
+              marker,
+              `Unit Test Results ${icon}`,
+              '',
+              '```',
+              summary || 'No summary captured',
+              '```',
+              '',
+              '_Node.js 22.x_'
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const list = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = list.data.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

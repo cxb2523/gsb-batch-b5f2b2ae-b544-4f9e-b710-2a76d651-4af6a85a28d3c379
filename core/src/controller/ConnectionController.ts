@@ -1,0 +1,525 @@
+import {
+	VoiceConnection,
+	VoiceConnectionStatus,
+	entersState,
+	joinVoiceChannel,
+	getVoiceConnection,
+	type AudioPlayer,
+	type PlayerSubscription,
+} from "@discordjs/voice";
+import type { VoiceChannel, PlayerConnectionInput, ConnectionControllerOptions, WebAudioSubscriberInfo } from "../types";
+import { Bus, createPlayerSessionId, type PlayerRequestId, type PlayerSessionId } from "../structures/Bus";
+import { playerDataMap } from "../structures/PlayerDataRegistry";
+import { BUS_OUTPUT, BUS_REQUEST, PLAYER_QUERY, PLAYER_RPC, traceBusSignal } from "../structures/BusContract";
+import type { WebAudioConnection } from "../output/WebAudioConnection";
+import { toError } from "../utils/errors";
+import type { DebugLogger } from "../types";
+
+interface ConnectionSlot {
+	group?: string;
+	selfDeaf: boolean;
+	selfMute: boolean;
+	debug?: DebugLogger;
+	readyTimeoutMs: number;
+	connection: VoiceConnection | null;
+	channel: VoiceChannel | null;
+	sessionId: PlayerSessionId | null;
+	requestId: PlayerRequestId | null;
+	audioPlayer: AudioPlayer | null;
+	subscription: PlayerSubscription | null;
+	webAudioOutputs: Map<string, { connection: WebAudioConnection; name: string }>;
+	disposed: boolean;
+	operation: Promise<void>;
+}
+
+/**
+ * Owns Discord voice connection state and lifecycle behind the Bus.
+ *
+ * Singleton — created exactly once in `ensureSharedControllers()` and shared by every
+ * player in the process (see `SharedControllerGraph`). A Discord voice connection is
+ * inherently per-guild (one `VoiceConnection`/`AudioPlayer` can only ever serve one
+ * guild), so that per-guild resource still exists once per player — it lives in the
+ * player.data under this controller's namespace (via
+ * `attach(playerId, ...)`/`detach(playerId)`) instead of a whole separate
+ * `ConnectionController` instance. `connection.setAudioPlayer`/`connection`/
+ * `connection.state` and the three `onInput` listeners below are registered exactly
+ * once for the whole process and route by `playerId`/`event.playerId` — this also fixes
+ * a latent bug in the old one-instance-per-player design, where `Bus.onInput()`
+ * dispatch is global/flat (broadcast to every listener) and the old handlers didn't
+ * filter by `event.playerId`, so every guild's `ConnectionController` instance used to
+ * run `connect()`/`disconnect()`/`reconnect()` for every OTHER guild's request too.
+ */
+export class ConnectionController {
+	private readonly bus?: Bus;
+	private readonly stateBus: Bus;
+	private get slots(): Map<string, ConnectionSlot> {
+		return playerDataMap(this.stateBus, "controller.connection.slots");
+	}
+	/** Process-wide debug sink (separate from each slot's own `debug` set at `attach()` time). */
+	private readonly debugSink?: (message: string) => void;
+
+	public constructor(bus?: Bus, debugSink?: (message: string) => void) {
+		this.bus = bus;
+		this.stateBus = bus ?? new Bus();
+		this.debugSink = debugSink;
+
+		if (bus) {
+			bus.registerRpc<{ audioPlayer: AudioPlayer | null }, void>(PLAYER_RPC.connectionSetAudioPlayer, ({ audioPlayer }, ctx) =>
+				this.setAudioPlayer(ctx.playerId, audioPlayer),
+			);
+			bus.registerRpc<{ id: string; name: string; connection: WebAudioConnection }, void>(
+				PLAYER_RPC.connectionWebAudioRegister,
+				({ id, name, connection }, ctx) => this.registerWebAudioOutput(ctx.playerId, id, name, connection),
+			);
+			bus.registerRpc<{ id: string }, boolean>(PLAYER_RPC.connectionWebAudioDisconnect, ({ id }, ctx) =>
+				this.disconnectWebAudio(ctx.playerId, id),
+			);
+			bus.registerRpc<void, void>(PLAYER_RPC.connectionWebAudioClear, (_request, ctx) => this.clearWebAudioOutputs(ctx.playerId));
+			bus.registerRpc<void, WebAudioSubscriberInfo[]>(PLAYER_RPC.connectionWebAudioList, (_request, ctx) =>
+				this.getWebAudioSubscribers(ctx.playerId),
+			);
+			bus.registerQuery(PLAYER_QUERY.connection, (playerId) => this.getConnections(playerId));
+			bus.registerQuery(PLAYER_QUERY.voiceConnection, (playerId) => this.slots.get(playerId)?.connection ?? null);
+			bus.registerQuery(PLAYER_QUERY.connectionState, (playerId) => this.slots.get(playerId)?.connection?.state.status);
+			bus.registerQuery(PLAYER_QUERY.hasOutput, (playerId) => this.hasOutput(playerId));
+			bus.onInput(BUS_REQUEST.connectionConnect, (event) => {
+				this.trace(event.playerId, BUS_REQUEST.connectionConnect, `channel=${event.channel.id}`);
+				this.enqueue(event.playerId, () => this.connect(event.playerId, event));
+			});
+			bus.onInput(BUS_REQUEST.connectionDisconnect, (event) => {
+				this.trace(event.playerId, BUS_REQUEST.connectionDisconnect, event.reason ? `reason=${event.reason}` : undefined);
+				this.enqueue(event.playerId, () => this.disconnect(event.playerId, event));
+			});
+			bus.onInput(BUS_REQUEST.connectionReconnect, (event) => {
+				this.trace(event.playerId, BUS_REQUEST.connectionReconnect, `channel=${event.channel.id}`);
+				this.enqueue(event.playerId, () => this.reconnect(event.playerId, event));
+			});
+		}
+	}
+
+	/**
+	 * Logs `traceBusSignal(type)` ("[From]->[To]:label") plus `detail`, through both this
+	 * controller's own process-wide `debugSink` and, when attached, the playerId's per-slot
+	 * `debug` callback — so a signal shows up in whichever debug stream is actually listening,
+	 * regardless of whether it's a global controller-level sink or a per-player one.
+	 */
+	private trace(playerId: string, type: string, detail?: string): void {
+		const message = `[ConnectionController] ${traceBusSignal(type)} guild=${playerId}${detail ? ` ${detail}` : ""}`;
+		this.debugSink?.(message);
+		this.slots.get(playerId)?.debug?.(message);
+	}
+
+	/**
+	 * Opens a slot for `playerId`. If a slot from a previous `attach()` is still around (it
+	 * should always have gone through `detach()` first — this only guards a caller that skips
+	 * that), release its voice connection synchronously instead of silently overwriting the
+	 * `Map` entry and orphaning the old `VoiceConnection`. `detach()` itself stays async (it
+	 * waits for in-flight enqueue()'d operations), so it is not called from here: the old slot
+	 * is being discarded outright, so there is nothing left to wait for.
+	 */
+	public attach(playerId: string, options: ConnectionControllerOptions): void {
+		const existing = this.slots.get(playerId);
+		if (existing && !existing.disposed) {
+			existing.disposed = true;
+			this.cleanupSubscription(playerId);
+			existing.connection?.destroy();
+			existing.connection = null;
+			this.clearWebAudioOutputs(playerId);
+		}
+		const opt = options.options ?? {};
+		this.slots.set(playerId, {
+			group: opt.group ?? "Ziplayer",
+			selfDeaf: opt.selfDeaf ?? true,
+			selfMute: opt.selfMute ?? false,
+			debug: options.debug,
+			readyTimeoutMs: options.readyTimeoutMs ?? 50_000,
+			connection: null,
+			channel: null,
+			sessionId: null,
+			requestId: null,
+			audioPlayer: options.audioPlayer ?? null,
+			subscription: null,
+			webAudioOutputs: new Map(),
+			disposed: false,
+			operation: Promise.resolve(),
+		});
+	}
+
+	public countAttached(): number {
+		return this.slots.size;
+	}
+	public countConnected(): number {
+		let count = 0;
+		for (const slot of this.slots.values()) {
+			if (slot.connection) count++;
+		}
+		return count;
+	}
+	public getActive(playerId: string): VoiceConnection | null {
+		return this.slots.get(playerId)?.connection ?? null;
+	}
+	public getConnections(playerId: string): Array<VoiceConnection | WebAudioConnection> {
+		const slot = this.slots.get(playerId);
+		if (!slot) return [];
+		this.pruneDestroyedWebAudioOutputs(slot);
+		const connections: Array<VoiceConnection | WebAudioConnection> = [];
+		if (slot.connection && slot.subscription) connections.push(slot.connection);
+		for (const { connection } of slot.webAudioOutputs.values()) {
+			if (connection.state.subscription) connections.push(connection);
+		}
+		return connections;
+	}
+	public hasOutput(playerId: string): boolean {
+		const slot = this.slots.get(playerId);
+		return (
+			Boolean(slot?.connection) ||
+			Boolean(slot && [...slot.webAudioOutputs.values()].some(({ connection }) => connection.isReady))
+		);
+	}
+	public getWebAudioSubscribers(playerId: string): WebAudioSubscriberInfo[] {
+		const slot = this.slots.get(playerId);
+		if (!slot) return [];
+		this.pruneDestroyedWebAudioOutputs(slot);
+		return [...slot.webAudioOutputs].map(([id, { connection, name }]) => {
+			const stats = connection.getStats();
+			return {
+				id,
+				name,
+				state:
+					connection.isSpeaking ? "playing"
+					: connection.isReady ? "ready"
+					: "stopped",
+				activeSessions: connection.isSpeaking ? 1 : 0,
+				droppedChunks: stats.droppedPackets,
+				droppedBytes: stats.droppedBytes,
+			};
+		});
+	}
+	public registerWebAudioOutput(playerId: string, id: string, name: string, connection: WebAudioConnection): void {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.disposed || !slot.audioPlayer) {
+			throw new Error(`Audio output cannot be attached to player "${playerId}" without an active AudioPlayer`);
+		}
+		this.pruneDestroyedWebAudioOutputs(slot);
+		if (slot.webAudioOutputs.has(id)) {
+			throw new Error(`Audio output id already exists: ${id}`);
+		}
+		if (!connection.subscribe(slot.audioPlayer)) {
+			throw new Error(`WebAudio connection "${connection.sessionId}" cannot subscribe to player "${playerId}"`);
+		}
+		slot.webAudioOutputs.set(id, { connection, name });
+	}
+	public disconnectWebAudio(playerId: string, id: string): boolean {
+		const slot = this.slots.get(playerId);
+		const output = slot?.webAudioOutputs.get(id);
+		if (!slot || !output) return false;
+		slot.webAudioOutputs.delete(id);
+		output.connection.unsubscribe();
+		output.connection.destroy();
+		return true;
+	}
+	public clearWebAudioOutputs(playerId: string): void {
+		const slot = this.slots.get(playerId);
+		if (!slot) return;
+		for (const [id] of slot.webAudioOutputs) this.disconnectWebAudio(playerId, id);
+	}
+	private pruneDestroyedWebAudioOutputs(slot: ConnectionSlot): void {
+		for (const [id, { connection }] of slot.webAudioOutputs) {
+			if (connection.getStats().status === VoiceConnectionStatus.Destroyed) slot.webAudioOutputs.delete(id);
+		}
+	}
+	public getActiveChannel(playerId: string): VoiceChannel | null {
+		return this.slots.get(playerId)?.channel ?? null;
+	}
+	public getActiveSessionId(playerId: string): PlayerSessionId | null {
+		return this.slots.get(playerId)?.sessionId ?? null;
+	}
+	public getActiveSubscription(playerId: string): PlayerSubscription | null {
+		return this.slots.get(playerId)?.subscription ?? null;
+	}
+	public getIsReady(playerId: string): boolean {
+		return this.slots.get(playerId)?.connection?.state.status === VoiceConnectionStatus.Ready;
+	}
+	public getIsSubscribed(playerId: string): boolean {
+		const slot = this.slots.get(playerId);
+		return Boolean(slot?.subscription && slot.connection?.state.status === VoiceConnectionStatus.Ready);
+	}
+
+	public setAudioPlayer(playerId: string, audioPlayer: AudioPlayer | null): void {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.audioPlayer === audioPlayer) return;
+		this.cleanupSubscription(playerId);
+		slot.audioPlayer = audioPlayer;
+		if (slot.connection && slot.connection.state.status === VoiceConnectionStatus.Ready) {
+			this.ensureSubscription(playerId, slot.connection);
+		}
+	}
+
+	public ensureSubscription(playerId: string, connection?: VoiceConnection | null): PlayerSubscription | null {
+		const slot = this.slots.get(playerId);
+		if (!slot) return null;
+		const target = connection === undefined ? slot.connection : connection;
+		if (slot.disposed || !target || !slot.audioPlayer) {
+			this.cleanupSubscription(playerId);
+			return null;
+		}
+		if (target.state.status !== VoiceConnectionStatus.Ready) {
+			return null;
+		}
+		if (slot.subscription && slot.subscription.connection !== target) {
+			this.cleanupSubscription(playerId);
+		}
+		const currentSub = (target.state as { subscription?: PlayerSubscription }).subscription;
+		if (slot.subscription && currentSub === slot.subscription) {
+			return slot.subscription;
+		}
+		try {
+			slot.subscription?.unsubscribe();
+			slot.subscription = target.subscribe(slot.audioPlayer) ?? null;
+			slot.debug?.(`[ConnectionController] AudioPlayer subscribed guild=${playerId}`);
+		} catch (error) {
+			slot.debug?.(`[ConnectionController] AudioPlayer subscription failed guild=${playerId}: ${this.errorMessage(error)}`);
+			slot.subscription = null;
+		}
+		return slot.subscription;
+	}
+
+	public cleanupSubscription(playerId: string): void {
+		const slot = this.slots.get(playerId);
+		if (!slot?.subscription) return;
+		try {
+			slot.subscription.unsubscribe();
+		} catch {}
+		slot.subscription = null;
+		slot.debug?.(`[ConnectionController] AudioPlayer unsubscribed guild=${playerId}`);
+	}
+
+	public async dispose(playerId?: string): Promise<void> {
+		if (playerId) {
+			await this.detach(playerId);
+			return;
+		}
+		for (const id of [...this.slots.keys()]) await this.detach(id);
+	}
+
+	public async detach(playerId: string): Promise<void> {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.disposed) return;
+		slot.disposed = true;
+		await slot.operation.catch(() => undefined);
+		this.cleanupSubscription(playerId);
+		this.clearWebAudioOutputs(playerId);
+		const connection = slot.connection;
+		slot.connection = null;
+		slot.channel = null;
+		slot.sessionId = null;
+		slot.requestId = null;
+		connection?.destroy();
+		this.slots.delete(playerId);
+	}
+
+	private enqueue(playerId: string, operation: () => Promise<void>): void {
+		const slot = this.slots.get(playerId);
+		if (!slot) return;
+		slot.operation = slot.operation.then(operation, operation).catch((error) => {
+			slot.debug?.(`[ConnectionController] operation failed: ${this.errorMessage(error)}`);
+		});
+	}
+
+	private async connect(
+		playerId: string,
+		event: Extract<PlayerConnectionInput, { type: typeof BUS_REQUEST.connectionConnect }>,
+	): Promise<void> {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.disposed) return;
+		const sessionId = createPlayerSessionId();
+		slot.requestId = event.requestId;
+		slot.sessionId = sessionId;
+		slot.channel = event.channel;
+		this.trace(playerId, BUS_OUTPUT.connectionConnecting, `channel=${event.channel.id}`);
+		this.bus?.emitOutput({
+			type: BUS_OUTPUT.connectionConnecting,
+			requestId: event.requestId,
+			playerId,
+			sessionId,
+			channel: event.channel,
+		});
+
+		try {
+			if (
+				slot.connection &&
+				slot.channel?.id === event.channel.id &&
+				slot.connection.state.status === VoiceConnectionStatus.Ready
+			) {
+				this.ensureSubscription(playerId, slot.connection);
+				this.emitConnected(playerId, event.requestId, sessionId, event.channel, slot.connection);
+				return;
+			}
+
+			this.cleanupSubscription(playerId);
+			slot.connection?.destroy();
+			slot.connection = null;
+
+			const guildId = event.channel.guildId || playerId;
+			const existing = getVoiceConnection(guildId, event.options?.group ?? slot.group);
+			if (existing) existing.destroy();
+
+			const group = event.options?.group ?? slot.group;
+			const selfDeaf = event.options?.deaf ?? slot.selfDeaf;
+			const selfMute = event.options?.mute ?? slot.selfMute;
+
+			const connection = joinVoiceChannel({
+				channelId: event.channel.id,
+				guildId: event.channel.guildId || playerId,
+				adapterCreator: event.channel.guild.voiceAdapterCreator,
+				group,
+				selfDeaf,
+				selfMute,
+			});
+			slot.connection = connection;
+
+			connection.on("error", (error: Error) => {
+				if (slot.connection !== connection) return;
+				this.trace(playerId, BUS_OUTPUT.connectionError, `operation=connection error=${error.message}`);
+				this.bus?.emitOutput({
+					type: BUS_OUTPUT.connectionError,
+					requestId: slot.requestId ?? event.requestId,
+					playerId,
+					sessionId,
+					operation: "connect",
+					error: toError(error),
+				});
+			});
+			connection.on("stateChange", (oldS, newS) => {
+				slot.debug?.(
+					`[Voice] ${oldS.status} -> ${newS.status}` + ("closeCode" in newS ? ` closeCode=${(newS as any).closeCode}` : ""),
+				);
+			});
+			connection.on("debug", (m) => slot.debug?.(`[Voice:debug] ${m}`));
+			connection.on(VoiceConnectionStatus.Ready, () => {
+				if (slot.connection !== connection) return;
+				this.ensureSubscription(playerId, connection);
+			});
+
+			connection.on(VoiceConnectionStatus.Disconnected, async () => {
+				if (slot.connection !== connection) return;
+				try {
+					await Promise.race([
+						entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+						entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+					]);
+				} catch {
+					if (slot.connection === connection) connection.destroy();
+				}
+			});
+			connection.once(VoiceConnectionStatus.Destroyed, () => {
+				if (slot.connection !== connection) return;
+				this.cleanupSubscription(playerId);
+				slot.connection = null;
+				this.trace(playerId, BUS_OUTPUT.connectionDisconnected, "reason=destroyed");
+				this.bus?.emitOutput({
+					type: BUS_OUTPUT.connectionDisconnected,
+					requestId: slot.requestId ?? undefined,
+					playerId,
+					sessionId: slot.sessionId ?? sessionId,
+					reason: "destroyed",
+				});
+			});
+
+			await entersState(connection, VoiceConnectionStatus.Ready, slot.readyTimeoutMs);
+			if (slot.disposed || slot.sessionId !== sessionId || slot.connection !== connection) {
+				this.cleanupSubscription(playerId);
+				connection.destroy();
+				return;
+			}
+			this.ensureSubscription(playerId, connection);
+			this.emitConnected(playerId, event.requestId, sessionId, event.channel, connection);
+		} catch (error) {
+			if (slot.sessionId !== sessionId) return;
+			this.cleanupSubscription(playerId);
+			slot.connection?.destroy();
+			slot.connection = null;
+			this.trace(playerId, BUS_OUTPUT.connectionError, "operation=connect");
+			this.bus?.emitOutput({
+				type: BUS_OUTPUT.connectionError,
+				requestId: event.requestId,
+				playerId,
+				sessionId,
+				operation: "connect",
+				error: toError(error),
+			});
+		}
+	}
+
+	private async disconnect(
+		playerId: string,
+		event: Extract<PlayerConnectionInput, { type: typeof BUS_REQUEST.connectionDisconnect }>,
+	): Promise<void> {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.disposed) return;
+		const sessionId = slot.sessionId ?? createPlayerSessionId();
+		const connection = slot.connection;
+		this.cleanupSubscription(playerId);
+		slot.connection = null;
+		slot.channel = null;
+		slot.sessionId = null;
+		slot.requestId = null;
+		try {
+			connection?.destroy();
+			this.trace(playerId, BUS_OUTPUT.connectionDisconnected, event.reason ? `reason=${event.reason}` : undefined);
+			this.bus?.emitOutput({
+				type: BUS_OUTPUT.connectionDisconnected,
+				requestId: event.requestId,
+				playerId,
+				sessionId,
+				reason: event.reason,
+			});
+		} catch (error) {
+			this.trace(playerId, BUS_OUTPUT.connectionError, "operation=disconnect");
+			this.bus?.emitOutput({
+				type: BUS_OUTPUT.connectionError,
+				requestId: event.requestId,
+				playerId,
+				sessionId,
+				operation: "disconnect",
+				error: toError(error),
+			});
+		}
+	}
+
+	private async reconnect(
+		playerId: string,
+		event: Extract<PlayerConnectionInput, { type: typeof BUS_REQUEST.connectionReconnect }>,
+	): Promise<void> {
+		const slot = this.slots.get(playerId);
+		if (!slot || slot.disposed) return;
+		this.cleanupSubscription(playerId);
+		slot.connection?.destroy();
+		slot.connection = null;
+		slot.channel = null;
+		slot.sessionId = null;
+		await this.connect(playerId, { type: BUS_REQUEST.connectionConnect, requestId: event.requestId, channel: event.channel });
+	}
+
+	private emitConnected(
+		playerId: string,
+		requestId: PlayerRequestId,
+		sessionId: PlayerSessionId,
+		channel: VoiceChannel,
+		connection: VoiceConnection,
+	): void {
+		this.trace(playerId, BUS_OUTPUT.connectionConnected, `channel=${channel.id}`);
+		this.bus?.emitOutput({
+			type: BUS_OUTPUT.connectionConnected,
+			requestId,
+			playerId,
+			sessionId,
+			channel,
+			connection,
+		});
+	}
+
+	private errorMessage(error: unknown): string {
+		return toError(error).message;
+	}
+}

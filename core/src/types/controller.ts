@@ -1,0 +1,186 @@
+import type { Track, PlayerOptions } from ".";
+import type { AudioResource, AudioPlayer, StreamType, AudioPlayerStatus } from "@discordjs/voice";
+import type { Readable } from "stream";
+import type { PlaybackSession } from "../structures/PlaybackSession";
+import type { StreamManager } from "../structures/StreamManager";
+import type { Bus } from "../structures/Bus";
+import type { DebugLogger } from "./debug";
+
+/** Per-player configuration handed to the shared `ConnectionController` via `attach(playerId, options)`. */
+export interface ConnectionControllerOptions {
+	audioPlayer?: AudioPlayer;
+	options?: Pick<PlayerOptions, "selfDeaf" | "selfMute" | "group">;
+	debug?: DebugLogger;
+	readyTimeoutMs?: number;
+}
+export interface WebAudioSubscriberInfo {
+	id: string;
+	name: string;
+	state: "playing" | "ready" | "stopped";
+	activeSessions: number;
+	droppedChunks: number;
+	droppedBytes: number;
+}
+export interface LifecycleControllerOptions {
+	bus: Bus;
+	options: Pick<PlayerOptions, "leaveOnEnd" | "leaveOnEmpty" | "pauseOnEmpty" | "leaveTimeout">;
+	debug?: DebugLogger;
+}
+/** Per-player resources handed to the shared `PlaybackController` via `attach(playerId, options)`. */
+export interface PlaybackControllerOptions {
+	audioPlayer?: AudioPlayer;
+	stuckTimeoutMs?: number;
+}
+
+export interface ActiveStream {
+	sessionId: number;
+	session: PlaybackSession;
+	track: Track;
+	stream: Readable;
+	streamId: string | null;
+	inputType?: StreamType;
+}
+export interface StreamControllerOptions {
+	streamManager?: StreamManager;
+	bus?: Bus;
+}
+export type FilterControllerStreamType = "webm/opus" | "ogg/opus" | "arbitrary" | "mp3";
+export interface FilterControllerResourcePort {
+	refreshPlayerResource(position?: number): Promise<boolean>;
+}
+export interface StreamManagerOptions {
+	maxConcurrentStreams?: number;
+	streamTimeout?: number;
+	maxListenersPerStream?: number;
+	cleanupInterval?: number;
+	enableMetrics?: boolean;
+	autoDestroy?: boolean;
+}
+export interface ManagedStream {
+	id: string;
+	stream: Readable;
+	track: Track;
+	createdAt: number;
+	lastAccessed: number;
+	playStream?: Readable;
+	metadata: { source: string; isPreload: boolean; isRemote: boolean; priority: number };
+	listeners: {
+		error: (err: Error) => void;
+		close: () => void;
+		end: () => void;
+		drain?: () => void;
+		pause?: () => void;
+		resume?: () => void;
+	};
+	status: "active" | "paused" | "ended" | "error" | "destroyed";
+	byteCount: number;
+}
+export interface PlaybackSessionSnapshot {
+	id: number;
+	track: Track | null;
+	resource: AudioResource | null;
+	status: PlaybackSessionStatus;
+	position: number | null;
+	startedAt: number | null;
+}
+
+export type PlaybackSessionStatus =
+	| AudioPlayerStatus
+	| "idle"
+	| "loading"
+	| "playing"
+	| "paused"
+	| "stopped"
+	| "ended"
+	| "destroyed"
+	| "buffering";
+export interface AntiStuckControllerOptions {
+	enabled?: boolean;
+	maxRetries?: number;
+	retryDelayMs?: number;
+	reusePreloadFirst?: boolean;
+	reduceQualityOnRetry?: boolean;
+	controlledSkipThreshold?: number;
+	bus?: Bus;
+	/** Debug sink; see `traceBusSignal` in BusContract for the log format used. */
+	debug?: DebugLogger;
+}
+export interface AntiStuckRetryContext {
+	session: PlaybackSession;
+	track: Track;
+	retry: number;
+	reason?: string;
+}
+export interface AntiStuckRetryHandlers {
+	retry: (context: AntiStuckRetryContext) => Promise<boolean>;
+	skip: (context: AntiStuckRetryContext) => Promise<void> | void;
+}
+export interface SearchRequest {
+	query: string;
+	requestedBy?: import("./core").TrackRequester;
+	plugin?: string | string[];
+}
+
+export interface SearchDebugResult {
+	isCached: boolean;
+	cacheAge?: number;
+	pluginCount: number;
+	ttsFiltered: boolean;
+}
+
+export interface ControllerCommandContext {
+	requestId: string;
+	sessionId?: string;
+	signal?: AbortSignal;
+	timestamp?: number;
+}
+export type ControllerCommandHandler<TRequest = unknown, TResponse = unknown> = (
+	request: TRequest,
+	context: ControllerCommandContext,
+) => TResponse | Promise<TResponse>;
+export interface TransitionPlanRequest {
+	from: Track | null;
+	to: Track | null;
+}
+export interface TransitionPlanResponse {
+	enabled: boolean;
+	durationMs: number;
+	waitForBeat: boolean;
+	beatAlignMaxWaitMs: number;
+}
+export interface TransitionBeatWaitRequest {
+	track: Track | null;
+	positionMs: number;
+}
+export interface VolumeTargetRequest {
+	track?: Track | null;
+}
+export interface VolumeSetRequest {
+	value: number;
+}
+export interface AntiStuckReportRequest {
+	session: PlaybackSession;
+	reason: string;
+	handlers: AntiStuckRetryHandlers;
+}
+export interface TrackLoadRequest {
+	track: Track;
+	session: PlaybackSession;
+}
+export interface TrackResetRecoveryRequest {
+	track?: Track;
+}
+export interface TrackGetRecoveryCountRequest {
+	track: Track;
+}
+export interface TtsIsTTSRequest {
+	track: Track;
+}
+export interface TtsPlayRequest {
+	track: Track;
+}
+export interface TtsSkipRequest {}
+export interface TtsSkipResponse {
+	skipped: boolean;
+}
+export interface TtsStopRequest {}

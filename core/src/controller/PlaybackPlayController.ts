@@ -1,0 +1,302 @@
+import type { Bus, BusRpcContext } from "../structures/Bus";
+import type {
+	PlayerMessageContext,
+	SearchResult,
+	Track,
+	PlaybackPlayControllerOptions,
+	ExtensionPlayRequest,
+	ExtensionPlayResponse,
+	ExtensionAfterPlayPayload,
+	TrackRequester,
+} from "../types";
+import { BUS_EVENT, CONTROLLER_RPC, PLAYER_QUERY, PLAYER_RPC, PLAYER_ACTION } from "../structures/BusContract";
+import { toError } from "../utils/errors";
+import { createIdleSnapshot } from "../structures/PlaybackSession";
+import { queryPlaybackSession } from "../structures/PlaybackSession";
+
+function selectPlaybackTracks(result: SearchResult): { tracks: Track[]; isPlaylist: boolean } {
+	const isPlaylist = Boolean(result.playlist);
+	return {
+		tracks: isPlaylist ? result.tracks : result.tracks.slice(0, 1),
+		isPlaylist,
+	};
+}
+
+/**
+ * Owns the public play RPC: search, queue insertion, TTS interrupt, and initial skip.
+ * Talks to sibling playback controllers only through Bus queries/actions —
+ * never by holding a direct reference to them.
+ *
+ * Per-player controller instance held by the shared `PlaybackOrchestrator` state for
+ * `playerId`. Registers no RPC of its own: `play` is registered exactly once, in the
+ * orchestrator's constructor, and routed by `ctx.playerId`.
+ */
+export class PlaybackPlayController {
+	private readonly playerId: string;
+	private readonly bus: Bus;
+	private readonly isWaitingForQueue: PlaybackPlayControllerOptions["isWaitingForQueue"];
+	private readonly debug: PlaybackPlayControllerOptions["debug"];
+	private readonly lifecycleSignal: AbortSignal;
+	private readonly adapters: PlaybackPlayControllerOptions["adapters"];
+
+	public constructor(playerId: string, options: PlaybackPlayControllerOptions) {
+		this.playerId = playerId;
+		this.bus = options.bus;
+		this.isWaitingForQueue = options.isWaitingForQueue;
+		this.debug = options.debug;
+		this.lifecycleSignal = options.lifecycleSignal;
+		this.adapters = options.adapters;
+	}
+
+	public dispose(): void {
+		// No module-level registration to release; kept for a uniform per-player lifecycle API.
+	}
+
+	private async skipThroughBus(context: PlayerMessageContext): Promise<void> {
+		await this.bus.action(this.playerId, { type: PLAYER_ACTION.skip, requestId: context.requestId }, context);
+	}
+
+	private async beforePlayHooks(
+		request: ExtensionPlayRequest,
+	): Promise<{ request: ExtensionPlayRequest; response: ExtensionPlayResponse }> {
+		if (this.bus.hasRpc(CONTROLLER_RPC.extensionBeforePlay)) {
+			try {
+				return await this.bus.requestRpc<
+					ExtensionPlayRequest,
+					{ request: ExtensionPlayRequest; response: ExtensionPlayResponse }
+				>(this.playerId, CONTROLLER_RPC.extensionBeforePlay, request);
+			} catch (e) {
+				this.debug("[PlaybackPlayController] extensionBeforePlay error:", e);
+			}
+		}
+		return { request, response: {} };
+	}
+
+	private async afterPlayHooks(payload: ExtensionAfterPlayPayload): Promise<void> {
+		if (this.bus.hasRpc(CONTROLLER_RPC.extensionAfterPlay)) {
+			try {
+				await this.bus.requestRpc<ExtensionAfterPlayPayload, void>(this.playerId, CONTROLLER_RPC.extensionAfterPlay, payload);
+			} catch (e) {
+				this.debug("[PlaybackPlayController] extensionAfterPlay error:", e);
+			}
+		}
+	}
+
+	public async play(
+		query: string | Track | SearchResult | null,
+		requestedBy: TrackRequester | undefined,
+		rpcContext: BusRpcContext,
+		pluginSelection?: string | string[],
+	): Promise<{ ok: boolean; track: Track | null } | boolean> {
+		if (rpcContext.signal.aborted || this.lifecycleSignal.aborted) return { ok: false, track: null };
+		const context: PlayerMessageContext = {
+			playerId: this.playerId,
+			requestId: rpcContext.requestId,
+			source: "PlaybackPlayController:play",
+			signal: AbortSignal.any([rpcContext.signal, this.lifecycleSignal]),
+			timestamp: rpcContext.timestamp,
+			priority: 10,
+		};
+		let tracksToAdd: Track[] = [];
+		let isPlaylist = false;
+		let effectiveRequest: ExtensionPlayRequest = { query: query as string | Track, requestedBy };
+		let hookResponse: ExtensionPlayResponse = {};
+
+		try {
+			if (query === null) {
+				const session = queryPlaybackSession(this.bus, this.playerId);
+				if (session?.status === "playing" || session?.status === "paused") {
+					return { ok: true, track: session.track };
+				}
+				const queueLength = (this.bus.querySync(this.playerId, PLAYER_QUERY.queue) ?? []).length;
+				if (queueLength === 0) return { ok: false, track: null };
+				await this.skipThroughBus(context);
+				return { ok: true, track: queryPlaybackSession(this.bus, this.playerId)?.track ?? null };
+			}
+
+			if (query && typeof query === "object" && "tracks" in query && Array.isArray((query as SearchResult).tracks)) {
+				const sr = query as SearchResult;
+				const selection = selectPlaybackTracks(sr);
+				tracksToAdd = selection.tracks;
+				isPlaylist = selection.isPlaylist;
+			} else {
+				const hookOutcome = await this.beforePlayHooks(effectiveRequest);
+				effectiveRequest = hookOutcome.request;
+				hookResponse = hookOutcome.response;
+				if (effectiveRequest.requestedBy === undefined) {
+					effectiveRequest.requestedBy = requestedBy;
+				}
+
+				const hookTracks = Array.isArray(hookResponse.tracks) ? hookResponse.tracks : undefined;
+
+				if (hookResponse.handled && (!hookTracks || hookTracks.length === 0)) {
+					const handledPayload: ExtensionAfterPlayPayload = {
+						success: hookResponse.success ?? true,
+						query: effectiveRequest.query,
+						requestedBy: effectiveRequest.requestedBy,
+						tracks: [],
+						isPlaylist: hookResponse.isPlaylist ?? false,
+						error: hookResponse.error,
+					};
+					await this.afterPlayHooks(handledPayload);
+					if (hookResponse.error) {
+						const session = queryPlaybackSession(this.bus, this.playerId);
+						this.bus.event(this.playerId, {
+							type: BUS_EVENT.trackError,
+							session: session?.snapshot() ?? createIdleSnapshot(),
+							error: hookResponse.error,
+						});
+					}
+					return { ok: hookResponse.success ?? true, track: null };
+				}
+
+				if (hookTracks && hookTracks.length > 0) {
+					tracksToAdd = hookTracks;
+					isPlaylist = hookResponse.isPlaylist ?? hookTracks.length > 1;
+				} else if (typeof effectiveRequest.query === "string") {
+					const result = await this.bus.requestRpc<
+						{ query: string; requestedBy: TrackRequester; plugin?: string | string[] },
+						SearchResult
+					>(
+						this.playerId,
+						PLAYER_RPC.search,
+						{
+							query: effectiveRequest.query,
+							requestedBy: effectiveRequest.requestedBy || "Unknown",
+							plugin: pluginSelection,
+						},
+						{ signal: context.signal },
+					);
+					const selection = selectPlaybackTracks(result);
+					tracksToAdd = selection.tracks;
+					isPlaylist = selection.isPlaylist;
+				} else if (effectiveRequest.query) {
+					tracksToAdd = [effectiveRequest.query as Track];
+				}
+			}
+
+			if (requestedBy && typeof requestedBy === "object") {
+				tracksToAdd = tracksToAdd.map((track) => ({ ...track, requestedBy }));
+			}
+
+			if (tracksToAdd.length === 0 || context.signal.aborted) {
+				throw new Error("No tracks found");
+			}
+
+			const ttsInterruptEnabled = this.bus.querySync(this.playerId, PLAYER_QUERY.ttsInterrupt) ?? true;
+			const isTTS = (t: Track | undefined) => {
+				if (!t) return false;
+				try {
+					return (
+						(typeof t.source === "string" && t.source.toLowerCase().includes("tts")) ||
+						(typeof t.id === "string" && t.id.toLowerCase().startsWith("tts-")) ||
+						(typeof t.url === "string" && t.url.toLowerCase().startsWith("tts://")) ||
+						Boolean(t.metadata?.tts)
+					);
+				} catch {
+					return false;
+				}
+			};
+			const checkIsTTS = (t: Track | undefined): boolean => {
+				if (!t) return false;
+				if (this.bus.hasRpc(CONTROLLER_RPC.ttsIsTTS)) {
+					return Boolean(
+						this.bus.requestRpcSync<{ track: Track }, boolean>(this.playerId, CONTROLLER_RPC.ttsIsTTS, {
+							track: t,
+						}),
+					);
+				}
+				return Boolean(this.adapters?.isTTS?.(t) ?? isTTS(t));
+			};
+
+			const rawQuery = typeof effectiveRequest.query === "string" ? effectiveRequest.query.trim().toLowerCase() : "";
+			const queryLooksTTS = rawQuery.startsWith("tts:");
+
+			if (queryLooksTTS && tracksToAdd.length > 0 && !checkIsTTS(tracksToAdd[0])) {
+				const ttsIdx = tracksToAdd.findIndex(checkIsTTS);
+				if (ttsIdx > 0) {
+					const [ttsTrack] = tracksToAdd.splice(ttsIdx, 1);
+					tracksToAdd.unshift(ttsTrack);
+				}
+			}
+
+			const reportPlayResult = (success: boolean) =>
+				this.afterPlayHooks({
+					success,
+					query: effectiveRequest.query,
+					requestedBy: effectiveRequest.requestedBy,
+					tracks: tracksToAdd,
+					isPlaylist,
+				});
+
+			const isTTSTrack = !isPlaylist && tracksToAdd.length > 0 && ttsInterruptEnabled && checkIsTTS(tracksToAdd[0]);
+
+			if (isTTSTrack) {
+				if (this.bus.hasRpc(CONTROLLER_RPC.ttsPlay)) {
+					await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.ttsPlay, { track: tracksToAdd[0] }, { signal: context.signal });
+				} else {
+					await this.adapters?.playTTS?.(tracksToAdd[0]);
+				}
+				await reportPlayResult(true);
+				return { ok: true, track: tracksToAdd[0] ?? null };
+			}
+
+			if (isPlaylist) {
+				await this.bus.requestRpc(
+					this.playerId,
+					PLAYER_RPC.queueAddMultiple,
+					{ tracks: tracksToAdd },
+					{ signal: context.signal },
+				);
+			} else {
+				await this.bus.requestRpc(this.playerId, PLAYER_RPC.queueAdd, { track: tracksToAdd[0] }, { signal: context.signal });
+			}
+
+			const session = queryPlaybackSession(this.bus, this.playerId);
+			const isPlayingOrPaused = session?.status === "playing" || session?.status === "paused";
+
+			if (isPlayingOrPaused && !this.isWaitingForQueue()) {
+				if (this.bus.hasRpc(PLAYER_RPC.preloadNext)) {
+					void this.bus
+						.requestRpc(this.playerId, PLAYER_RPC.preloadNext, {}, { signal: context.signal })
+						.catch((error: unknown) => this.debug("[PlaybackPlayController] Preload after queue add error:", error));
+				}
+				await reportPlayResult(true);
+				return { ok: true, track: tracksToAdd[0] ?? null };
+			}
+
+			let started = true;
+			if (!isPlayingOrPaused) {
+				if (this.isWaitingForQueue()) {
+					started = true;
+				} else {
+					await this.skipThroughBus(context);
+					started = true;
+				}
+			}
+
+			await reportPlayResult(started);
+			return { ok: started, track: tracksToAdd[0] ?? null };
+		} catch (error) {
+			this.debug("[PlaybackPlayController] Play error:", error);
+			const err = toError(error);
+			await this.afterPlayHooks({
+				success: false,
+				query: effectiveRequest.query,
+				requestedBy: effectiveRequest.requestedBy,
+				tracks: tracksToAdd,
+				isPlaylist,
+				error: err,
+			});
+			const session = queryPlaybackSession(this.bus, this.playerId);
+			if (!context.signal.aborted) {
+				this.bus.event(this.playerId, {
+					type: BUS_EVENT.trackError,
+					session: session?.snapshot() ?? createIdleSnapshot(),
+					error: err,
+				});
+			}
+			return { ok: false, track: null };
+		}
+	}
+}

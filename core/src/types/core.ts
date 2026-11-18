@@ -1,0 +1,397 @@
+import { Readable } from "stream";
+import { Player } from "../structures/Player";
+import type { PlayerManager } from "../structures/PlayerManager";
+import type { AudioFilter } from "./filter";
+import type { SourcePluginLike } from "./plugin";
+import type { AudioResource, StreamType } from "@discordjs/voice";
+import type { PlayerDebugLevel } from "./debug";
+
+export enum PlaybackMode {
+	NATIVE = "native",
+	REMOTE = "remote",
+	FORWARD = "forward",
+}
+/**
+ * Represents a music track with metadata and streaming information.
+ */
+export type TrackRequester = string | object;
+
+export interface Track {
+	id: string;
+	title: string;
+	url: string;
+	duration: number;
+	thumbnail?: string;
+	/** User object or identifier who requested this track. */
+	requestedBy: TrackRequester;
+	source: string;
+	metadata?: Record<string, any>;
+	isLive?: boolean;
+	author?: string;
+}
+
+export interface SearchResult {
+	/** Search candidates; play() uses the first unless this result represents a playlist. */
+	tracks: Track[];
+	/** Present only when all tracks belong to a playlist. */
+	playlist?: {
+		name: string;
+		url?: string;
+		thumbnail?: string;
+	} | null;
+	query?: string;
+	score?: SearchScore;
+	source?: string;
+}
+
+export interface SearchScore {
+	score: number;
+	reason: string;
+	matchedBy: "url" | "title" | "partial" | "none" | "playlist";
+	exactMatch: boolean;
+}
+
+/**
+ * Raw streaming information returned by plugins or custom resolvers.
+ */
+export interface RawStreamInfo {
+	stream?: Readable;
+	url?: string;
+	track?: Track;
+	streamType?: StreamType;
+	/** @deprecated Use streamType */
+	type?: "webm/opus" | "ogg/opus" | "arbitrary" | "url" | string;
+	/** @deprecated Use streamType */
+	inputType?: StreamType;
+	metadata?: Record<string, any>;
+	position?: number;
+	recreate?: (position: number) => Promise<Readable>;
+	remote?: boolean;
+	handle?: {
+		play(): Promise<void>;
+		stop(): Promise<void>;
+		pause(): Promise<void>;
+		resume(): Promise<void>;
+		seek(position: number): Promise<void>;
+		setVolume(volume: number): Promise<void>;
+		destroy(): Promise<void>;
+	};
+}
+
+/**
+ * Normalized streaming information for audio playback.
+ * Guaranteed to have `track` and `streamType`.
+ */
+export interface StreamInfo extends RawStreamInfo {
+	stream?: Readable;
+	track?: Track;
+	streamType?: StreamType;
+	/** @deprecated Use streamType */
+	inputType?: StreamType;
+	/** @deprecated Use streamType */
+	type?: "webm/opus" | "ogg/opus" | "arbitrary" | "url" | string;
+}
+
+export function inferStreamType(info: Partial<RawStreamInfo>): StreamType {
+	if (info.streamType) return info.streamType;
+	if (info.inputType) return info.inputType;
+	const t = typeof info.type === "string" ? info.type.toLowerCase() : "";
+	if (t === "webm/opus") return "webm/opus" as StreamType;
+	if (t === "ogg/opus") return "ogg/opus" as StreamType;
+	if (t === "opus") return "opus" as StreamType;
+	if (t === "raw") return "raw" as StreamType;
+	return "arbitrary" as StreamType;
+}
+
+export function normalizeStreamInfo(requestedTrack: Track, info: RawStreamInfo): StreamInfo {
+	const streamType = info.streamType ?? info.inputType ?? (info.type as StreamType) ?? inferStreamType(info);
+	if (String(streamType).toLowerCase() === "raw") {
+		throw new TypeError("Raw audio input is unsupported; provide encoded audio");
+	}
+	return {
+		...info,
+		track: info.track ?? requestedTrack,
+		streamType,
+		inputType: info.inputType ?? streamType,
+		type: info.type ?? (streamType as string),
+	};
+}
+
+export interface TrackMiddlewareContext {
+	playerId: string;
+	manager?: PlayerManager;
+	player?: Player;
+}
+
+export interface TrackResolverContext {
+	playerId: string;
+	history?: Track[];
+	signal?: AbortSignal;
+	[key: string]: any;
+}
+
+export type TrackMiddleware = (track: Track, context: TrackMiddlewareContext) => void | Track | Promise<void | Track>;
+
+export interface PlaybackMirrorOptions {
+	leaderGuildId: string;
+	followerGuildIds: string[];
+	forwardMode?: boolean;
+}
+
+export function normalizeTrackMiddleware(input?: TrackMiddleware | TrackMiddleware[]): TrackMiddleware[] {
+	if (!input) return [];
+	return Array.isArray(input) ? input : [input];
+}
+
+export interface PlayerOptions {
+	leaveOnEnd?: boolean;
+	leaveOnEmpty?: boolean;
+	pauseOnEmpty?: boolean;
+	leaveTimeout?: number;
+	volume?: number;
+	quality?: "high" | "low";
+	selfDeaf?: boolean;
+	selfMute?: boolean;
+	group?: string;
+	extractorTimeout?: number;
+	userdata?: Record<string, any>;
+	/** Explicit FFmpeg executable path used by seek/filter processing. */
+	ffmpegPath?: string | null;
+	tts?: {
+		createPlayer?: boolean;
+		interrupt?: boolean;
+		volume?: number;
+		maxTimeTts?: number;
+	};
+	extensions?: any[] | string[];
+	filters?: (string | AudioFilter)[];
+	lowPerformance?: boolean;
+	preload?: { enabled?: boolean; autoDisableInLowPerformance?: boolean };
+	crossfade?: { enabled?: boolean; autoEnable?: boolean; autoDisableInLowPerformance?: boolean; durationMs?: number };
+	smartTransition?: {
+		enabled?: boolean;
+		genreAware?: boolean;
+		beatAlign?: boolean;
+		baseDurationMs?: number;
+		minDurationMs?: number;
+		maxDurationMs?: number;
+		genreDurations?: Record<string, number>;
+		beatAlignMaxWaitMs?: number;
+	};
+	antiStuck?: {
+		enabled?: boolean;
+		maxRetries?: number;
+		retryDelayMs?: number;
+		stuckTimeoutMs?: number;
+		reusePreloadFirst?: boolean;
+		reduceQualityOnRetry?: boolean;
+		controlledSkipThreshold?: number;
+	};
+	loudnessNormalization?: {
+		enabled?: boolean;
+		targetLUFS?: number;
+		maxBoostDb?: number;
+		maxCutDb?: number;
+		limiterCeiling?: number;
+		autoDisableInLowPerformance?: boolean;
+	};
+	trackMiddleware?: TrackMiddleware | TrackMiddleware[];
+	maxStreamStore?: number;
+}
+
+export interface PlayerManagerOptions {
+	plugins?: SourcePluginLike[];
+	extensions?: any[];
+	extractorTimeout?: number;
+	autoCleanup?: boolean;
+	cleanupInterval?: number;
+	enableSearchCache?: boolean;
+	enableStatsCollection?: boolean;
+	trackMiddleware?: TrackMiddleware | TrackMiddleware[];
+	debugLevel?: PlayerDebugLevel | "info";
+}
+
+export interface ProgressBarOptions {
+	size?: number;
+	barChar?: string;
+	progressChar?: string;
+	timeFormat?: "compact" | "full";
+	showPercentage?: boolean;
+	showTime?: boolean;
+	hideProgressChar?: boolean;
+}
+
+export interface SaveOptions {
+	filename?: string;
+	quality?: "high" | "low";
+	timeout?: number;
+	signal?: AbortSignal;
+	metadata?: Record<string, any>;
+	filter?: AudioFilter[];
+	seek?: number;
+}
+
+export type SaveVideoOptions = Pick<SaveOptions, "filename" | "quality" | "timeout" | "metadata" | "signal">;
+
+export interface PreloadState {
+	resource: AudioResource | null;
+	track: Track | null;
+	abortController: AbortController | null;
+	timeoutId: NodeJS.Timeout | null;
+	isValid: boolean;
+	streamId?: string;
+	isBeingUsed: boolean;
+}
+
+export interface ForwardHealthStatus {
+	guildId: string;
+	healthy: boolean;
+	role: "leader" | "follower" | "none";
+	issues: string[];
+	details: {
+		leaderId?: string;
+		followerCount?: number;
+		connectionState?: string;
+		audioPlayerState?: string;
+	};
+}
+
+export interface PlayerManagerStats {
+	players: number;
+	totalPlayers: number;
+	playback: {
+		playing: number;
+		paused: number;
+		idle: number;
+	};
+	streams: {
+		active: number;
+		loading: number;
+	};
+	queues: {
+		totalTracks: number;
+	};
+	preload: {
+		active: number;
+	};
+	transitions: {
+		active: number;
+	};
+	leader: number;
+	follower: number;
+	activePlayers: number;
+	pausedPlayers: number;
+	connectedPlayers: number;
+	totalTracksInQueue: number;
+	forwardHealthStatus: ForwardHealthStatus[];
+}
+
+export type PlayerStats = PlayerManagerStats;
+
+export interface StreamSlot {
+	resource?: AudioResource | null;
+	streamInfo?: StreamInfo | null;
+	track: Track | null;
+	streamId: string | null;
+	processedStreamId?: string | null;
+	abortController: AbortController | null;
+	isValid: boolean;
+	isLoading: boolean;
+	loadPromise: Promise<void> | null;
+}
+
+export type LoopMode = "off" | "track" | "queue";
+
+export interface PlayerSession {
+	guildId: string;
+	queue: Track[];
+	currentTrack: Track | null;
+	volume: number;
+	loopMode: LoopMode;
+	autoPlay: boolean;
+	position: number | null;
+	extensions: string[];
+	plugins: string[];
+	userdata?: Record<string, any>;
+}
+
+export interface PlayerRuntimeState {
+	plugins: string[];
+	extensions: string[];
+}
+
+export interface PlayOptions {
+	/** User object or identifier who requested playback. Track metadata preserves the supplied value. */
+	requestedBy?: TrackRequester;
+	/** Guild voice channel to connect to automatically before playback. */
+	voiceChannel?: VoiceChannel;
+	/** Target plugin or list of plugins to search/play from. */
+	plugin?: string | string[];
+	/** AbortSignal to cancel play operation before commit. */
+	signal?: AbortSignal;
+	[key: string]: any;
+}
+
+export interface SearchOptions {
+	/** User object or identifier who requested the search. Track metadata preserves the supplied value. */
+	requestedBy?: TrackRequester;
+	/** Restrict search to this plugin or list of plugins. */
+	plugin?: string | string[];
+	/** AbortSignal to cancel the search. */
+	signal?: AbortSignal;
+}
+
+export interface PlayResult {
+	track: Track;
+	query: string;
+	requestedBy?: TrackRequester;
+	voiceConnection?: any;
+	player: Player;
+}
+
+export interface WillPlayEvent {
+	track: Track;
+	relatedTracks: Track[];
+	/** @deprecated Use relatedTracks */
+	upcomingTracks?: Track[];
+}
+
+export interface VoiceChannel {
+	id: string;
+	guildId: string;
+	type: any;
+	guild: any;
+}
+
+export interface ManagerEvents {
+	debug: [message: string, ...args: any[]];
+	willPlay: [player: Player, track: Track, relatedTracks: Track[]];
+	trackStart: [player: Player, track: Track];
+	trackEnd: [player: Player, track: Track];
+	queueEnd: [player: Player];
+	playerError: [player: Player, error: Error, track?: Track];
+	connectionError: [player: Player, error: Error];
+	volumeChange: [player: Player, oldVolume: number, newVolume: number];
+	queueAdd: [player: Player, track: Track];
+	queueAddList: [player: Player, tracks: Track[]];
+	queueRemove: [player: Player, track: Track, index: number];
+	playerPause: [player: Player, track: Track];
+	playerResume: [player: Player, track: Track];
+	playerStop: [player: Player];
+	playerDestroy: [player: Player];
+	ttsStart: [player: Player, payload: { text?: string; track?: Track }];
+	ttsEnd: [player: Player];
+	filterApplied: [player: Player, filter: AudioFilter];
+	filterRemoved: [player: Player, filter: AudioFilter];
+	filtersCleared: [player: Player];
+	lyricsCreate: [player: Player, track: Track, lyrics: any];
+	lyricsChange: [player: Player, track: Track, lyrics: any];
+	voiceCreate: [player: Player, evt: any];
+	stats: [stats: PlayerStats];
+	streamError: [player: Player, error: Error, track: Track | null];
+	forwardModeStart: [player: Player, leader: Player];
+	forwardModeEnd: [player: Player, leader: Player, reason: string | undefined];
+	seek: [player: Player, payload: { track: Track; position: number }];
+	trackStuck: [player: Player, track: Track | null];
+	playerIdChange: [player: Player, newPlayerId: string, oldPlayerId: string];
+}

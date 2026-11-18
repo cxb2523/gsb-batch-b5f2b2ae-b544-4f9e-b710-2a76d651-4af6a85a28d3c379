@@ -1,0 +1,32 @@
+{
+	"name": "ziplayer-dev-root",
+	"private": true,
+	"scripts": {
+		"build:core": "npm run build --prefix core",
+		"build:core:fast": "npm run build:fast --prefix core",
+		"pretest": "node scripts/ensure-core-build.js",
+		"test": "node --test --test-concurrency=4 tests/*.test.js",
+		"test:integration": "node --test tests/plugins/*.test.js tests/extensions/*.test.js",
+		"format": "npx prettier --ignore-path .gitignore --write .",
+		"format:check": "npx prettier --ignore-path .gitignore -l .",
+		"web:dev": "npm run dev --prefix page",
+		"web:build": "npm run build --prefix page",
+		"web:start": "npm run start --prefix page"
+	},
+	"devDependencies": {
+		"dotenv": "^17.2.2"
+	},
+	"dependencies": {
+		"@discordjs/voice": "^0.19.2",
+		"@ziplayer/plugin": "file:plugins",
+		"isomorphic-unfetch": "^4.0.2",
+		"spotify-url-info": "^3.3.0"
+	},
+	"allowScripts": {
+		"ffmpeg-static": true,
+		"@ziplayer/plugin": true,
+		"file:../core": true,
+		"esbuild@0.27.7": true,
+		"file:../../plugins": true
+	}
+}

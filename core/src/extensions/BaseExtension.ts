@@ -1,0 +1,122 @@
+import type {
+	SourceExtension,
+	ExtensionContext,
+	SearchResult,
+	ExtensionPlayRequest,
+	ExtensionPlayResponse,
+	ExtensionAfterPlayPayload,
+	ExtensionStreamRequest,
+	StreamInfo,
+	ExtensionSearchRequest,
+	PlayerDebugLevel,
+	PlayerEvent,
+	PlayerEventType,
+} from "../types";
+import type { Player } from "../structures/Player";
+import { EventEmitter } from "events";
+
+export abstract class BaseExtension extends EventEmitter implements SourceExtension {
+	abstract name: string;
+	abstract version: string;
+	priority?: number; // Higher = run first
+	abstract player: Player | null;
+	abstract active(alas: any): boolean | Promise<boolean>;
+	private readonly busUnsubscribers = new Map<Player, Set<() => void>>();
+
+	/**
+	 * Subscribe to this extension's player's scoped Bus events. Subscriptions are
+	 * automatically released when the extension is detached from the player.
+	 */
+	protected subscribeBus<K extends PlayerEventType>(
+		type: K,
+		listener: (event: Extract<PlayerEvent, { type: K }>) => void,
+		player: Player | null = this.player,
+	): () => void {
+		if (!player || player.destroyed) {
+			throw new Error(`Cannot subscribe ${this.name} to Bus events without an attached player`);
+		}
+
+		const unsubscribe = player.bus.subscribe(player.playerId, type, listener);
+		let playerUnsubscribers = this.busUnsubscribers.get(player);
+		if (!playerUnsubscribers) {
+			playerUnsubscribers = new Set();
+			this.busUnsubscribers.set(player, playerUnsubscribers);
+		}
+		playerUnsubscribers.add(unsubscribe);
+		return () => {
+			unsubscribe();
+			playerUnsubscribers?.delete(unsubscribe);
+			if (playerUnsubscribers?.size === 0) this.busUnsubscribers.delete(player);
+		};
+	}
+
+	/** @internal Called by ExtensionManager when the extension is detached. */
+	releaseBusSubscriptions(player?: Player): void {
+		const players = player ? [player] : [...this.busUnsubscribers.keys()];
+		for (const attachedPlayer of players) {
+			const unsubscribers = this.busUnsubscribers.get(attachedPlayer);
+			if (!unsubscribers) continue;
+			for (const unsubscribe of [...unsubscribers]) unsubscribe();
+			this.busUnsubscribers.delete(attachedPlayer);
+		}
+	}
+
+	// Player event forwarders
+	protected forwardToPlayer(event: string, ...args: any[]): void {
+		if (this.player && !this.player.destroyed) {
+			this.player.emit(event as any, ...args);
+		}
+	}
+
+	/**
+	 * Priority-aware debug logger for extensions. Routes through the owning
+	 * player's central {@link PlayerEventDebug} tracer (so it obeys the same
+	 * `debugLevel` PRIORITY threshold as everything else), tagged with the
+	 * extension's name, and - only once the level clears the threshold -
+	 * forwards a `debug` event on the player for backward-compatible listeners.
+	 */
+	protected debugLog(level: PlayerDebugLevel, message?: any, ...args: any[]): void {
+		this.forwardToPlayer("debug", `[${this.name}] ${message ?? ""}`.trimEnd(), ...args);
+	}
+
+	/** Convenience default-level (`debug`) shorthand for {@link debugLog}. */
+	protected debug(message?: any, ...args: any[]): void {
+		this.debugLog("debug", message, ...args);
+	}
+
+	// Direct player control methods
+	protected async playerPlayNext(): Promise<void> {
+		if (this.player && !this.player.destroyed) {
+			await (this.player as any).playNext();
+		}
+	}
+
+	protected async playerSkip(): Promise<void> {
+		if (this.player && !this.player.destroyed) {
+			(this.player as any).skip();
+		}
+	}
+
+	protected updatePlayerState(state: Partial<{ playing: boolean; paused: boolean; track: any }>): void {
+		if (this.player && !this.player.destroyed) {
+			// Update internal player state if needed
+			if (state.track !== undefined) this.player.setCurrentTrack(state.track);
+		}
+	}
+
+	onRegister?(context: ExtensionContext): void | Promise<void>;
+	onDestroy?(context: ExtensionContext): void | Promise<void>;
+	beforePlay?(
+		context: ExtensionContext,
+		payload: ExtensionPlayRequest,
+	): Promise<ExtensionPlayResponse | void> | ExtensionPlayResponse | void;
+	afterPlay?(context: ExtensionContext, payload: ExtensionAfterPlayPayload): Promise<void> | void;
+	provideSearch?(
+		context: ExtensionContext,
+		payload: ExtensionSearchRequest,
+	): Promise<SearchResult | null | undefined> | SearchResult | null | undefined;
+	provideStream?(
+		context: ExtensionContext,
+		payload: ExtensionStreamRequest,
+	): Promise<StreamInfo | null | undefined> | StreamInfo | null | undefined;
+}

@@ -1,0 +1,107 @@
+import { PlayerManager, getGlobalManager } from "./structures/PlayerManager";
+
+export { Player, assertVoiceChannel } from "./structures/Player";
+export type { PlayerWebAudioRegistration } from "./structures/Player";
+export { PlayerManager } from "./structures/PlayerManager";
+export { Bus } from "./structures/Bus";
+export {
+	BUS_REQUEST,
+	BUS_OUTPUT,
+	CONTROLLER_RPC,
+	PLAYER_RPC,
+	BUS_EVENT,
+	PLAYER_ACTION,
+	PLAYER_QUERY,
+	traceBusSignal,
+} from "./structures/BusContract";
+export type {
+	BusRequestKey,
+	BusOutputKey,
+	ControllerRpcKey,
+	PlayerRpcKey,
+	BusEventKey,
+	PlayerActionKey,
+	PlayerQueryKey,
+} from "./structures/BusContract";
+export { PlayerAction } from "./structures/PlayerAction";
+
+export { PlaybackOrchestrator, createPlaybackOrchestrator } from "./structures/PlaybackOrchestrator";
+export { createSharedControllers } from "./structures/PlayerManager";
+export { PlaybackSession } from "./structures/PlaybackSession";
+export {
+	WebAudioConnection,
+	encodeWebAudioOpusFrame,
+	decodeWebAudioOpusFrame,
+	WEB_AUDIO_MAGIC_0,
+	WEB_AUDIO_MAGIC_1,
+	WEB_AUDIO_PROTOCOL_VERSION_V1,
+	WEB_AUDIO_FLAG_CODEC_OPUS,
+	WEB_AUDIO_OPUS_SAMPLE_RATE_HZ,
+	WEB_AUDIO_OPUS_CHANNELS,
+	WEB_AUDIO_OPUS_CODEC_ID,
+	WEB_AUDIO_MAX_MESSAGE_BYTES,
+	DEFAULT_MAX_BUFFERED_BYTES,
+	DEFAULT_MAX_QUEUED_PACKETS,
+} from "./output/WebAudioConnection";
+export type {
+	WebAudioConnectionOptions,
+	WebAudioConnectionStats,
+	WebAudioConnectionState,
+	WebSocketLike,
+} from "./output/WebAudioConnection";
+export {
+	createOpusAudioResource,
+	demuxOggOpusToPackets,
+	demuxWebmOpusToPackets,
+	getOpusPacketDurationMs,
+	validateOpusPacketDuration,
+	validateOpusPacketFraming,
+} from "./audio/OpusSourceAdapter";
+export type { CreateOpusAudioResourceOptions } from "./audio/OpusSourceAdapter";
+export { TrackLoader } from "./structures/TrackLoader";
+export { PlaybackController } from "./controller/PlaybackController";
+export { ConnectionController } from "./controller/ConnectionController";
+export { VolumeController, defaults } from "./controller/VolumeController";
+export { StreamController } from "./controller/StreamController";
+export { QueueController, QueueState, QueueState as Queue } from "./controller/QueueController";
+export type { PlayerQueue } from "./controller/QueueController";
+export { AntiStuckController } from "./controller/AntiStuckController";
+export { PlaybackSessionController } from "./controller/PlaybackSessionController";
+export { TransitionController } from "./controller/TransitionController";
+export { PreloadController } from "./controller/PreloadController";
+export { SaveController } from "./controller/SaveController";
+export { TTSController } from "./controller/TTSController";
+export { PlaybackSkipController } from "./controller/PlaybackSkipController";
+export { BusLatencyTrace } from "./controller/BusLatencyTrace";
+export { PlayerEventBridge } from "./controller/PlayerEventBridge";
+export { PlayerEventDebug, DEBUG_PRIORITY } from "./controller/PlayerEventDebug";
+export { GlobalControllerRegistry, globalControllerRegistry } from "./controller/GlobalControllerRegistry";
+export { FilterEngine, isSafeCustomFilter } from "./controller/FilterController";
+export { StreamManager } from "./structures/StreamManager";
+export { resolveFfmpegExecutable } from "./audio/ffmpegLimits";
+export {
+	isBlockedIpAddress,
+	parseMediaUrl,
+	resolvePublicAddresses,
+	assertSafeMediaUrl,
+	openSafeHttpStream,
+	UnsafeMediaUrlError,
+} from "./audio/urlSafety";
+
+export type {
+	PlayerAction as PlayerActionMessage,
+	PlayerEvent,
+	PlayerEventType,
+	BusEvents,
+	PlayerQuery,
+	PlayerQueryMap,
+} from "./structures/Bus";
+
+export { PreloadManager } from "./structures/PreloadManager";
+export * from "./types";
+export * from "./plugins";
+export * from "./extensions";
+
+export default PlayerManager;
+export const getManager = () => getGlobalManager();
+export const getPlayer = (guildOrId: string) => getManager()?.get(guildOrId);

@@ -1,0 +1,229 @@
+import { createPlayerRequestId } from "../structures/Bus";
+import type { PlayerMessageContext, PlaybackSessionSnapshot, Track } from "../types";
+import type { Bus } from "../structures/Bus";
+import type { PlaybackTrackEndControllerOptions } from "../types";
+import { PlayerActionPriority } from "../types";
+import { BUS_EVENT, CONTROLLER_RPC, PLAYER_QUERY, PLAYER_RPC } from "../structures/BusContract";
+import { reportStreamError } from "./reportStreamError";
+import { queryPlaybackSession } from "../structures/PlaybackSession";
+
+/**
+ * Owns TRACK_END, queue refill, autoplay fallback, and queue-end transitions.
+ * Talks to sibling playback controllers only through Bus queries/RPCs —
+ * never by holding a direct reference to them.
+ *
+ * Per-player controller instance held by the shared `PlaybackOrchestrator` state for
+ * `playerId`. Registers no RPC of its own: `playback.transitionLock` is registered once in
+ * the orchestrator and routed by `ctx.playerId`.
+ */
+export class PlaybackTrackEndController {
+	private readonly playerId: string;
+	private readonly bus: Bus;
+	private readonly nextThroughBus: PlaybackTrackEndControllerOptions["nextThroughBus"];
+	private readonly stopPlayback: PlaybackTrackEndControllerOptions["stopPlayback"];
+	private readonly publishState: PlaybackTrackEndControllerOptions["publishState"];
+	private readonly queueSnapshot: PlaybackTrackEndControllerOptions["queueSnapshot"];
+	private readonly lifecycleSignal: AbortSignal;
+	private trackEndTransition = false;
+	private waitingForQueue = false;
+	private queueStartPromise: Promise<void> | null = null;
+	private queueStartGeneration = 0;
+
+	public constructor(playerId: string, options: PlaybackTrackEndControllerOptions) {
+		this.playerId = playerId;
+		this.bus = options.bus;
+		this.nextThroughBus = options.nextThroughBus;
+		this.stopPlayback = options.stopPlayback;
+		this.publishState = options.publishState;
+		this.queueSnapshot = options.queueSnapshot;
+		this.lifecycleSignal = options.lifecycleSignal;
+	}
+
+	public get isTransitioning(): boolean {
+		return this.trackEndTransition;
+	}
+	public get isWaitingForQueue(): boolean {
+		return this.waitingForQueue;
+	}
+
+	public onQueueEnd(): void {
+		if (!this.lifecycleSignal.aborted) this.waitingForQueue = true;
+	}
+
+	public setWaitingForQueue(waiting: boolean): void {
+		if (!this.lifecycleSignal.aborted) this.waitingForQueue = waiting;
+	}
+
+	public setTrackEndTransition(active: boolean): void {
+		if (!this.lifecycleSignal.aborted) this.trackEndTransition = active;
+	}
+
+	public async waitForQueue(signal: AbortSignal): Promise<void> {
+		const queueStartPromise = this.queueStartPromise;
+		if (!queueStartPromise) return;
+		await new Promise<void>((resolve) => {
+			const finish = () => {
+				signal.removeEventListener("abort", finish);
+				this.lifecycleSignal.removeEventListener("abort", finish);
+				resolve();
+			};
+			if (signal.aborted || this.lifecycleSignal.aborted) {
+				finish();
+				return;
+			}
+			signal.addEventListener("abort", finish, { once: true });
+			this.lifecycleSignal.addEventListener("abort", finish, { once: true });
+			void queueStartPromise.then(finish, finish);
+		});
+	}
+
+	public onQueueChanged(): void {
+		if (this.lifecycleSignal.aborted || !this.waitingForQueue || this.trackEndTransition || this.queueStartPromise) return;
+		if (!this.queueSnapshot().length) return;
+		const generation = ++this.queueStartGeneration;
+		this.queueStartPromise = this.startQueuedTrackAfterEnd()
+			.catch((error) => reportStreamError(this.bus, this.playerId, queryPlaybackSession(this.bus, this.playerId)?.track ?? null, error))
+			.finally(() => {
+				if (generation === this.queueStartGeneration) this.queueStartPromise = null;
+			});
+	}
+
+	public async onTrackEnd(snapshot: PlaybackSessionSnapshot): Promise<void> {
+		const current = queryPlaybackSession(this.bus, this.playerId);
+		if (!current || current.id !== snapshot.id || current.status === "ended" || current.status === "stopped") return;
+		if (this.trackEndTransition) return;
+		this.trackEndTransition = true;
+		try {
+			if (!current.isActive()) return;
+			const from = current.track;
+			const endedSession = current;
+			const context = this.createContext("PlaybackTrackEndController:track-end");
+
+			const loopMode = this.bus.querySync(this.playerId, PLAYER_QUERY.queueLoop);
+			let next: Track | null = null;
+			let relatedTracks: Track[] = (this.bus.querySync(this.playerId, PLAYER_QUERY.relatedTracks) as Track[] | null) ?? [];
+			let isFromQueueOrLoop = false;
+
+			if (loopMode === "track") {
+				next = endedSession.track;
+				isFromQueueOrLoop = true;
+			} else {
+				const queueSnapshot = this.queueSnapshot();
+				if (queueSnapshot.length > 0) {
+					next = queueSnapshot[0];
+					isFromQueueOrLoop = true;
+				} else if (loopMode === "queue") {
+					const history = (this.bus.querySync(this.playerId, PLAYER_QUERY.previousTracks) as Track[] | null) ?? [];
+					next = history[0] ?? endedSession.track;
+					isFromQueueOrLoop = true;
+				} else {
+					// Queue is empty -> generateRelated()
+					const previousTracks = (this.bus.querySync(this.playerId, PLAYER_QUERY.previousTracks) as Track[] | null) ?? [];
+					const source = previousTracks.at(-1) ?? endedSession.track;
+					try {
+						relatedTracks = await this.bus.requestRpc<{ track?: Track | null }, Track[]>(
+							this.playerId,
+							CONTROLLER_RPC.playbackCreateRelatedTracks,
+							{
+								track: source,
+							},
+						);
+					} catch (error) {
+						reportStreamError(this.bus, this.playerId, from, error);
+						relatedTracks = [];
+					}
+					relatedTracks = relatedTracks ?? [];
+					next = relatedTracks[0] ?? null;
+					isFromQueueOrLoop = false;
+				}
+			}
+
+			// Emit willNext
+			this.bus.requestRpcSync(this.playerId, PLAYER_RPC.queueWillNext, { track: next });
+
+			// Emit willPlay
+			if (next) {
+				this.bus.event(this.playerId, {
+					type: BUS_EVENT.willPlay,
+					track: next,
+					relatedTracks,
+					upcomingTracks: this.queueSnapshot(),
+				});
+			}
+
+			// Actually start next?
+			if (isFromQueueOrLoop) {
+				const queueNext = await this.nextThroughBus(false, context);
+				if (queueNext) {
+					endedSession.markEnded();
+					try {
+						await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.playbackStart, { track: queueNext, context, from });
+						this.waitingForQueue = false;
+					} catch (error) {
+						this.waitingForQueue = true;
+						throw error;
+					}
+					return;
+				}
+			} else {
+				const autoPlay = Boolean(this.bus.querySync(this.playerId, PLAYER_QUERY.queueAutoPlay));
+				if (autoPlay && next) {
+					endedSession.markEnded();
+					this.bus.requestRpcSync(this.playerId, PLAYER_RPC.queueWillNext, { track: null });
+					try {
+						await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.playbackStart, { track: next, context, from });
+						this.waitingForQueue = false;
+					} catch (error) {
+						this.waitingForQueue = true;
+						throw error;
+					}
+					return;
+				}
+			}
+
+			// autoPlay=false or no next candidate -> stop here
+			const finalSession = queryPlaybackSession(this.bus, this.playerId);
+			if (!finalSession || finalSession.id !== snapshot.id || !finalSession.isActive()) return;
+			endedSession.markEnded();
+			await this.stopPlayback(context.signal);
+			this.publishState();
+			this.waitingForQueue = true;
+			this.bus.event(this.playerId, { type: BUS_EVENT.queueEnd });
+		} finally {
+			this.trackEndTransition = false;
+		}
+	}
+
+	public dispose(): void {
+		this.queueStartGeneration++;
+		this.queueStartPromise = null;
+		this.trackEndTransition = false;
+		this.waitingForQueue = false;
+	}
+
+	private async startQueuedTrackAfterEnd(): Promise<void> {
+		if (this.lifecycleSignal.aborted || !this.waitingForQueue || this.trackEndTransition || !this.queueSnapshot().length) return;
+		this.trackEndTransition = true;
+		try {
+			const from = queryPlaybackSession(this.bus, this.playerId)?.track ?? null;
+			const context = this.createContext("PlaybackTrackEndController:queue-refill");
+			const next = await this.nextThroughBus(false, context);
+			if (!next || context.signal.aborted) return;
+			await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.playbackStart, { track: next, context, from });
+			this.waitingForQueue = false;
+		} finally {
+			this.trackEndTransition = false;
+		}
+	}
+
+	private createContext(source: string): PlayerMessageContext {
+		return {
+			playerId: this.playerId,
+			requestId: createPlayerRequestId(),
+			source,
+			signal: this.lifecycleSignal,
+			timestamp: Date.now(),
+			priority: PlayerActionPriority.NORMAL,
+		};
+	}
+}

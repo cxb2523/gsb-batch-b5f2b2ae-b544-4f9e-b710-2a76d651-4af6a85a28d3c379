@@ -1,0 +1,152 @@
+import type { Bus } from "../structures/Bus";
+import type { PlayerMessageContext } from "../types";
+import type { PlaybackSkipControllerOptions } from "../types";
+import { toError } from "../utils/errors";
+import { queryPlaybackSession } from "../structures/PlaybackSession";
+import {
+	BUS_EVENT,
+	CONTROLLER_RPC,
+	PLAYER_QUERY,
+	PLAYER_RPC,
+	type TtsSkipRequest,
+	type TtsSkipResponse,
+} from "../structures/BusContract";
+
+/** Owns manual skip and its autoplay/queue fallback workflow. Talks to sibling
+ * playback controllers only through Bus queries/RPCs — never by holding
+ * a direct reference to them. */
+export class PlaybackSkipController {
+	private readonly bus: Bus;
+	private readonly playerId: string;
+	private readonly nextThroughBus: PlaybackSkipControllerOptions["nextThroughBus"];
+	private readonly stopPlayback: PlaybackSkipControllerOptions["stopPlayback"];
+	private readonly publishState: PlaybackSkipControllerOptions["publishState"];
+	private readonly setWaitingForQueue: PlaybackSkipControllerOptions["setWaitingForQueue"];
+
+	public constructor(options: PlaybackSkipControllerOptions & { playerId: string }) {
+		this.bus = options.bus;
+		this.playerId = options.playerId;
+		this.nextThroughBus = options.nextThroughBus;
+		this.stopPlayback = options.stopPlayback;
+		this.publishState = options.publishState;
+		this.setWaitingForQueue = options.setWaitingForQueue;
+	}
+
+	public async skip(context: PlayerMessageContext, index?: number): Promise<boolean> {
+		if (context.signal.aborted) {
+			return false;
+		}
+
+		try {
+			const result = await this.doSkip(context, index);
+
+			if (context.signal.aborted) {
+				return false;
+			}
+
+			return result;
+		} catch (error) {
+			this.bus.event(this.playerId, {
+				type: BUS_EVENT.streamError,
+				error: toError(error),
+				track: queryPlaybackSession(this.bus, this.playerId)?.track ?? null,
+			});
+			return false;
+		}
+	}
+
+	private async doSkip(context: PlayerMessageContext, index?: number): Promise<boolean> {
+		if (context.signal.aborted) return false;
+
+		// 1. If an utterance is actively playing, preparing, or queued for TTS,
+		// invoking skip must skip that TTS utterance without affecting underlying music.
+		if (typeof index !== "number" && this.bus.hasRpc(CONTROLLER_RPC.ttsSkip)) {
+			try {
+				const ttsResult = await this.bus.requestRpc<TtsSkipRequest, TtsSkipResponse>(
+					this.playerId,
+					CONTROLLER_RPC.ttsSkip,
+					{},
+					{ signal: context.signal },
+				);
+				if (ttsResult?.skipped) {
+					return true;
+				}
+			} catch (error) {
+				if (context.signal.aborted) return false;
+				// If ttsSkip failed unexpectedly, proceed only if TTS is genuinely inactive
+				const ttsActive = Boolean(this.bus.querySync(this.playerId, PLAYER_QUERY.ttsIsActive));
+				if (ttsActive) {
+					return true;
+				}
+			}
+		}
+
+		if (context.signal.aborted) return false;
+
+		const oldSession = queryPlaybackSession(this.bus, this.playerId);
+		const from = oldSession?.track ?? null;
+		if (oldSession && context.sessionId && oldSession.sessionId !== context.sessionId) return false;
+		this.bus.requestRpcSync(this.playerId, CONTROLLER_RPC.playbackTransitionLock, { active: true });
+		try {
+			if (context.signal.aborted) return false;
+			if (oldSession?.isActive()) {
+				const transition = this.bus.querySync(this.playerId, PLAYER_QUERY.transitionSettings) as
+					| { enabled?: boolean }
+					| undefined;
+				if (transition?.enabled) {
+					try {
+						await this.bus.requestRpc(this.playerId, PLAYER_RPC.transitionFadeOutCurrent, undefined);
+					} catch (error) {
+						this.bus.event(this.playerId, {
+							type: BUS_EVENT.streamError,
+							error: toError(error),
+							track: oldSession.track,
+						});
+					}
+				}
+			}
+			if (context.signal.aborted) return false;
+
+			if (typeof index === "number" && index >= 0) {
+				for (let i = 0; i < index; i++) {
+					this.bus.requestRpcSync(this.playerId, PLAYER_RPC.queueRemove, { index: 0 });
+				}
+			}
+			if (context.signal.aborted) return false;
+
+			let next = await this.nextThroughBus(true, context);
+			if (context.signal.aborted) return false;
+
+			if (!next && this.bus.querySync(this.playerId, PLAYER_QUERY.queueAutoPlay) && oldSession) {
+				const candidate = await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.playbackPrepareAutoplay, {
+					session: oldSession,
+					context,
+				});
+				if (context.signal.aborted) return false;
+
+				if (candidate) {
+					this.bus.requestRpcSync(this.playerId, PLAYER_RPC.queueWillNext, { track: null });
+					next = candidate;
+				}
+			}
+
+			// COMMIT PHASE: no abort checks after commit
+			if (oldSession?.isActive()) {
+				this.bus.event(this.playerId, { type: BUS_EVENT.trackEnd, session: oldSession.snapshot() });
+				oldSession.markEnded();
+			}
+			if (!next) {
+				await this.stopPlayback(context.signal);
+				this.publishState();
+				this.setWaitingForQueue(true);
+				this.bus.event(this.playerId, { type: BUS_EVENT.queueEnd });
+				return true;
+			}
+			this.setWaitingForQueue(false);
+			await this.bus.requestRpc(this.playerId, CONTROLLER_RPC.playbackStart, { track: next, context, from });
+			return true;
+		} finally {
+			this.bus.requestRpcSync(this.playerId, CONTROLLER_RPC.playbackTransitionLock, { active: false });
+		}
+	}
+}

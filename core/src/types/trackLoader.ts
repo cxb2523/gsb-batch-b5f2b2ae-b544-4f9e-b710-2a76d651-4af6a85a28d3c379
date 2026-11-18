@@ -1,0 +1,37 @@
+import type { StreamInfo, Track, TrackMiddleware, TrackMiddlewareContext } from ".";
+import type { PlaybackSession } from "../structures/PlaybackSession";
+import type { DebugLogger } from "./debug";
+
+export interface TrackLoaderContext extends TrackMiddlewareContext {}
+export type TrackStreamResolver = (
+	track: Track,
+	session: PlaybackSession,
+) => Promise<StreamInfo | null | undefined> | StreamInfo | null | undefined;
+export interface TrackLoadResult {
+	track: Track;
+	stream: StreamInfo;
+	sessionId: number;
+	retry: number;
+	usedFallback: boolean;
+}
+export interface TrackAttemptQualityController {
+	get(): "high" | "low" | undefined;
+	set(quality: "high" | "low"): void;
+}
+export interface TrackRecoveryPolicy {
+	enabled?: boolean;
+	maxRetries?: number;
+	retryDelayMs?: number;
+	reusePreloadFirst?: boolean;
+	reduceQualityOnRetry?: boolean;
+	controlledSkipThreshold?: number;
+}
+/** Per-player configuration handed to the shared `TrackLoader` via `attach(playerId, options)`. */
+export interface TrackLoaderOptions {
+	middleware?: TrackMiddleware[];
+	context: TrackLoaderContext;
+	resolvers?: TrackStreamResolver[];
+	recovery?: TrackRecoveryPolicy;
+	qualityController?: TrackAttemptQualityController;
+	debug?: DebugLogger;
+}
