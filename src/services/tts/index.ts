@@ -231,6 +231,14 @@ class VoicePipeline {
     this.webspeech.stop();
   }
 
+  /** Tear down the voice FX chain(s). Called at the end of each wake so
+   *  repeated wakes don't accumulate chains on the shared AudioContext. */
+  disposeChain() {
+    this.chain?.dispose();
+    this.chain = null;
+    this.eleven.disposeChain();
+  }
+
   private key(text: string, voice?: keyof typeof VOICES) {
     return `${voice ?? 'default'}::${text}`;
   }

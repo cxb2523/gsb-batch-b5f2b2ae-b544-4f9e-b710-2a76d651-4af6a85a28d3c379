@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useJarvis } from '@/state/store';
 import { voice } from '@/services/tts';
+import { endWakeAudioSession } from '@/services/audio/wakeSession';
 
 /**
  * Global keyboard + NATIVE clap wiring.
@@ -25,6 +26,7 @@ export function useClap(onTrigger: () => void) {
       }
       if (e.key === 'r' || e.key === 'R') {
         e.preventDefault();
+        endWakeAudioSession();
         voice.stop();
         useJarvis.getState().reset();
         return;

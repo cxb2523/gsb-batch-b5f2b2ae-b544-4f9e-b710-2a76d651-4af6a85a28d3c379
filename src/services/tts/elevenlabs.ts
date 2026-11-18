@@ -176,6 +176,13 @@ export class ElevenLabsTTS {
     this.stopAnalyser();
   }
 
+  /** Release the shared FX chain. Called when a wake sequence ends so the
+   *  next wake rebuilds a fresh chain instead of stacking connections. */
+  disposeChain() {
+    this.chain?.dispose();
+    this.chain = null;
+  }
+
   private stopAnalyser() {
     if (this.rafId) {
       cancelAnimationFrame(this.rafId);

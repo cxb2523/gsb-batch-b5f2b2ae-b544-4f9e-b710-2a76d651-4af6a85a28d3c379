@@ -2,10 +2,14 @@ import { useCallback } from 'react';
 import { useJarvis } from '@/state/store';
 import { voice } from '@/services/tts';
 import { buildSegments, getActiveCues, type BriefingContext, type PanelKey } from '@/services/briefing/mock-data';
-import { playAmbientBed } from '@/services/audio/ambient';
-import { playMusic, type MusicController } from '@/services/audio/music';
 import { whoosh, chime, impact, riser } from '@/services/audio/sfx';
 import { unlockAudio } from '@/services/audio/bus';
+import {
+  beginWakeAudioSession,
+  startWakeMusic,
+  duckWakeMusic,
+  swellWakeBed,
+} from '@/services/audio/wakeSession';
 import { CONFIG } from '@/config';
 
 // Live data fetch — timeboxed so the wake never stalls on a slow API.
@@ -66,17 +70,13 @@ export function useWakeSequence() {
 
     // Audio bed — local MP3 (AC/DC Shoot to Thrill on disk). No YouTube,
     // no embed block. MusicPanel is purely visual; this plays the actual audio.
-    let musicCtl: MusicController | null = null;
-    let proceduralBed: ReturnType<typeof playAmbientBed> | null = null;
-    playMusic(CONFIG.musicTrack, CONFIG.musicLevel).then((ctl) => {
-      if (ctl) {
-        musicCtl = ctl;
-        // Expose on window so v2.0 voice commands can stop/duck it.
-        (window as any).__jarvisMusic = ctl;
-      } else {
-        proceduralBed = playAmbientBed({ level: 0.18 });
-      }
-    });
+    //
+    // One re-entrant session owns the wake's music + ambient bed: beginning
+    // this session stops the previous wake's music/bed (even mid-fade), and
+    // if the async MP3 load resolves after a newer wake has begun, it is
+    // discarded without playing.
+    const audioSession = beginWakeAudioSession();
+    startWakeMusic(audioSession, CONFIG.musicTrack, CONFIG.musicLevel);
 
     // Phase 1: space → Earth
     whoosh({ level: 0.35, duration: 0.55 });
@@ -92,8 +92,8 @@ export function useWakeSequence() {
     // Phase 3: briefing begins. Music is already playing from disk —
     // duck it so JARVIS cuts through cleanly.
     chime({ level: 0.18 });
-    musicCtl?.duck(CONFIG.musicLevel * 0.42, 400);
-    proceduralBed?.swell(0.18, 300);
+    duckWakeMusic(audioSession, CONFIG.musicLevel * 0.42, 400);
+    swellWakeBed(audioSession, 0.18, 300);
     setPhase('briefing');
     setVoiceActive(true);
 
@@ -175,8 +175,9 @@ export function useWakeSequence() {
     const timeoutIds: number[] = [];
 
     // Speak the whole briefing as a single pre-rendered clip.
-    await precachePromise;
-    await voice.speak(script, {
+    try {
+      await precachePromise;
+      await voice.speak(script, {
       voice: 'jarvis',
       onStart: () => {
         // Audio actually started playing — arm wall-clock timers from t=0.
@@ -203,6 +204,11 @@ export function useWakeSequence() {
         }
       },
     });
+    } finally {
+      // Wake is over (or failed) — dispose the voice FX chain so repeated
+      // wakes don't stack another chain on the shared AudioContext.
+      voice.disposeChain();
+    }
 
     // Speech ended — clear any pending timeouts (most have already fired).
     timeoutIds.forEach((id) => clearTimeout(id));
@@ -213,8 +219,8 @@ export function useWakeSequence() {
 
     // Done — final stinger. Music swells back to full after George finishes.
     impact({ level: 0.45 });
-    musicCtl?.duck(CONFIG.musicLevel, 1800);  // unduck — restore to full
-    proceduralBed?.swell(0.22, 1200);
+    duckWakeMusic(audioSession, CONFIG.musicLevel, 1800);  // unduck — restore to full
+    swellWakeBed(audioSession, 0.22, 1200);
     setPhase('ready');
     setVoiceActive(false);
     setVoiceAmp(0);

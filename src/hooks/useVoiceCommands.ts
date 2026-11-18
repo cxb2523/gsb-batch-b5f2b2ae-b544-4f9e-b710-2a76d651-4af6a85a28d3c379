@@ -20,6 +20,7 @@
 import { useEffect, useRef } from 'react';
 import { useJarvis } from '@/state/store';
 import { voice } from '@/services/tts';
+import { endWakeAudioSession } from '@/services/audio/wakeSession';
 
 type Rec = any;
 
@@ -93,6 +94,7 @@ export function useVoiceCommands(wake: () => Promise<void>) {
       }
       if (/\b(goodnight|good night|sleep)\b/.test(cmd)) {
         await speak('Goodnight, boss.');
+        endWakeAudioSession();
         useJarvis.getState().reset();
         return;
       }
