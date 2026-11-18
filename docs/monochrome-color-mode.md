@@ -18,7 +18,7 @@ viewer.setColorMode('source');
 viewer.setColorMode('monochrome', '#000000');
 ```
 
-The policy is applied by the shared color resolver, so normalized DWG/DXF output is consistent across Canvas2D, retained WebGL geometry, text overlays, fills, layer colors and ByBlock inheritance. Source entity colors, line types, line weights, visibility, geometry and alpha values are preserved.
+The policy is applied by the shared color resolver, so normalized DWG/DXF output is consistent across Canvas2D, retained WebGL geometry, text overlays, fills, layer colors and ByBlock inheritance. The WebGL renderer reads the policy once while building its CPU scene (`rebuildScene()`), so switching modes re-uploads the GPU batches instead of only repainting; the current pan/zoom view is retained and the previous scene's GPU buffers are released. Source entity colors, line types, line weights, visibility, geometry and alpha values are preserved.
 
 Native DWF/DWFx/XPS rendering forwards the same fixed color to `dwf-viewer` when the installed native renderer exposes `setMonochromeColor()`.
 

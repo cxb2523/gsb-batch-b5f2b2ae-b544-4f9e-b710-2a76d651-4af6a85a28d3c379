@@ -5,6 +5,7 @@ import { cadTextLayoutBounds, layoutCadText, paintCadText, parseCadText, type Ca
 import { cadEntityWorldStrokeWidth, inferEntityKind, isCadPolylineClosed } from '../core/entity.js';
 import { applyByBlockLineTypeInheritance, createDashedCadPrimitives, resolveCadLinePattern, transformCadLineTypeGlyph, type CadLineTypeMarker } from '../core/linetype.js';
 import { createCadSceneDocument } from '../core/scene.js';
+import { readCadColorPolicy, type CadColorMode } from '../core/colorPolicy.js';
 import { EMPTY_SHX_GLYPH_RESOLVER, type CadShxGlyph } from '../core/shx.js';
 import { matrixFromInsert, transformEntity } from '../core/transform.js';
 import type { CadBlock, CadBounds, CadDocument, CadEntity, CadFitMode, CadPathCommand, CadPoint2D, CadPoint3D } from '../core/types.js';
@@ -197,14 +198,17 @@ export class CadWebGLRenderer {
     this.sourceDocument = document;
     this.document = createCadSceneDocument(document);
     this.bounds = computeCadDocumentBounds(this.document, this.boundsOptions());
-    this.disposeScene();
-    const cpuScene = buildCpuScene(this.document, this.opts, this.bounds);
-    this.scene = uploadScene(this.gl, cpuScene);
-    this.stats = createStatsFromScene(this.scene, 0);
+    this.rebuildScene();
     this.fitToView();
   }
 
-  refreshReferences(): void {
+  /**
+   * Rebuilds the retained CPU scene and re-uploads GPU buffers for the active
+   * document, honoring its render-only color policy. The previous scene's GPU
+   * buffers are deleted before replacement so policy toggles never leak buffers,
+   * and the current pan/zoom view is preserved across the rebuild.
+   */
+  rebuildScene(): void {
     if (!this.document) return;
     const view = { ...this.view };
     const fitScale = this.fitScale;
@@ -214,6 +218,11 @@ export class CadWebGLRenderer {
     this.stats = createStatsFromScene(this.scene, 0);
     this.view = view;
     this.fitScale = fitScale;
+  }
+
+  refreshReferences(): void {
+    if (!this.document) return;
+    this.rebuildScene();
     this.render();
     this.emitViewChange();
   }
@@ -228,8 +237,13 @@ export class CadWebGLRenderer {
     const rebuildRequired = requiresSceneRebuild(this.opts, options);
     const refit = options.fitMode !== undefined && options.fitMode !== this.opts.fitMode;
     this.opts = { ...this.opts, ...options };
-    if (rebuildRequired && (this.sourceDocument ?? this.document)) {
-      this.setDocument(this.sourceDocument ?? this.document!);
+    if (rebuildRequired && this.document) {
+      // Rebuild the retained scene in place so option changes (including the
+      // monochrome foreground fallback) neither refit the view nor replace the
+      // parser-owned source document reference.
+      this.rebuildScene();
+      this.render();
+      this.emitViewChange();
       return;
     }
     if (refit && this.document) {
@@ -763,7 +777,11 @@ function buildCpuScene(document: CadDocument, opts: Required<CanvasViewerOptions
   const origin = boundsValid(bounds)
     ? { x: (bounds.minX + bounds.maxX) / 2, y: (bounds.minY + bounds.maxY) / 2 }
     : { x: 0, y: 0 };
-  const builder = new CpuSceneBuilder(document, opts, bounds, origin);
+  // The render-only color policy travels in document metadata. Read it once while
+  // building the retained CPU scene so every stroke/fill/text/placeholder color is
+  // resolved consistently; the parser-owned source document is never rewritten.
+  const policy = readCadColorPolicy(document);
+  const builder = new CpuSceneBuilder(document, opts, bounds, origin, policy);
   for (const entity of document.entities) builder.addEntityTracked(entity, 0);
   const scene = builder.finalize();
   scene.buildElapsedMs = performance.now() - started;
@@ -782,7 +800,13 @@ class CpuSceneBuilder {
   private readonly maxVerticesPerBatch: number;
   private primitiveCount = 0;
 
-  constructor(private readonly document: CadDocument, private readonly opts: Required<CanvasViewerOptions>, private readonly bounds: CadBounds, private readonly origin: CadPoint2D) {
+  constructor(
+    private readonly document: CadDocument,
+    private readonly opts: Required<CanvasViewerOptions>,
+    private readonly bounds: CadBounds,
+    private readonly origin: CadPoint2D,
+    private readonly colorPolicy: { mode: CadColorMode; monochromeColor?: string }
+  ) {
     const width = boundsValid(bounds) ? Math.max(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, 1e-9) : 1;
     this.tileSize = opts.enableSpatialIndex ? width / Math.max(8, opts.spatialIndexCellCount) : Number.POSITIVE_INFINITY;
     this.maxVerticesPerBatch = Math.max(4096, Math.floor(opts.maxVerticesPerBatch));
@@ -1173,7 +1197,17 @@ class CpuSceneBuilder {
   }
 
   private colorOptions() {
-    return { foreground: this.opts.foreground, background: this.opts.background, trueColorByteOrder: this.opts.trueColorByteOrder, contrastMode: this.opts.contrastMode, minColorContrast: this.opts.minColorContrast };
+    return {
+      foreground: this.opts.foreground,
+      background: this.opts.background,
+      trueColorByteOrder: this.opts.trueColorByteOrder,
+      contrastMode: this.opts.contrastMode,
+      minColorContrast: this.opts.minColorContrast,
+      // Explicit policy inputs make the retained scene independent of implicit
+      // metadata lookups; an unspecified monochrome color falls back to foreground.
+      colorMode: this.colorPolicy.mode,
+      ...(this.colorPolicy.monochromeColor ? { monochromeColor: this.colorPolicy.monochromeColor } : {})
+    };
   }
 
   private markSkipped(type: string): void {

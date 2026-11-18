@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Apply the render-only source/monochrome color policy when the WebGL renderer builds its retained CPU scene. Monochrome mode now replaces every retained stroke, fill, point, linetype glyph and overlay text/placeholder color with the policy color (falling back to the renderer foreground when unspecified), while source mode keeps the authored ACI/BYLAYER/BYBLOCK resolution.
+- Policy and color-affecting option changes rebuild the retained GPU scene in place without changing the pan/zoom view and without leaking the previous scene's GPU buffers. WebGL `captureCanvas()` consequently exports the active monochrome frame without mutating the parser-owned source document.
+
 ## 0.8.4 (candidate, not published)
 
 ### Fixed
