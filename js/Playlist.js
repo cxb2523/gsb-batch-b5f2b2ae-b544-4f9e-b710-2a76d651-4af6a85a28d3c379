@@ -132,10 +132,17 @@ Playlist.prototype = {
   },
 
   onItemRemoved(item) {
+    let isSelected = this.selectedItem && this.selectedItem.hash === item.hash;
+    if (isSelected) {
+      /* Notify the player first so it stops playback and releases the
+         visualizer animation frame and object URLs before the selection
+         moves on: a destroyed item must never be referenced afterwards. */
+      this.params.onItemRemoved(item);
+    }
     if (this.list.length === 1) {
       this.onItemCleared();
-    } else if (this.selectedItem.hash === item.hash) {
-      this.selectNext(item);
+    } else if (isSelected) {
+      this.selectNext();
     }
     item.destroy();
     this.list = this.list.filter(i => i.hash !== item.hash);
@@ -143,9 +150,36 @@ Playlist.prototype = {
     this.hashes = this.hashes.filter(h => h !== item.hash);
   },
 
+  clear() {
+    if (this.list.length === 0) {
+      return;
+    }
+    if (this.selectedItem) {
+      /* Release the current track's resources before tearing the list down. */
+      this.params.onItemRemoved(this.selectedItem);
+    }
+    for (let item of this.list) {
+      item.destroy();
+    }
+    this.list = [];
+    this.orderedlist = [];
+    this.hashes = [];
+    this.onItemCleared();
+  },
+
   onItemCleared() {
     this.selectedItem = null;
     this.params.onItemCleared();
+  },
+
+  onItemUpdated(item) {
+    /* A tag finished loading after the item was selected: forward it so
+       the player can refresh the header/cover without re-selecting the
+       item (which would restart playback and leak object URLs). */
+    if (this.selectedItem && this.selectedItem.hash === item.hash
+        && this.params.onItemUpdated) {
+      this.params.onItemUpdated(item);
+    }
   }
 };
 
@@ -222,7 +256,10 @@ PlaylistItem.prototype = {
 
     this.element = item;
     if (this.element.classList.contains("playing")) {
-      this.onItemSelected(this);
+      /* The tag resolved while this item is selected: refresh the
+         header/cover instead of re-selecting, which would restart
+         playback and revoke the object URL currently in use. */
+      this.playlist.onItemUpdated(this);
     }
     return item;
   },
@@ -239,8 +276,11 @@ PlaylistItem.prototype = {
 
   destroy() {
     this.element.remove();
+    URL.revokeObjectURL(this.pic);
     this.media = null;
-    this.playlist.coverEl.src = "";
+    /* The cover is owned by the selection flow (select/unselect and the
+       player's releaseMedia): destroying a background item must not
+       blank the cover of the track that is now playing. */
   }
 };
 

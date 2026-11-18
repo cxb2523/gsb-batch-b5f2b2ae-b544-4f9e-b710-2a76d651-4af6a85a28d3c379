@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Media Player transition tests</title>
+	<script>
+	/* ---- Instrumentation: track live requestAnimationFrame loops ---- */
+	window.__liveFrames = new Set();
+	(function() {
+		var origRaf = window.requestAnimationFrame.bind(window);
+		var origCancel = window.cancelAnimationFrame.bind(window);
+		window.requestAnimationFrame = function(cb) {
+			var id = origRaf(function(t) {
+				window.__liveFrames.delete(id);
+				cb(t);
+			});
+			window.__liveFrames.add(id);
+			return id;
+		};
+		window.cancelAnimationFrame = function(id) {
+			window.__liveFrames.delete(id);
+			return origCancel(id);
+		};
+	})();
+
+	/* ---- Stub for the (external) mp3 tag reader ----
+	   Files with "pic" in their name get an embedded picture, others don't. */
+	window.getMp3Tag = function(media) {
+		return new Promise(function(resolve) {
+			setTimeout(function() {
+				resolve({
+					title: undefined,
+					artist: undefined,
+					album: undefined,
+					picture: media.name.indexOf("pic") > -1
+						? new Blob([new Uint8Array([1, 2, 3])], {type: "image/png"})
+						: null
+				});
+			}, 10);
+		});
+	};
+	</script>
+	<script src="../js/utils.js"></script>
+	<script src="../js/SettingsStore.js"></script>
+	<script src="../js/SettingsOverlay.js"></script>
+	<script src="../js/Equalizer.js"></script>
+	<script src="../js/Playlist.js"></script>
+	<script src="../js/MediaPlayer.js"></script>
+</head>
+<body>
+	<div class="main-content">
+		<div id="display-container">
+			<div id="header-container" class="header">
+				<div id="header"></div>
+			</div>
+			<div id="content-area">
+				<img id="cover" src="">
+				<canvas id="visualizer" width="600" height="300" class="placeholder"></canvas>
+				<video controls id="MediaPlayer" hidden="hidden"></video>
+				<div id="control-overlay"></div>
+			</div>
+		</div>
+		<div id="sidebar">
+			<div id="sidebar-header">Playlist</div>
+			<div id="upload-container"><input title="Click to upload" type="file" id="upfile" accept="audio/*|video/*" multiple><div></div></div>
+			<ul id="playlist"></ul>
+		</div>
+	</div>
+	<div>
+		<div id="progress-bar">
+			<div id="progress"></div>
+			<span id="tooltip"></span>
+		</div>
+		<div id="media-controls" class="disabled">
+			<button class="media-control" id="equalizer-btn" title="Equalizer"></button>
+			<div id="equalizer-panel" class="menu"></div>
+			<div id="volume-control">
+				<span id="volume-icon"></span>
+				<input type="range" id="volume-range" value="1" min="0" max="1" step="0.01">
+			</div>
+			<div id="main-controls">
+				<button class="media-control" id="previous-btn" title="Rewind"></button>
+				<button class="media-control paused" id="play-pause"></button>
+				<button class="media-control" id="next-btn" title="Forward"></button>
+			</div>
+			<div id="secondary-controls">
+				<button class="media-control not-checked" id="speed-btn"></button>
+				<button class="media-control" id="loop" title="Repeat"></button>
+				<button class="media-control" id="shuffle" title="Shuffle"></button>
+				<button class="media-control" title="Settings" id="settings-btn"></button>
+			</div>
+		</div>
+	</div>
+	<div id="settings-overlay" class="hidden"></div>
+	<pre id="results">RUNNING</pre>
+
+	<script>
+	var results = [];
+	function assert(name, cond, detail) {
+		results.push((cond ? "PASS" : "FAIL") + " | " + name + (cond ? "" : " | got: " + detail));
+	}
+	function sleep(ms) {
+		return new Promise(function(r) { setTimeout(r, ms); });
+	}
+	function makeWav(name) {
+		var sampleRate = 8000, n = sampleRate; // 1 second
+		var buffer = new ArrayBuffer(44 + n * 2);
+		var view = new DataView(buffer);
+		function writeStr(off, s) {
+			for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+		}
+		writeStr(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); writeStr(8, "WAVE");
+		writeStr(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+		view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+		view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true);
+		view.setUint16(34, 16, true); writeStr(36, "data"); view.setUint32(40, n * 2, true);
+		for (var i = 0; i < n; i++) view.setInt16(44 + i * 2, Math.sin(i / 10) * 10000, true);
+		return new File([buffer], name, {type: "audio/wav"});
+	}
+
+	async function run() {
+		while (!MediaPlayer.playlist) { await sleep(50); } // wait for init()
+		var MP = MediaPlayer;
+		var playlist = MP.playlist;
+		var cover = document.getElementById("cover");
+		var coverSrc = function() { return cover.getAttribute("src") || ""; };
+		var header = function() { return document.getElementById("header").textContent; };
+
+		/* ---------- Scenario 1: normal track switching ---------- */
+		MP.uploadFiles([
+			makeWav("ArtistA - SongA-pic.wav"),
+			makeWav("ArtistB - SongB.wav"),
+			makeWav("ArtistC - SongC-pic.wav")
+		]);
+		await sleep(400);
+		assert("s1 header shows song A", header().indexOf("SongA") > -1, header());
+		assert("s1 cover is a blob URL for A", coverSrc().indexOf("blob:") === 0, coverSrc());
+		assert("s1 visualizer loop running", MP.animationId !== null, String(MP.animationId));
+		assert("s1 at most one live animation frame", window.__liveFrames.size <= 1, window.__liveFrames.size);
+		var ctx1 = MP.ctx;
+		assert("s1 audio context created", !!ctx1);
+
+		MP.changeVolume(0.3);
+		var eqNode = MP.equalizer.frequencyMap.get(500).audioNode;
+		MP.equalizer.setFrequencyGain(500, 12);
+
+		playlist.selectNext(); // -> B (no picture)
+		await sleep(400);
+		assert("s1 header shows song B after switch", header().indexOf("SongB") > -1, header());
+		assert("s1 cover cleared for tag-less B", coverSrc() === "", coverSrc());
+		assert("s1 audio context not recreated", MP.ctx === ctx1);
+		assert("s1 volume survives switch", Math.abs(MP.videoEl.volume - 0.09) < 1e-6, MP.videoEl.volume);
+		assert("s1 equalizer gain survives switch", eqNode.gain.value === 12, eqNode.gain.value);
+		assert("s1 single animation loop after switch", window.__liveFrames.size <= 1, window.__liveFrames.size);
+
+		/* ---------- Scenario 2: removing the current item selects the next ---------- */
+		var removedSrc = MP.videoEl.src;
+		playlist.onItemRemoved(playlist.selectedItem); // remove B
+		await sleep(400);
+		assert("s2 next item C auto-selected", header().indexOf("SongC") > -1, header());
+		assert("s2 cover is a blob URL for C", coverSrc().indexOf("blob:") === 0, coverSrc());
+		assert("s2 old object URL replaced", MP.videoEl.src !== removedSrc && MP.videoEl.src.indexOf("blob:") === 0, MP.videoEl.src);
+		assert("s2 visualizer loop running for C", MP.animationId !== null, String(MP.animationId));
+		assert("s2 old animation stopped (one loop max)", window.__liveFrames.size <= 1, window.__liveFrames.size);
+		assert("s2 list shrunk to 2 items", playlist.list.length === 2, playlist.list.length);
+
+		/* ---------- Scenario 3: rapid consecutive switching ---------- */
+		var ctxBefore = MP.ctx;
+		for (var i = 0; i < 6; i++) playlist.selectNext();
+		await sleep(400);
+		var sel = playlist.selectedItem;
+		assert("s3 no duplicate audio context", MP.ctx === ctxBefore);
+		assert("s3 equalizer nodes intact", MP.equalizer.frequencyMap.size === 10, MP.equalizer.frequencyMap.size);
+		assert("s3 single animation loop", window.__liveFrames.size <= 1, window.__liveFrames.size);
+		assert("s3 header matches final item", header().indexOf(sel.tag.title) > -1, header() + " vs " + sel.tag.title);
+		assert("s3 cover matches final item",
+			sel.pic ? coverSrc().indexOf("blob:") === 0 : coverSrc() === "", coverSrc());
+		assert("s3 volume survives rapid switching", Math.abs(MP.videoEl.volume - 0.09) < 1e-6, MP.videoEl.volume);
+		assert("s3 equalizer gain survives rapid switching", eqNode.gain.value === 12, eqNode.gain.value);
+
+		/* ---------- Scenario 4: video item clears the cover ---------- */
+		MP.uploadFiles([new File([new Uint8Array(100)], "MyVideo.mp4", {type: "video/mp4"})]);
+		await sleep(100);
+		var vidItem = playlist.list.find(function(it) { return it.media.name === "MyVideo.mp4"; });
+		playlist.onItemSelected(vidItem);
+		await sleep(200);
+		assert("s4 video element shown", MP.videoEl.hidden === false);
+		assert("s4 canvas hidden for video", MP.canvasEl.hidden === true);
+		assert("s4 cover cleared for video", coverSrc() === "", coverSrc());
+		assert("s4 display container marked as video",
+			document.getElementById("display-container").className === "video",
+			document.getElementById("display-container").className);
+
+		/* ---------- Scenario 5: clearing the list ---------- */
+		playlist.clear();
+		await sleep(200);
+		assert("s5 controls disabled", document.body.classList.contains("controls-disabled"));
+		assert("s5 cover cleared", coverSrc() === "", coverSrc());
+		assert("s5 no live animation frames", window.__liveFrames.size === 0, window.__liveFrames.size);
+		assert("s5 animationId released", MP.animationId === null, String(MP.animationId));
+		assert("s5 media src removed", MP.videoEl.getAttribute("src") === null, MP.videoEl.getAttribute("src"));
+		assert("s5 playlist empty", playlist.list.length === 0, playlist.list.length);
+		assert("s5 header cleared", header() === "", header());
+
+		/* ---------- Scenario 6: removing the only remaining item ---------- */
+		MP.uploadFiles([makeWav("Solo - Only-pic.wav")]);
+		await sleep(300);
+		assert("s6 UI enabled after re-upload", MP.UIEnabled === true);
+		assert("s6 cover shown for solo item", coverSrc().indexOf("blob:") === 0, coverSrc());
+		playlist.onItemRemoved(playlist.selectedItem);
+		await sleep(200);
+		assert("s6 controls disabled", document.body.classList.contains("controls-disabled"));
+		assert("s6 cover cleared", coverSrc() === "", coverSrc());
+		assert("s6 no live animation frames", window.__liveFrames.size === 0, window.__liveFrames.size);
+		assert("s6 media src removed", MP.videoEl.getAttribute("src") === null, MP.videoEl.getAttribute("src"));
+		assert("s6 playlist empty", playlist.list.length === 0, playlist.list.length);
+
+		var failed = results.filter(function(r) { return r.indexOf("FAIL") === 0; });
+		document.getElementById("results").textContent =
+			results.join("\n") + "\n=== " + (failed.length ? failed.length + " FAILURES" : "ALL PASS") + " ===";
+		document.title = failed.length ? "TESTS FAILED" : "TESTS PASSED";
+	}
+
+	window.addEventListener("load", function() {
+		run().catch(function(e) {
+			document.getElementById("results").textContent =
+				results.join("\n") + "\nERROR: " + (e && e.stack || e);
+			document.title = "TESTS ERROR";
+		});
+	});
+	</script>
+</body>
+</html>

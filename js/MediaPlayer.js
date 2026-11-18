@@ -23,6 +23,7 @@ var MediaPlayer = {
     this.sidebarEl = document.getElementById("sidebar");
     this.controlsEl = document.getElementById("media-controls");
     this.canvasEl = document.getElementById("visualizer");
+    this.coverEl = document.getElementById("cover");
 
     this.controlOverlay = document.getElementById("control-overlay");
     this.videoEl.controls = false;
@@ -50,7 +51,13 @@ var MediaPlayer = {
     this.playlist = new Playlist({
       element: document.getElementById("playlist"),
       onItemSelected: this.setMedia.bind(this),
-      onItemRemoved: () => {},
+      onItemRemoved: this.releaseMedia.bind(this),
+      onItemUpdated: (item) => {
+        /* The tag/picture arrived after the item was selected: refresh
+           the header and cover without restarting playback. */
+        this.updateHeader(item.tag);
+        this.updateCover(item);
+      },
       onItemCleared: () => {
         this.UIEnabled = false;
       },
@@ -203,8 +210,7 @@ var MediaPlayer = {
       document.title = "Media Player";
       this.videoEl.hidden = true;
       this.canvasEl.hidden = false;
-      this.videoEl.src = "";
-      this.pause(true);
+      this.releaseMedia();
       this.videoEl.currentTime = 0;
     } else {
       document.body.classList.remove("controls-disabled");
@@ -241,17 +247,46 @@ var MediaPlayer = {
     return this.playlist.addAll(uploadedMedia);
   },
   setMedia(item) {
+    /* Release the previous track first so the switch is atomic: no stale
+       animation frame, object URL or cover can leak into the new track. */
+    this.killContext();
+    URL.revokeObjectURL(this.videoEl.src);
+
+    /* The audio graph is created once, on the first track, and reused for
+       every subsequent one so volume/equalizer settings survive switches. */
+    if (!this.ctx) {
+      this.initAudioContext();
+    }
+
     document.querySelector("#display-container")
       .className = item.type;
     this.videoEl.hidden = item.type != "video";
     this.canvasEl.hidden = item.type == "video";
-    URL.revokeObjectURL(this.videoEl.src);
     this.videoEl.src = URL.createObjectURL(item.media);
     this.updateHeader(item.tag);
+    this.updateCover(item);
     // Scroll to the selected item
     this.playlist.element.scrollTo(item.element.offsetTop, 1000);
     this.UIEnabled = true;
     this.play(true);
+  },
+  /*
+   * Stops playback and releases every resource tied to the current track:
+   * the visualizer animation loop, the media object URL and the cover.
+   * Called by the playlist *before* the selection moves away from an item
+   * (or the list is cleared) so a destroyed item is never referenced again.
+   */
+  releaseMedia() {
+    this.pause(true);
+    URL.revokeObjectURL(this.videoEl.src);
+    this.videoEl.removeAttribute("src");
+    this.videoEl.load();
+    this.coverEl.src = "";
+  },
+  updateCover(item) {
+    /* Never keep the previous cover around: only audio items with an
+       embedded picture have one, everything else clears it. */
+    this.coverEl.src = item.type == "audio" && item.pic ? item.pic : "";
   },
   updateHeader(tag) {
     let artistAndTitle = tag.artist ? tag.artist + " - " + tag.title
@@ -264,6 +299,13 @@ var MediaPlayer = {
 
   /** Audio controls **/
   initAudioContext() {
+    /* The audio graph (context, media element source, equalizer, analyser)
+       must be created exactly once: a media element can only have a single
+       source node, and re-creating the graph would drop the volume and
+       equalizer gains the user configured. */
+    if (this.ctx) {
+      return;
+    }
     var AudioContext = window.AudioContext || window.webkitAudioContext;
     var ctx = new AudioContext();
     var media = this.videoEl;
@@ -427,7 +469,10 @@ var MediaPlayer = {
     }
   },
   changeVolume(volume) {
-    if (volume == this.videoEl.volume) {
+    /* The element stores the squared value, so compare against that:
+       this also breaks the changeVolume -> SettingsStore.setItem ->
+       onApply -> changeVolume loop when the volume is persisted. */
+    if (volume * volume == this.videoEl.volume) {
       return;
     }
     this.videoEl.volume = volume * volume;
