@@ -20,6 +20,12 @@ All notable changes to tanku Anime are documented here. This project follows
 
 - Drama search shows Bangumi title cards with poster, score, and episode count; the direct Nyaa keyword search remains under 「もっと探す」.
 
+### Media
+
+- Library scans from the directory watcher, the periodic poll, and the manual scan button now run one at a time per media folder; requests that arrive during a scan are merged into a single follow-up pass, so the same video is never transcoded twice or recorded twice.
+- Playback copies and extracted subtitles are written to a temporary `.partial.*` file and only moved into place after a size and stream check, so an interrupted ffmpeg can no longer leave a half-written `.play.mp4` that a later scan treats as usable. Existing 0-byte copies are rebuilt.
+- Deleting a source video now removes its database row together with the derived `.play.mp4` and extracted subtitle files. User-supplied subtitle files and collected vocabulary are kept; one failed cleanup does not block importing other files.
+
 ## [0.1.0] — 2026-08-16
 
 First tagged release. Everything below was built between 2026-07-21 and 2026-08-16.

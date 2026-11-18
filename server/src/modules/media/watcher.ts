@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../../db.js';
-import { listSourceVideos, scanFiles, type ScanResult } from './scanner.js';
+import { listSourceVideos, pruneMissingMedia, scanFiles, type ScanResult } from './scanner.js';
 
 interface FileSample {
   size: number;
@@ -38,20 +38,30 @@ export function createMediaDirectoryWatcher(opts: {
   let reconciling = false;
   let reconcileAgain = false;
   let stopped = false;
+  // start() が自分で空ディレクトリを作った場合（外付けドライブ未マウント等）は、
+  // その空さを「全ファイル削除」と誤認しない。ソースが 1 本見えたら掃除を許可する。
+  let pruneAllowed = false;
 
   function sourceFiles(): string[] {
     return listSourceVideos(mediaDir);
   }
 
   async function reconcileOnce(): Promise<void> {
+    const sources = sourceFiles();
+    if (sources.length > 0) pruneAllowed = true;
+    // ソースが消えた行は、その派生副本・抽出字幕ごと片付ける。
+    // ここで消しておくと、同じパスにファイルが戻ってきたとき stability window を取り直せる。
+    // pruneMissingMedia 自身も、ルートや親ディレクトリが無い行（未マウント）には触らない。
+    if (pruneAllowed) pruneMissingMedia(db, mediaDir);
     const existing = new Set(
-      (db.prepare('SELECT file_path FROM media').all() as { file_path: string }[]).map((row) => path.resolve(row.file_path)),
+      (db.prepare('SELECT file_path FROM media').all() as { file_path: string }[])
+        .map((row) => path.resolve(row.file_path)),
     );
     const seen = new Set<string>();
     const ready: string[] = [];
     const time = now();
 
-    for (const candidate of sourceFiles()) {
+    for (const candidate of sources) {
       const file = path.resolve(candidate);
       seen.add(file);
       if (existing.has(file)) {

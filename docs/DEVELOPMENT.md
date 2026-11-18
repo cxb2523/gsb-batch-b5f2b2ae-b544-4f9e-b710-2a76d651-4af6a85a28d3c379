@@ -92,6 +92,7 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
 | 功能 | 关键位置 |
 |------|----------|
 | 媒体扫描：mkv 先 remux 成 `.play.mp4`，若产物无法被 ffprobe 读出视频轨则回退为浏览器兼容 H.264；重新扫描会修复损坏的既有播放副本。内嵌字幕会抽取、外部 `.ja.srt` 优先；扫描时先对已有条目重新解析文件名（`reparseExistingMedia`），解析器升级后旧数据点一次扫描即自动修正 | media/scanner.ts |
+| 扫描互斥与清理：同一 `media_dir` 的扫描请求经 `SerialScanner` 串行化，运行中到达的请求合并为一次补扫（手动扫描/目录监听/周期对账三条路径共享），不会并行跑 ffmpeg。副本与提取字幕先写 `.<name>.partial.<basename>` 临时文件，ffprobe + 非空校验通过后才 rename 到最终路径；既有 `remuxed`/`transcoded` 副本复验文件大小与视频轨，0 字节或半成品会被重建。全量扫描与 watcher 对账会调用 `pruneMissingMedia`：源视频消失时删除 media 行、派生 `.play.mp4` / `.extracted.srt|ass` 与字幕记录（外部用户字幕保留），单文件清理失败不阻断其他导入 | media/scanner.ts + media/watcher.ts |
 | 文件名解析：支持 `SxxExx`、点分隔 scene 命名（`A.B.S02E01.1080p...-GROUP`）、`- NN`、`第NN話`；剥掉年份/版本 v2/发布组/画质/编码尾巴，得到干净作品名+集数，供 jimaku 按标题+集数匹配 | media/filename.ts |
 | H.265/HEVC Main 10 只在已验证的 macOS 浏览器路径 remux；Windows/Linux 保守标记「要トランスコード」，H.264 10-bit 等不兼容源同样不放行 | media/ffmpeg.ts decidePlayability |
 | 学习模式：首次默认无字幕；Space 暂停+显示；A 回句首（快速连按回上一句）；←/→ 跳句；S 常显且开关在浏览器本地保持；[ ] 偏移±100ms；右侧解析独立保持已选句，重听时不消失；页面快捷键提示可直接点击 | player/learningMode.ts + PlayerPage |
@@ -292,6 +293,22 @@ settings 是通用 KV 表，新增凭证项不需要数据库迁移。
   H.264/AAC、`yuv420p` 的播放副本，并标为 `transcoded`；两条路径均失败才清空播放路径并保留 `transcode_needed`。
   针对性测试覆盖“重扫修复损坏副本”和“remux 后自动回退 H.264”；实际 `npm test` 为 server 260、web 63 全绿，server
   `tsc --noEmit` 通过。该回退只处理原本可 remux、却生成了无效副本的文件，不改变 H.264 10-bit 等主动判为不兼容源的策略。
+
+- 2026-11-19：**扫描链路可重入互斥 + 半成品识别 + 删除清理**。目录监听、30 秒周期对账和 `POST /api/media/scan`
+  三条路径此前各自发起扫描，同一文件会被并发处理两次并生成重复副本/记录。现在同一 DB + `media_dir` 共用一个
+  `SerialScanner`：同一时刻只跑一个批次，运行中到达的请求合并为一次补扫（全量标志与文件集合取并集），
+  所有等待者共享该次结果；批次结束后同步晋升下一批，避免 await 的空隙被新请求插入并行执行。
+  副本与提取字幕改为写 `.partial.<basename>` 临时文件，`ffprobe` 与“非空文件”双检通过后才 rename 到最终路径，
+  ffmpeg 中途失败或进程中断都不会在最终路径留下半成品；既有 `remuxed`/`transcoded` 记录的复验也加入大小检查，
+  0 字节副本会被重建。新增 `pruneMissingMedia`：全量扫描与 watcher 对账时删除源视频已消失的 media 行，
+  并清理派生 `.play.mp4`、`.extracted.srt|ass`、`subtitle_file`、`subtitle_sync_state` 和 `progress`；
+  用户自己放的外部字幕不删，单文件清理失败只跳过该文件，不影响同批其他导入；`vocab` 行保留（学习资产）
+  但把 `media_id` 置空以免外键阻止删除。为防止外接盘未挂载误删，`media_dir` 或源文件的父目录不存在时
+  不扫不删，watcher 在首个源文件出现前也不执行清理。`codec_status` 语义与
+  `/api/media`、`/api/media/scan` 的响应形状未变。新增测试覆盖并发合流（无并行 ffmpeg、无重复行）、
+  半成品副本不发布/被重建、残留 `.partial.` 被忽略、删除时清理派生文件并保留外部字幕与生词、
+  清理失败不阻断导入、媒体目录或父目录不可用时不清库。
+  实际 `npm test -w server` 276 项、`npm test -w web` 64 项全绿，server `tsc --noEmit` 通过。
 
 ## 4. 关键决策记录（为什么这么做）
 

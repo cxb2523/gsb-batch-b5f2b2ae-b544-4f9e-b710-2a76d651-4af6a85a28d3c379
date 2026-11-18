@@ -138,6 +138,94 @@ describe('createMediaDirectoryWatcher', () => {
     expect(db.prepare('SELECT COUNT(*) c FROM media').get()).toEqual({ c: 1 });
   });
 
+  it('removes the row and its derived files when the source video disappears', async () => {
+    const dir = tmpDir();
+    const file = path.join(dir, 'Show - 05.mkv');
+    fs.writeFileSync(file, 'video');
+    const playable = path.join(dir, 'Show - 05.play.mp4');
+    const extracted = path.join(dir, 'Show - 05.extracted.ass');
+    fs.writeFileSync(playable, 'mp4');
+    fs.writeFileSync(extracted, 'sub');
+    const db = createDb(':memory:');
+    const scan = successfulScan(db);
+    let now = 0;
+    const watcher = createMediaDirectoryWatcher({ db, mediaDir: dir, stableMs: 15_000, now: () => now, scan });
+
+    await watcher.reconcileNow();
+    now = 15_000;
+    await watcher.reconcileNow();
+    const row: any = db.prepare('SELECT id FROM media WHERE file_path=?').get(file);
+    expect(row).toBeDefined();
+    db.prepare(`INSERT INTO subtitle_file (media_id, file_path, format) VALUES (?, ?, 'ass')`).run(row.id, extracted);
+
+    fs.rmSync(file);
+    await watcher.reconcileNow();
+
+    expect(db.prepare('SELECT COUNT(*) c FROM media').get()).toEqual({ c: 0 });
+    expect(db.prepare('SELECT COUNT(*) c FROM subtitle_file').get()).toEqual({ c: 0 });
+    expect(fs.existsSync(playable)).toBe(false);
+    expect(fs.existsSync(extracted)).toBe(false);
+  });
+
+  it('does not run overlapping scans when reconciliations arrive together', async () => {
+    const dir = tmpDir();
+    const file = path.join(dir, 'Show - 06.mp4');
+    fs.writeFileSync(file, 'video');
+    const db = createDb(':memory:');
+    let running = 0;
+    let maxRunning = 0;
+    const scan = vi.fn(async (paths: string[]): Promise<ScanResult> => {
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const importedIds = paths.map((filePath) => Number(db.prepare(
+        `INSERT OR IGNORE INTO media (series, file_path, playable_path, codec_status) VALUES ('Show', ?, ?, 'direct')`,
+      ).run(filePath, filePath).lastInsertRowid));
+      running--;
+      return { importedIds, failedFiles: [] };
+    });
+    let now = 0;
+    const watcher = createMediaDirectoryWatcher({ db, mediaDir: dir, stableMs: 15_000, now: () => now, scan });
+
+    await watcher.reconcileNow();
+    now = 15_000;
+    await Promise.all([
+      watcher.reconcileNow(),
+      watcher.reconcileNow(),
+      watcher.reconcileNow(),
+    ]);
+
+    expect(maxRunning).toBe(1);
+    expect(db.prepare('SELECT COUNT(*) c FROM media').get()).toEqual({ c: 1 });
+  });
+
+  it('does not prune the library just because the media directory was absent at startup', async () => {
+    const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'media-watcher-')), 'unmounted');
+    const db = createDb(':memory:');
+    const stale = path.join(dir, 'Show - 07.mp4');
+    db.prepare(`INSERT INTO media (series, file_path, codec_status) VALUES ('Show', ?, 'direct')`).run(stale);
+    const scan = successfulScan(db);
+    let now = 0;
+    const watcher = createMediaDirectoryWatcher({ db, mediaDir: dir, stableMs: 0, now: () => now, scan });
+
+    // 外付けドライブ未マウント: start() は空ディレクトリを作るが、掃除はしない
+    await watcher.start();
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(db.prepare('SELECT COUNT(*) c FROM media').get()).toEqual({ c: 1 });
+
+    // マウントされてソースが見えたら、通常どおり掃除と取り込みを再開する
+    fs.writeFileSync(path.join(dir, 'Show - 08.mp4'), 'video');
+    now = 1;
+    await watcher.reconcileNow();
+    now = 2;
+    await watcher.reconcileNow();
+    watcher.stop();
+
+    const files = (db.prepare('SELECT file_path FROM media ORDER BY file_path').all() as any[])
+      .map((row) => path.basename(row.file_path));
+    // マウント後は「ソースが 1 本も無い」状態ではないので、消えた行の掃除を再開してよい
+    expect(files).toEqual(['Show - 08.mp4']);  });
+
   it('falls back to periodic reconciliation when the directory watcher fails', async () => {
     const dir = tmpDir();
     const db = createDb(':memory:');

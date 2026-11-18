@@ -23,8 +23,19 @@ export const realOps: FfmpegOps = {
 
 const VIDEO_EXT = new Set(['.mkv', '.mp4']);
 const SUB_EXT = new Set(['.srt', '.ass']);
+const PLAYBACK_COPY_RE = /\.play\.mp4$/i;
+const EXTRACTED_SUB_RE = /\.extracted\.(?:srt|ass)$/i;
+// 途中で落ちた ffmpeg の出力は最終パスではなく、隠しファイル `.partial.<name>` に書く。
+// プロセスが中断しても最終パスに半製品が残らず、次回スキャンで必ず作り直せる。
+const PARTIAL_PREFIX = '.partial.';
 
 async function assertPlayableVideo(file: string, ops: FfmpegOps): Promise<void> {
+  // 実在するだけでは足りない。中断した ffmpeg は 0 バイトの入れ物を残し得るので、
+  // サイズと ffprobe の両方で「完全な再生副本」であることを確かめる。
+  const stat = fs.statSync(file);
+  if (!stat.isFile() || stat.size === 0) {
+    throw new Error('Playback copy is incomplete');
+  }
   const probe = await ops.probe(file);
   if (!probe.streams.some((stream) => stream.codec_type === 'video')) {
     throw new Error('Playback copy has no video stream');
@@ -50,6 +61,15 @@ function findExternalSub(dir: string, videoBase: string): string | null {
 
 export function listSourceVideos(mediaDir: string): string[] {
   const files: string[] = [];
+  // ルートが存在しない（外付けドライブ未マウント等）場合は空を返す。ここで mkdir すると
+  // 「空になった」と誤認して削除掃除が全行を消しかねないため、作成はしない。
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(mediaDir);
+  } catch {
+    return files;
+  }
+  if (!stat.isDirectory()) return files;
   const visit = (dir: string) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (entry.name.startsWith('.')) continue;
@@ -59,14 +79,13 @@ export function listSourceVideos(mediaDir: string): string[] {
       } else if (
         entry.isFile()
         && VIDEO_EXT.has(path.extname(entry.name).toLowerCase())
-        && !entry.name.toLowerCase().endsWith('.play.mp4')
+        && !PLAYBACK_COPY_RE.test(entry.name)
       ) {
         files.push(full);
       }
     }
   };
 
-  fs.mkdirSync(mediaDir, { recursive: true });
   visit(mediaDir);
   return files;
 }
@@ -91,12 +110,48 @@ export function reparseExistingMedia(db: Db): number {
   return changed;
 }
 
-export async function scanFiles(
+function isPathInside(root: string, target: string): boolean {
+  const relative = path.relative(root, path.resolve(target));
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function partialPathFor(output: string): string {
+  return path.join(path.dirname(output), `${PARTIAL_PREFIX}${path.basename(output)}`);
+}
+
+function removeIfPresent(file: string): void {
+  try {
+    fs.rmSync(file, { force: true });
+  } catch { /* 後片付けの失敗は本処理を止めない */ }
+}
+
+// 変換は一時ファイルに対して行い、ffprobe で完全性を確認できたものだけを最終パスへ rename する。
+// 途中で例外・プロセス中断が起きても、最終パスには完全な副本しか現れない。
+async function renderPlaybackCopy(
+  input: string,
+  output: string,
+  kind: 'remux' | 'transcode',
+  ops: FfmpegOps,
+): Promise<void> {
+  const temp = partialPathFor(output);
+  removeIfPresent(temp);
+  try {
+    if (kind === 'remux') await ops.remux(input, temp);
+    else await ops.transcode(input, temp);
+    await assertPlayableVideo(temp, ops);
+    fs.renameSync(temp, output);
+  } catch (error) {
+    removeIfPresent(temp);
+    throw error;
+  }
+}
+
+async function scanFilesNow(
   db: Db,
   mediaDir: string,
   filePaths: string[],
-  ops: FfmpegOps = realOps,
-  platform: NodeJS.Platform = process.platform,
+  ops: FfmpegOps,
+  platform: NodeJS.Platform,
 ): Promise<ScanResult> {
   reparseExistingMedia(db);
   const importedIds: number[] = [];
@@ -109,7 +164,7 @@ export async function scanFiles(
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
     const file = path.basename(full);
     if (!VIDEO_EXT.has(path.extname(file).toLowerCase())) continue;
-    if (file.endsWith('.play.mp4')) continue; // 自前で生成した再生用ファイル
+    if (PLAYBACK_COPY_RE.test(file) || file.startsWith(PARTIAL_PREFIX)) continue; // 自前で生成した再生用ファイル
     const existing = db.prepare('SELECT id, codec_status, playable_path FROM media WHERE file_path=?').get(full) as
       { id: number; codec_status: string; playable_path: string | null } | undefined;
     if (existing && existing.codec_status !== 'transcode_needed') {
@@ -141,13 +196,11 @@ export async function scanFiles(
     } else if (playability === 'remux') {
       playablePath = full.replace(/\.[^.]+$/, '') + '.play.mp4';
       try {
-        await ops.remux(full, playablePath);
-        await assertPlayableVideo(playablePath, ops);
+        await renderPlaybackCopy(full, playablePath, 'remux', ops);
         status = 'remuxed';
       } catch {
         try {
-          await ops.transcode(full, playablePath);
-          await assertPlayableVideo(playablePath, ops);
+          await renderPlaybackCopy(full, playablePath, 'transcode', ops);
           status = 'transcoded';
         } catch {
           playablePath = null;
@@ -185,10 +238,17 @@ export async function scanFiles(
       if (stream) {
         const fmt = stream.codec === 'subrip' || stream.codec === 'srt' ? 'srt' : 'ass';
         const out = full.replace(/\.[^.]+$/, '') + `.extracted.${fmt}`;
+        const temp = partialPathFor(out);
+        removeIfPresent(temp);
         try {
-          await ops.extractSub(full, stream.index, out);
+          await ops.extractSub(full, stream.index, temp);
+          if (!fs.statSync(temp).isFile() || fs.statSync(temp).size === 0) {
+            throw new Error('Extracted subtitle is incomplete');
+          }
+          fs.renameSync(temp, out);
           db.prepare(`INSERT INTO subtitle_file (media_id, file_path, format) VALUES (?,?,?)`).run(mediaId, out, fmt);
         } catch { /* 字幕なし。再生ページ側で案内 */ }
+        removeIfPresent(temp);
       }
     }
   }
@@ -196,11 +256,206 @@ export async function scanFiles(
   return { importedIds, failedFiles };
 }
 
+// 削除されたソース動画の行と、そこから派生した再生副本・抽出字幕を片付ける。
+// 外部字幕（ユーザーが置いた .ja.srt など）は消さない。1 ファイルの失敗は他へ波及させない。
+//
+// 安全弁: ルートやソースの親ディレクトリが無い行は「外付けドライブ未マウント」とみなして
+// 触らない。ファイル 1 本だけ消した場合は親ディレクトリが残るので、通常どおり掃除される。
+export function pruneMissingMedia(db: Db, mediaDir: string): number[] {
+  const root = path.resolve(mediaDir);
+  try {
+    if (!fs.statSync(root).isDirectory()) return [];
+  } catch {
+    return [];
+  }
+  const rows = db.prepare('SELECT id, file_path, playable_path FROM media').all() as
+    { id: number; file_path: string; playable_path: string | null }[];
+  const removed: number[] = [];
+  const selectSubs = db.prepare('SELECT file_path FROM subtitle_file WHERE media_id=?');
+  const removeRow = db.transaction((mediaId: number) => {
+    db.prepare('DELETE FROM subtitle_file WHERE media_id=?').run(mediaId);
+    db.prepare('DELETE FROM subtitle_sync_state WHERE media_id=?').run(mediaId);
+    db.prepare('DELETE FROM progress WHERE media_id=?').run(mediaId);
+    // 生词本はユーザーの学習資産なので消さない。media への外部キーだけ外して
+    // 出典不明の語として残す（FK 制約で削除が失敗しないようにする）。
+    db.prepare('UPDATE vocab SET media_id=NULL WHERE media_id=?').run(mediaId);
+    db.prepare('DELETE FROM media WHERE id=?').run(mediaId);
+  });
+
+  for (const row of rows) {
+    if (!isPathInside(root, row.file_path)) continue;
+    if (fs.existsSync(row.file_path)) continue;
+    // 親ディレクトリごと消えている = 外付けドライブが外れた可能性が高いので保留する。
+    // 個別ファイルの削除なら親は残る。
+    try {
+      if (!fs.statSync(path.dirname(row.file_path)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    const derived = new Set<string>();
+    if (row.playable_path && row.playable_path !== row.file_path
+      && PLAYBACK_COPY_RE.test(row.playable_path) && isPathInside(root, row.playable_path)) {
+      derived.add(row.playable_path);
+    }
+    // DB に残っていない半製品も、命名規則から辿って掃除する。
+    const base = row.file_path.replace(/\.[^.]+$/, '');
+    derived.add(`${base}.play.mp4`);
+    derived.add(`${base}.extracted.srt`);
+    derived.add(`${base}.extracted.ass`);
+    for (const sub of selectSubs.all(row.id) as { file_path: string }[]) {
+      if (EXTRACTED_SUB_RE.test(sub.file_path) && isPathInside(root, sub.file_path)) {
+        derived.add(sub.file_path);
+      }
+    }
+
+    for (const file of derived) {
+      if (!isPathInside(root, file)) continue;
+      try {
+        fs.rmSync(file, { force: true });
+        fs.rmSync(partialPathFor(file), { force: true });
+      } catch { /* 清掃失敗は他のファイルの取り込みを止めない */ }
+    }
+
+    try {
+      removeRow(row.id);
+      removed.push(row.id);
+    } catch { /* 行削除に失敗したら次回スキャンで再試行 */ }
+  }
+  return removed;
+}
+
+interface ScanRequest {
+  all: boolean;
+  prune: boolean;
+  filePaths: string[];
+  ops: FfmpegOps;
+  platform: NodeJS.Platform;
+}
+interface ScanWaiter {
+  resolve: (value: ScanResult) => void;
+  reject: (reason: unknown) => void;
+}
+
+interface ScanBatch {
+  all: boolean;
+  prune: boolean;
+  files: Set<string>;
+  ops: FfmpegOps;
+  platform: NodeJS.Platform;
+  waiters: ScanWaiter[];
+}
+
+// 同一 DB・同一ディレクトリのスキャンは常に 1 本だけ走らせる。
+// 実行中に来た要求は 1 回分の補掃にまとめ、ffmpeg を並列で走らせない。
+class SerialScanner {
+  private active: ScanBatch | null = null;
+  private queued: ScanBatch | null = null;
+
+  constructor(private readonly db: Db, private readonly mediaDir: string) {}
+
+  submit(request: ScanRequest): Promise<ScanResult> {
+    return new Promise<ScanResult>((resolve, reject) => {
+      const waiter: ScanWaiter = { resolve, reject };
+      if (!this.active) {
+        const batch = this.newBatch(request);
+        batch.waiters.push(waiter);
+        this.active = batch;
+        void this.runBatch(batch);
+        return;
+      }
+      const batch = this.queued ?? (this.queued = this.newBatch(request));
+      if (request.all) batch.all = true;
+      if (request.prune) batch.prune = true;
+      for (const file of request.filePaths) batch.files.add(path.resolve(file));
+      batch.waiters.push(waiter);
+    });
+  }
+
+  private newBatch(request: ScanRequest): ScanBatch {
+    return {
+      all: request.all,
+      prune: request.prune,
+      files: new Set(request.filePaths.map((file) => path.resolve(file))),
+      ops: request.ops,
+      platform: request.platform,
+      waiters: [],
+    };
+  }
+
+  private async runBatch(batch: ScanBatch): Promise<void> {
+    let result: ScanResult | null = null;
+    let failure: unknown = null;
+    try {
+      if (batch.all) {
+        result = await scanFilesNow(this.db, this.mediaDir, listSourceVideos(this.mediaDir), batch.ops, batch.platform);
+      } else {
+        result = await scanFilesNow(this.db, this.mediaDir, [...batch.files], batch.ops, batch.platform);
+      }
+    } catch (error) {
+      failure = error;
+    }
+
+    // 掃除は取り込みの成否と切り離す。失敗しても他のファイルの導入結果は返す。
+    if (batch.prune) {
+      try {
+        pruneMissingMedia(this.db, this.mediaDir);
+      } catch {
+        /* 次回スキャンで再試行 */
+      }
+    }
+
+    // 待機中の要求を同期的に昇格させ、その後で結果を返す（合間に新しい要求が割り込まない）。
+    this.active = null;
+    const next = this.queued;
+    this.queued = null;
+    if (next) {
+      this.active = next;
+      void this.runBatch(next);
+    }
+    for (const waiter of batch.waiters) {
+      if (failure) waiter.reject(failure);
+      else waiter.resolve(result!);
+    }
+  }
+}
+
+const scannersByDb = new WeakMap<Db, Map<string, SerialScanner>>();
+
+function scannerFor(db: Db, mediaDir: string): SerialScanner {
+  let byDirectory = scannersByDb.get(db);
+  if (!byDirectory) {
+    byDirectory = new Map();
+    scannersByDb.set(db, byDirectory);
+  }
+  const key = path.resolve(mediaDir);
+  let scanner = byDirectory.get(key);
+  if (!scanner) {
+    scanner = new SerialScanner(db, key);
+    byDirectory.set(key, scanner);
+  }
+  return scanner;
+}
+
+// 指定ファイルだけを走査する（watcher 用）。同一ディレクトリで実行中の走査があれば、
+// その完了後に 1 回の補掃へまとめて合流する。
+export async function scanFiles(
+  db: Db,
+  mediaDir: string,
+  filePaths: string[],
+  ops: FfmpegOps = realOps,
+  platform: NodeJS.Platform = process.platform,
+): Promise<ScanResult> {
+  return scannerFor(db, mediaDir).submit({ all: false, prune: false, filePaths, ops, platform });
+}
+
+// ディレクトリ全体を走査する（手動スキャン用）。実行中の走査には並行せず合流する。
+// 全走査では、削除済みソースの行と派生ファイルも併せて片付ける。
 export async function scanLibrary(
   db: Db,
   mediaDir: string,
   ops: FfmpegOps = realOps,
   platform: NodeJS.Platform = process.platform,
 ): Promise<ScanResult> {
-  return scanFiles(db, mediaDir, listSourceVideos(mediaDir), ops, platform);
+  return scannerFor(db, mediaDir).submit({ all: true, prune: true, filePaths: [], ops, platform });
 }
