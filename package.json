@@ -4,7 +4,7 @@
   "description": "Tiny Web-Audio GM synth",
   "main": "javascript/JZZ.synth.Tiny.js",
   "scripts": {
-    "test": "nyc mocha test/mocha.js",
+    "test": "nyc mocha test/mocha.js test/mocha-context.js",
     "lint": "eslint test",
     "coverage": "nyc report --reporter=lcov"
   },

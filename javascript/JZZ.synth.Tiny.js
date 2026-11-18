@@ -364,7 +364,7 @@ function WebAudioTinySynth(opt){
       this.sustain=[]; this.notetab=[]; this.rhythm=[];
       this.masterTuningC=0; this.masterTuningF=0; this.tuningC=[]; this.tuningF=[]; this.scaleTuning=[];
       this.maxTick=0, this.playTick=0, this.playing=0; this.releaseRatio=3.5;
-      for(var i=0;i<16;++i){
+      for(i=0;i<16;++i){
         this.pg[i]=0; this.vol[i]=3*100*100/(127*127);
         this.bend[i]=0; this.brange[i]=0x100;
         this.tuningC[i]=0; this.tuningF[i]=0;
@@ -382,14 +382,14 @@ function WebAudioTinySynth(opt){
             this.relcnt=0;
             for(var i=this.notetab.length-1;i>=0;--i){
               var nt=this.notetab[i];
-              if(this.actx.currentTime>nt.e){
+              if(this.actx && this.actx.currentTime>nt.e){
                 this._pruneNote(nt);
                 this.notetab.splice(i,1);
               }
             }
             /**/
           }
-          if(this.playing && this.song.ev.length>0){
+          if(this.playing && this.actx && this.song.ev.length>0){
             var e=this.song.ev[this.playIndex];
             while(this.actx.currentTime+this.preroll>this.playTime){
               if(e.m[0]==0xff51){
@@ -497,35 +497,57 @@ function WebAudioTinySynth(opt){
     },
     _pruneNote:function(nt){
       for(var k=nt.o.length-1;k>=0;--k){
-        if(nt.o[k].frequency){
-          nt.o[k].frequency.cancelScheduledValues(0);
-        }
-        else{
-          nt.o[k].playbackRate.cancelScheduledValues(0);
-        }
-        nt.g[k].gain.cancelScheduledValues(0);
+        try{
+          if(nt.o[k].frequency){
+            nt.o[k].frequency.cancelScheduledValues(0);
+          }
+          else{
+            nt.o[k].playbackRate.cancelScheduledValues(0);
+          }
+          nt.g[k].gain.cancelScheduledValues(0);
 
-        nt.o[k].stop();
-        if(nt.o[k].detune) {
-          try {
-            this.chmod[nt.ch].disconnect(nt.o[k].detune);
-          } catch (c) {}
+          nt.o[k].stop();
+          if(nt.o[k].detune) {
+            try {
+              this.chmod[nt.ch].disconnect(nt.o[k].detune);
+            } catch (c) { /* already disconnected or replaced context */ }
+          }
         }
-        nt.g[k].gain.value = 0;
+        catch(e){ /* the node may already belong to a closed/replaced AudioContext */ }
+        try{ nt.g[k].disconnect(); }
+        catch(e2){ /* already disconnected */ }
+        try{ nt.o[k].disconnect(); }
+        catch(e3){ /* already disconnected */ }
+        try{ nt.g[k].gain.value = 0; }
+        catch(e4){ /* node is gone with its context */ }
       }
     },
     _limitVoices:function(ch,n){
-      this.notetab.sort(function(n1,n2){
-        if(n1.f!=n2.f) return n1.f-n2.f;
-        if(n1.e!=n2.e) return n2.e-n1.e;
-        return n2.t-n1.t;
-      });
+      // only released notes are time-pruned; sounding notes (f==0, e==99999)
+      // must never be removed merely because their end time looks "reached"
       for(var i=this.notetab.length-1;i>=0;--i){
         var nt=this.notetab[i];
-        if(this.actx.currentTime>nt.e || i>=(this.voices-1)){
+        if(nt.f && this.actx && this.actx.currentTime>nt.e){
           this._pruneNote(nt);
           this.notetab.splice(i,1);
         }
+      }
+      if(this.notetab.length<this.voices)
+        return;
+      // voice stealing: drop released notes first (oldest end time),
+      // touch sounding notes only after no releasable voice remains
+      this.notetab.sort(function(n1,n2){
+        if(n1.f!=n2.f) return n2.f-n1.f;
+        if(n1.e!=n2.e) return n1.e-n2.e;
+        return n2.t-n1.t;
+      });
+      // the sort puts the best steal candidates at the front, so walk
+      // from index 0 and stop as soon as the table fits the voice cap
+      for(var j=0;j<this.notetab.length && this.notetab.length>=this.voices;++j){
+        var note=this.notetab[j];
+        this._pruneNote(note);
+        this.notetab.splice(j,1);
+        --j;
       }
     },
     _note:function(t,ch,n,v,p){
@@ -675,8 +697,11 @@ function WebAudioTinySynth(opt){
         var nt=this.notetab[i];
         if(nt.ch==ch){
           for(var k=nt.o.length-1;k>=0;--k){
-            if(nt.o[k].frequency)
-              if (nt.o[k].detune) nt.o[k].detune.setValueAtTime(this.bend[ch],t);
+            try{
+              if(nt.o[k].frequency)
+                if (nt.o[k].detune) nt.o[k].detune.setValueAtTime(this.bend[ch],t);
+            }
+            catch(e){ /* node belongs to a replaced/closed context */ }
           }
         }
       }
@@ -727,7 +752,7 @@ function WebAudioTinySynth(opt){
       var cmd=msg[0]&~0xf;
       if(cmd<0x80||cmd>=0x100)
         return;
-      if(this.audioContext.state=="suspended"){
+      if(this.audioContext && this.audioContext.state=="suspended"){
         this.audioContext.resume();
       }
       switch(cmd){
@@ -829,10 +854,59 @@ function WebAudioTinySynth(opt){
     getAudioContext:function(){
       return this.actx;
     },
+    _isValidAudioContext:function(actx){
+      // duck-typing: works for native AudioContext, OfflineAudioContext
+      // and headless mocks without relying on global constructors
+      return !!actx && typeof actx.createGain==='function' &&
+        typeof actx.createOscillator==='function' &&
+        typeof actx.createBuffer==='function';
+    },
+    _teardownAudio:function(){
+      // stop and disconnect every voice still scheduled on the old context;
+      // nothing from the old context may survive in the note table
+      for(var i=this.notetab.length-1;i>=0;--i){
+        this._pruneNote(this.notetab[i]);
+        this.notetab.splice(i,1);
+      }
+      // the modulation LFO is shared by all channels, stop it too
+      if(this.lfo){
+        try{ this.lfo.stop(); }
+        catch(e){ /* already stopped with the old context */ }
+        try{ this.lfo.disconnect(); }
+        catch(e2){ /* already disconnected */ }
+        this.lfo=null;
+      }
+      // tear down the old channel graph and master chain
+      if(this.chvol){
+        for(var k=0;k<this.chvol.length;++k){
+          try{ this.chvol[k] && this.chvol[k].disconnect(); }catch(e3){ /* gone with the old context */ }
+          try{ this.chmod[k] && this.chmod[k].disconnect(); }catch(e4){ /* gone with the old context */ }
+          try{ this.chpan[k] && this.chpan[k].disconnect(); }catch(e5){ /* gone with the old context */ }
+        }
+      }
+      if(this.rev){ try{ this.rev.disconnect(); }catch(e6){ /* already disconnected */ } }
+      if(this.conv){ try{ this.conv.disconnect(); }catch(e7){ /* already disconnected */ } }
+      if(this.comp){ try{ this.comp.disconnect(); }catch(e8){ /* already disconnected */ } }
+      if(this.out){ try{ this.out.disconnect(); }catch(e9){ /* already disconnected */ } }
+      this.chvol=[]; this.chmod=[]; this.chpan=[];
+      this.wave={};
+      this.rev=null; this.conv=null; this.comp=null; this.out=null;
+    },
     setAudioContext:function(actx,dest){
+      // invalid/missing context: keep the previous chain working
+      if(!this._isValidAudioContext(actx))
+        return;
+      // replacing (or rebuilding) the context: the old graph cannot serve
+      // the new one, so release everything scheduled on it first
+      if(this.actx){
+        this._teardownAudio();
+      }
       this.audioContext=this.actx=actx;
-      this.dest=dest;
-      if(!dest)
+      // a valid destination must be an AudioNode; a raw context or anything
+      // else falls back to the context destination
+      if(dest && typeof dest.connect==='function')
+        this.dest=dest;
+      else
         this.dest=actx.destination;
       this.tsdiff=performance.now()*.001-this.actx.currentTime;
       this.out=this.actx.createGain();
@@ -967,7 +1041,9 @@ function WebAudioTinySynth(opt){
     }
     synth.setAudioContext(_ac);
     port.plug = function(dest) {
-      if (dest && (dest.context instanceof AudioContext || dest.context instanceof webkitAudioContext)) {
+      // duck-typing: never rely on global AudioContext constructors,
+      // an invalid dest leaves the current context untouched
+      if (dest && dest.context && synth._isValidAudioContext(dest.context)) {
         synth.setAudioContext(dest.context, dest);
       }
     };
@@ -987,5 +1063,8 @@ function WebAudioTinySynth(opt){
   };
 
   JZZ.synth.Tiny.version = function() { return _version; };
+
+  // exposed for unit testing and for embedding the engine without a MIDI port
+  JZZ.synth.Tiny.WebAudioTinySynth = WebAudioTinySynth;
 
 });
