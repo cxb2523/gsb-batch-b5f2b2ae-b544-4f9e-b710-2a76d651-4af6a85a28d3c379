@@ -154,6 +154,36 @@ test("alignCues", async (t) => {
     );
   });
 
+  await t.test("stops before the search when already cancelled", () => {
+    const controller = new AbortController();
+    controller.abort();
+    assert.throws(
+      () => alignCues(referenceFor(dialogue(10), 0), dialogue(10), { signal: controller.signal }),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+    );
+  });
+
+  await t.test("stops the piecewise pass when cancelled mid-run", () => {
+    // The first candidate is scored, then the signal trips; the pass must not
+    // run to completion and must NOT return a result.
+    const cues = dialogue(30);
+    const reference = referenceFor(cues, 0);
+    const controller = new AbortController();
+    let checks = 0;
+    const signal = controller.signal;
+    Object.defineProperty(signal, "aborted", {
+      get: () => {
+        checks += 1;
+        // Let a couple of candidates through, then cancel.
+        return checks > 3;
+      },
+    });
+    assert.throws(
+      () => alignCues(reference, cues, { splitPenaltySeconds: 5, signal }),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+    );
+  });
+
   await t.test("flags an alignment against unrelated speech as untrustworthy", () => {
     // Subtitles from a different film: the correlation still returns a peak,
     // because it always does. The gate is what stops that peak being applied.

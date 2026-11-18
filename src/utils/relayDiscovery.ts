@@ -12,7 +12,7 @@
  * prompt the user to install the helper for live TV / blocked streams.
  */
 
-import { getRelayBase, setRelayBase } from "./secureUrl";
+import { getRelayBase, setRelayBase } from "./secureUrl.ts";
 
 export const RELAY_PORT = 11471;
 export const RELAY_ORIGIN = `http://127.0.0.1:${RELAY_PORT}`;

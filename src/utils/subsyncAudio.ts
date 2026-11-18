@@ -30,12 +30,45 @@
  * see subsyncVad.ts. Net memory for a 3-hour film is about 8 MB of signal.
  * ────────────────────────────────────────────────────────────────────────────
  *
- * Browser-only by nature (Worker, WebAssembly, File) — there are no unit tests
- * for this module; the logic that IS testable lives in subsyncVad.ts and
- * subsyncAlign.ts.
+ * ─── Cancellation and the decoder's lifetime ────────────────────────────────
+ * A run can be cancelled at any point — while the core downloads, while a URL
+ * prefix is being pulled, or between/inside window decodes. `signal` is wired
+ * all the way down:
+ *
+ *   - the core download and the media-prefix download are fetches given the
+ *     signal, so aborting closes their bodies;
+ *   - `ffmpeg.exec`/`readFile` are given the signal, so their promises reject
+ *     promptly instead of waiting for a 100-second window to finish;
+ *   - and because a wasm command keeps running after its JS promise rejects,
+ *     aborting also RETIRES the decoder (see releaseBrowserFfmpeg) so the
+ *     worker is actually torn down rather than left crunching.
+ *
+ * After an abort no further window or progress reaches the caller: every
+ * callback is gated on the internal signal, and the loop re-checks it after
+ * each await.
+ *
+ * One run at a time. A second `extractReferenceAudio` started while the first
+ * is still going is refused with `SubtitleSyncBusyError` rather than being
+ * allowed to mount over the first one; the refusal is synchronous and touches
+ * no shared state, so it cannot poison the run that owns the decoder or the
+ * one that follows it.
+ *
+ * The decoder is a page-level singleton, reused across successful runs. Any
+ * failure — cancellation included — drops it, so the next run loads a fresh
+ * instance instead of reusing one that was terminated or left half-loaded.
+ * Releasing is serialised against an in-flight load (see the slot logic) so a
+ * load can neither land after its release nor be resurrected by a stale
+ * promise.
+ *
+/**
+ * Browser-only by nature (Worker, WebAssembly, File). The cache/lifecycle and
+ * cancellation logic is injectable so that `node --test` can exercise it
+ * offline — see subsyncAudioLifecycle.test.ts — and the sync gate it refuses
+ * through is covered in subsyncGate.test.ts.
  */
 
-import type { FFmpeg } from "@ffmpeg/ffmpeg";
+import type { FFmpeg, FFFSType } from "@ffmpeg/ffmpeg";
+import { SubtitleSyncBusyError } from "./subsyncErrors.ts";
 
 /**
  * Sample rate handed to the detector.
@@ -150,7 +183,44 @@ export class AudioExtractionUnavailableError extends Error {
   }
 }
 
-let ffmpegPromise: Promise<FFmpeg> | null = null;
+const abortError = (message = "Subtitle sync was cancelled"): DOMException =>
+  new DOMException(message, "AbortError");
+
+/** `DOMException` in every engine we target; the name check also survives
+ *  cross-realm errors and the plain Errors some shims throw. */
+const isAbortError = (error: unknown): boolean =>
+  (error instanceof DOMException && error.name === "AbortError") ||
+  (error instanceof Error && error.name === "AbortError");
+
+const throwIfAborted = (signal?: AbortSignal): void => {
+  if (signal?.aborted) throw abortError();
+};
+
+/**
+ * Race a promise against a caller's abort, without cancelling the work itself.
+ *
+ * Used when a call JOINS another caller's in-flight load: the joiner must be
+ * able to give up on its own signal, but must not tear down a load that
+ * belongs to someone else. A `signal` of undefined just returns the promise.
+ */
+const raceWithSignal = <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+};
 
 const toBase64 = (bytes: ArrayBuffer): string => {
   const view = new Uint8Array(bytes);
@@ -159,42 +229,120 @@ const toBase64 = (bytes: ArrayBuffer): string => {
   return btoa(binary);
 };
 
+/* ------------------------------------------------------------------------ */
+/* Decoder lifecycle                                                         */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * One decoder slot: the loaded instance, or the promise that is loading it.
+ *
+ * `generation` is the release token. Every slot gets a fresh, monotonically
+ * increasing one, and a load may only COMMIT (install its instance) while its
+ * own generation is still the current one. Release bumps the counter before it
+ * awaits anything, so a load that was in flight can only ever observe a
+ * mismatch and tear itself down. That is what makes "released while loading"
+ * and "load landed after release" impossible, in either ordering.
+ */
+interface DecoderSlot {
+  generation: number;
+  instance: FFmpeg | null;
+  loading: Promise<FFmpeg> | null;
+  /** Aborts the in-flight load's network traffic when the slot is released. */
+  controller: AbortController;
+  /** Blob URLs created for this core, revoked when the slot dies. */
+  coreUrls: string[];
+}
+
+let slot: DecoderSlot | null = null;
+let generationCounter = 0;
+
+/**
+ * Test seam: build the decoder without touching wasm, the network or a Worker.
+ *
+ * Production never sets this; `null` means the real loader below runs. Exposed
+ * so `subsyncAudioLifecycle.test.ts` can drive cancellation, concurrency and
+ * cache eviction under `node --test`.
+ */
+type DecoderFactory = () => FFmpeg;
+let decoderFactory: DecoderFactory | null = null;
+
+const revokeCoreUrls = (entry: DecoderSlot): void => {
+  for (const url of entry.coreUrls) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      /* a URL that was never created, or already revoked */
+    }
+  }
+  entry.coreUrls.length = 0;
+};
+
 /**
  * Fetch one piece of the core, check it if it came from the CDN, and hand back
  * a blob URL.
  *
- * Falls back to the library's own `toBlobURL` where verification is not wanted
- * or `crypto.subtle` is unavailable (it needs a secure context — which
- * localhost and https both are, but a plain-http LAN address is not).
+ * Fetched by hand rather than through `@ffmpeg/util`'s `toBlobURL` because the
+ * signal has to reach the network request: cancelling during the ~32 MB core
+ * download is one of the moments this feature is expected to be cancellable.
  */
 const fetchCorePart = async (
   url: string,
   mimeType: string,
   verify: boolean,
-  toBlobURL: (url: string, mimeType: string, progress?: boolean, cb?: (e: { received: number; total: number }) => void) => Promise<string>,
+  signal: AbortSignal | undefined,
   onProgress: (fraction: number) => void,
+  onObjectUrl: (url: string) => void,
 ): Promise<string> => {
   const expected = CDN_CORE_HASHES[url.slice(url.lastIndexOf("/") + 1)];
-  if (!verify || !expected || !globalThis.crypto?.subtle) {
-    return toBlobURL(url, mimeType, true, (event) => {
-      if (event.total > 0) onProgress(Math.min(1, event.received / event.total));
-    });
-  }
-  const response = await fetch(url, { cache: "force-cache" });
+  const response = await fetch(url, { cache: "force-cache", signal });
   if (!response.ok) {
     throw new AudioExtractionUnavailableError(
       `Could not download the audio decoder (HTTP ${response.status}).`,
     );
   }
-  const bytes = await response.arrayBuffer();
-  onProgress(1);
-  const actual = toBase64(await crypto.subtle.digest("SHA-256", bytes));
-  if (actual !== expected) {
-    throw new AudioExtractionUnavailableError(
-      "The audio decoder downloaded from the CDN did not match its expected checksum, so it was not run.",
-    );
+
+  // Typed as an ArrayBuffer-backed view (not ArrayBufferLike): digest() and
+  // Blob accept only the former, and a SharedArrayBuffer is never involved.
+  let bytes: Uint8Array<ArrayBuffer>;
+  if (response.body) {
+    // Read incrementally so progress is real and an abort stops promptly.
+    const reader = response.body.getReader();
+    const total = Number(response.headers.get("content-length")) || 0;
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      chunks.push(value);
+      received += value.byteLength;
+      if (total > 0) onProgress(Math.min(1, received / total));
+    }
+    bytes = new Uint8Array(received);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.byteLength;
+    }
+  } else {
+    bytes = new Uint8Array(await response.arrayBuffer());
   }
-  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+  onProgress(1);
+
+  // A plain-http LAN address is not a secure context, so `crypto.subtle` may
+  // be absent there. Verification is then skipped rather than failing the
+  // feature — the same tradeoff the old toBlobURL fallback made.
+  if (verify && expected && globalThis.crypto?.subtle) {
+    const actual = toBase64(await crypto.subtle.digest("SHA-256", bytes));
+    if (actual !== expected) {
+      throw new AudioExtractionUnavailableError(
+        "The audio decoder downloaded from the CDN did not match its expected checksum, so it was not run.",
+      );
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+  onObjectUrl(objectUrl);
+  return objectUrl;
 };
 
 /**
@@ -210,9 +358,12 @@ const fetchCorePart = async (
  * The content type settles it: every host that serves a real .wasm labels it
  * `application/wasm`, and no fallback ever will.
  */
-const selfHostedCoreAvailable = async (): Promise<boolean> => {
+const selfHostedCoreAvailable = async (signal?: AbortSignal): Promise<boolean> => {
   try {
-    const response = await fetch(`${SELF_HOSTED_CORE_BASE}/ffmpeg-core.wasm`, { method: "HEAD" });
+    const response = await fetch(`${SELF_HOSTED_CORE_BASE}/ffmpeg-core.wasm`, {
+      method: "HEAD",
+      signal,
+    });
     if (!response.ok) return false;
     return (response.headers.get("content-type") ?? "").toLowerCase().includes("wasm");
   } catch {
@@ -220,82 +371,239 @@ const selfHostedCoreAvailable = async (): Promise<boolean> => {
   }
 };
 
+/** Load the real ffmpeg.wasm instance. The slot owner terminates it on abort. */
+const createRealDecoder = async (
+  entry: DecoderSlot,
+  signal: AbortSignal | undefined,
+  onProgress?: (fraction: number) => void,
+): Promise<FFmpeg> => {
+  let FFmpegCtor: typeof FFmpeg;
+  try {
+    // Dynamic so the wrapper is a separate chunk the app never loads unless
+    // an automatic sync is actually requested.
+    const ffmpegModule = await import("@ffmpeg/ffmpeg");
+    FFmpegCtor = ffmpegModule.FFmpeg;
+  } catch (error) {
+    throw new AudioExtractionUnavailableError("Could not load the in-browser audio decoder.", {
+      cause: error,
+    });
+  }
+
+  const override = coreBaseUrl();
+  const base = override || ((await selfHostedCoreAvailable(signal)) ? SELF_HOSTED_CORE_BASE : CDN_CORE_BASE);
+  const verify = base === CDN_CORE_BASE;
+  const ffmpeg = new FFmpegCtor();
+
+  try {
+    const [coreURL, wasmURL] = await Promise.all([
+      fetchCorePart(
+        `${base}/ffmpeg-core.js`,
+        "text/javascript",
+        verify,
+        signal,
+        (fraction) => onProgress?.(fraction * 0.5),
+        (url) => entry.coreUrls.push(url),
+      ),
+      fetchCorePart(
+        `${base}/ffmpeg-core.wasm`,
+        "application/wasm",
+        verify,
+        signal,
+        (fraction) => onProgress?.(0.5 + fraction * 0.5),
+        (url) => entry.coreUrls.push(url),
+      ),
+    ]);
+    throwIfAborted(signal);
+    await ffmpeg.load({ coreURL, wasmURL }, { signal });
+    return ffmpeg;
+  } catch (error) {
+    // The worker may already exist (load spawns it before the core arrives);
+    // terminating is the only way to stop it if we are backing out.
+    try {
+      ffmpeg.terminate();
+    } catch {
+      /* never started */
+    }
+    if (isAbortError(error) || signal?.aborted) throw abortError();
+    if (error instanceof AudioExtractionUnavailableError) throw error;
+    throw new AudioExtractionUnavailableError(
+      base === CDN_CORE_BASE
+        ? "Could not download the in-browser audio decoder. Check your connection, or connect the desktop app to sync without it."
+        : "Could not start the in-browser audio decoder.",
+      { cause: error },
+    );
+  }
+};
+
 /**
- * Load ffmpeg.wasm once per page, and reuse it.
+ * Load ffmpeg.wasm once per page, and reuse it while it is healthy.
  *
- * The core is fetched into blob URLs rather than handed to the worker as
- * cross-origin URLs: the worker loads the core with `importScripts`, which
- * same-origin policy would otherwise refuse for a CDN address.
+ * Concurrent callers share the one in-flight load rather than spawning two
+ * workers. A load that is released (or superseded) while in flight never
+ * commits: it terminates its own instance and rejects with an AbortError, so
+ * no orphaned wasm heap is left behind and no stale promise can resurrect a
+ * decoder that `releaseBrowserFfmpeg` has already retired.
  */
 export const loadBrowserFfmpeg = async (
   onProgress?: (fraction: number) => void,
+  options?: { signal?: AbortSignal },
 ): Promise<FFmpeg> => {
-  if (ffmpegPromise) return ffmpegPromise;
-  ffmpegPromise = (async () => {
-    let FFmpegCtor: typeof FFmpeg;
-    let toBlobURL: (url: string, mimeType: string, progress?: boolean, cb?: (event: { received: number; total: number }) => void) => Promise<string>;
-    try {
-      // Dynamic so the wrapper is a separate chunk the app never loads unless
-      // an automatic sync is actually requested.
-      const [ffmpegModule, utilModule] = await Promise.all([
-        import("@ffmpeg/ffmpeg"),
-        import("@ffmpeg/util"),
-      ]);
-      FFmpegCtor = ffmpegModule.FFmpeg;
-      toBlobURL = utilModule.toBlobURL;
-    } catch (error) {
-      // Clear the cache: a failed import is almost always a transient chunk
-      // fetch, and leaving the rejected promise in place would make every later
-      // attempt fail instantly with the same stale error.
-      ffmpegPromise = null;
-      throw new AudioExtractionUnavailableError(
-        "Could not load the in-browser audio decoder.",
-        { cause: error },
-      );
+  const outerSignal = options?.signal;
+  throwIfAborted(outerSignal);
+
+  if (slot) {
+    if (slot.instance) return slot.instance;
+    if (slot.loading) {
+      // A caller that shares someone else's in-flight load must still honour
+      // ITS OWN abort: its promise rejects with AbortError without cancelling
+      // the shared load (that belongs to the caller who started it).
+      return raceWithSignal(slot.loading, outerSignal);
     }
-
-    const override = coreBaseUrl();
-    const base = override || ((await selfHostedCoreAvailable()) ? SELF_HOSTED_CORE_BASE : CDN_CORE_BASE);
-
-    const ffmpeg = new FFmpegCtor();
-    const verify = base === CDN_CORE_BASE;
-    try {
-      const [coreURL, wasmURL] = await Promise.all([
-        fetchCorePart(`${base}/ffmpeg-core.js`, "text/javascript", verify, toBlobURL, (fraction) =>
-          onProgress?.(fraction * 0.5),
-        ),
-        fetchCorePart(`${base}/ffmpeg-core.wasm`, "application/wasm", verify, toBlobURL, (fraction) =>
-          onProgress?.(0.5 + fraction * 0.5),
-        ),
-      ]);
-      await ffmpeg.load({ coreURL, wasmURL });
-    } catch (error) {
-      // A failed load must not poison every later attempt — the usual cause is
-      // a dropped network, which the next click may well not hit.
-      ffmpegPromise = null;
-      throw new AudioExtractionUnavailableError(
-        base === CDN_CORE_BASE
-          ? "Could not download the in-browser audio decoder. Check your connection, or connect the desktop app to sync without it."
-          : "Could not start the in-browser audio decoder.",
-        { cause: error },
-      );
-    }
-    return ffmpeg;
-  })();
-  return ffmpegPromise;
-};
-
-/** Release the wasm instance and its heap. Safe to call when idle. */
-export const releaseBrowserFfmpeg = async (): Promise<void> => {
-  const pending = ffmpegPromise;
-  ffmpegPromise = null;
-  if (!pending) return;
-  try {
-    (await pending).terminate();
-  } catch {
-    /* already gone */
   }
+
+  const entry: DecoderSlot = {
+    generation: (generationCounter += 1),
+    instance: null,
+    loading: null,
+    controller: new AbortController(),
+    coreUrls: [],
+  };
+  slot = entry;
+
+  // The caller's signal and this slot's own (release) signal, combined without
+  // depending on `AbortSignal.any`, which older WebViews do not have.
+  const onOuterAbort = () => entry.controller.abort();
+  if (outerSignal?.aborted) entry.controller.abort();
+  else outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+
+  const promise = (async (): Promise<FFmpeg> => {
+    let ffmpeg: FFmpeg | null = null;
+    try {
+      if (decoderFactory) {
+        // Test seam: the fake owns its own (possibly slow) `load`, so the
+        // cancellation and release races can be driven deterministically.
+        ffmpeg = decoderFactory();
+        await ffmpeg.load({}, { signal: entry.controller.signal });
+      } else {
+        ffmpeg = await createRealDecoder(entry, entry.controller.signal, onProgress);
+      }
+    } catch (error) {
+      // A load that fails leaves a spawned worker behind (the real loader
+      // spawns it before the core arrives). Tear it down here too, so the
+      // "failed load = no decoder" rule holds for the injected loader as well.
+      if (ffmpeg) {
+        try {
+          ffmpeg.terminate();
+        } catch {
+          /* never started */
+        }
+      }
+      if (slot === entry) slot = null;
+      revokeCoreUrls(entry);
+      // The catch path exits via the `finally`, so undo the outer listener
+      // here — a load that failed or was released has nothing left to abort.
+      outerSignal?.removeEventListener("abort", onOuterAbort);
+      if (isAbortError(error) || entry.controller.signal.aborted || outerSignal?.aborted) {
+        throw abortError();
+      }
+      if (error instanceof AudioExtractionUnavailableError) throw error;
+      throw new AudioExtractionUnavailableError("Could not load the in-browser audio decoder.", {
+        cause: error,
+      });
+    } finally {
+      outerSignal?.removeEventListener("abort", onOuterAbort);
+    }
+
+    // COMMIT CHECK — the release protocol in one line. If the slot was
+    // released (or replaced) while this load ran, the instance belongs to
+    // nobody: tear it down ourselves instead of installing it.
+    // (`ffmpeg` cannot be null here: the try block either assigned it or threw.)
+    const instance = ffmpeg as FFmpeg;
+    if (slot !== entry || entry.generation !== generationCounter) {
+      try {
+        instance.terminate();
+      } catch {
+        /* never started */
+      }
+      revokeCoreUrls(entry);
+      throw abortError();
+    }
+
+    entry.instance = instance;
+    entry.loading = null;
+    return instance;
+  })();
+
+  entry.loading = promise;
+  return promise;
 };
+
+/**
+ * Retire the decoder and free its wasm heap. Safe to call when idle.
+ *
+ * Serialised against an in-flight load by construction: the slot is detached
+ * and the generation bumped BEFORE anything is awaited, which both invalidates
+ * a load that is still running and prevents a later load from committing into
+ * the slot this call is about to tear down. Only then does it wait for the
+ * pending load (so the caller knows the release is complete) and terminate
+ * whatever instance actually exists.
+ */
+export const releaseBrowserFfmpeg = async (): Promise<void> => {
+  const current = slot;
+  if (!current) return;
+  slot = null;
+  generationCounter += 1;
+
+  // Stop the core download and the worker's load, so awaiting is prompt.
+  current.controller.abort();
+
+  if (current.loading) {
+    try {
+      await current.loading;
+    } catch {
+      /* cancelled or failed: it produced nothing worth keeping */
+    }
+  }
+
+  const instance = current.instance;
+  current.instance = null;
+  if (instance) {
+    try {
+      instance.terminate();
+    } catch {
+      /* already gone */
+    }
+  }
+  revokeCoreUrls(current);
+};
+
+/** Test-only: the current cache state, for assertions. */
+export const __browserFfmpegCacheForTests = (): {
+  loaded: boolean;
+  loading: boolean;
+  generation: number;
+} => ({
+  loaded: Boolean(slot?.instance),
+  loading: Boolean(slot?.loading),
+  generation: generationCounter,
+});
+
+/** Test-only: replace the real wasm loader, or pass null to restore it. */
+export const __setBrowserFfmpegFactoryForTests = (factory: DecoderFactory | null): void => {
+  decoderFactory = factory;
+};
+
+/** Test-only: drop all module state between cases. */
+export const __resetBrowserFfmpegForTests = async (): Promise<void> => {
+  await releaseBrowserFfmpeg();
+  decoderFactory = null;
+  slot = null;
+  generationCounter += 1;
+};
+
+/* ------------------------------------------------------------------------ */
+/* Extraction                                                                */
+/* ------------------------------------------------------------------------ */
 
 export interface ExtractAudioOptions {
   /** The dropped file. Mounted, never copied. Preferred over `url`. */
@@ -328,16 +636,23 @@ export interface ExtractAudioOptions {
 const INPUT_NAME = "subsync-input";
 const OUTPUT_NAME = "subsync-window.pcm";
 const MOUNT_POINT = "/subsync";
+/** `FFFSType.WORKERFS`, as a literal so the enum need not be imported at
+ *  runtime (its value is the string the worker compares against). */
+const WORKERFS = "WORKERFS";
 
 /**
  * There is one wasm instance, and it has one filesystem.
  *
  * Two extractions at once would mount over each other, read each other's
  * output file and leave the mount point in whatever state the loser unwound
- * to. The UI already serializes runs; this makes the module safe on its own
- * terms rather than by convention.
+ * to. The UI serializes runs for its own reasons, but this makes the module
+ * safe on its own terms.
+ *
+ * Ownership is a token, not a boolean: the loser must never clear a flag that
+ * belongs to the run it was refused by. The token is released only by the
+ * owner, in one place, after cleanup.
  */
-let extractionInFlight = false;
+let extractionOwner: symbol | null = null;
 
 /**
  * Fetch a bounded prefix of a URL.
@@ -345,6 +660,9 @@ let extractionInFlight = false;
  * Range-requested first, and — because a server may ignore Range, and the app's
  * own relay streams rather than seeks — the body is also read incrementally and
  * ABORTED at the cap. Either way nothing larger than `cap` is ever held.
+ *
+ * The signal is checked per chunk as well as wired into `fetch`, so an abort
+ * re-thrown from here is an AbortError rather than a raw stream failure.
  */
 const fetchBoundedPrefix = async (
   url: string,
@@ -352,37 +670,58 @@ const fetchBoundedPrefix = async (
   signal: AbortSignal | undefined,
   onBytes?: (received: number) => void,
 ): Promise<Uint8Array> => {
+  throwIfAborted(signal);
   const controller = new AbortController();
   const stopOuter = () => controller.abort();
-  signal?.addEventListener("abort", stopOuter, { once: true });
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", stopOuter, { once: true });
   try {
-    const response = await fetch(url, {
-      headers: { range: `bytes=0-${cap - 1}` },
-      signal: controller.signal,
-      cache: "no-store",
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: { range: `bytes=0-${cap - 1}` },
+        signal: controller.signal,
+        cache: "no-store",
+      });
+    } catch (error) {
+      if (isAbortError(error) || signal?.aborted) throw abortError();
+      throw error;
+    }
     if (!response.ok && response.status !== 206) {
       throw new AudioExtractionUnavailableError(
         `Could not read this video (HTTP ${response.status}).`,
       );
     }
-    if (!response.body) return new Uint8Array(await response.arrayBuffer());
+    if (!response.body) {
+      throwIfAborted(signal);
+      return new Uint8Array(await response.arrayBuffer());
+    }
 
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let received = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done || !value) break;
-      chunks.push(value);
-      received += value.byteLength;
-      onBytes?.(received);
-      if (received >= cap) {
-        // Stop the transfer rather than draining a multi-gigabyte body.
-        await reader.cancel().catch(() => undefined);
-        break;
+    try {
+      for (;;) {
+        throwIfAborted(signal);
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        chunks.push(value);
+        received += value.byteLength;
+        onBytes?.(received);
+        if (received >= cap) {
+          // Stop the transfer rather than draining a multi-gigabyte body.
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
       }
+    } catch (error) {
+      if (isAbortError(error) || signal?.aborted) {
+        await reader.cancel().catch(() => undefined);
+        throw abortError();
+      }
+      throw error;
     }
+    throwIfAborted(signal);
     const out = new Uint8Array(Math.min(received, cap));
     let at = 0;
     for (const chunk of chunks) {
@@ -408,10 +747,6 @@ const asTimestamp = (seconds: number): string => {
   return fraction > 0 ? `${base}.${Math.round(fraction * 1000).toString().padStart(3, "0")}` : base;
 };
 
-const throwIfAborted = (signal?: AbortSignal): void => {
-  if (signal?.aborted) throw new DOMException("Subtitle sync was cancelled", "AbortError");
-};
-
 /**
  * Decode the reference audio, one window at a time.
  *
@@ -420,6 +755,11 @@ const throwIfAborted = (signal?: AbortSignal): void => {
  * stream with dropped or duplicated samples would otherwise make byte position
  * drift away from wall-clock time, and since the entire method is "which
  * 10 ms window was this", every offset would come out wrong by that drift.
+ *
+ * Cancellable at every await: the signal reaches the network, the decoder
+ * load, and each ffmpeg call; aborting also retires the decoder so the wasm
+ * worker stops rather than finishing the window in the background. Any error
+ * or cancellation evicts the decoder; a clean finish leaves it cached.
  */
 export const extractReferenceAudio = async (options: ExtractAudioOptions): Promise<number> => {
   const sampleRate = options.sampleRate ?? EXTRACT_SAMPLE_RATE;
@@ -427,88 +767,110 @@ export const extractReferenceAudio = async (options: ExtractAudioOptions): Promi
   const startSeconds = options.startSeconds ?? 0;
   const maxDurationSeconds = options.maxDurationSeconds ?? null;
 
-  throwIfAborted(options.signal);
-  if (extractionInFlight) {
-    throw new AudioExtractionUnavailableError(
-      "Another subtitle sync is already reading this video.",
-    );
+  // Refused before ANY shared state is touched — in particular before the
+  // decoder is consulted and before the existing run's signal or mount is
+  // disturbed. The caller of the rejected run simply gets an error.
+  if (extractionOwner) {
+    throw new SubtitleSyncBusyError("Another subtitle sync is already reading this video.");
   }
-  extractionInFlight = true;
+  throwIfAborted(options.signal);
 
-  const ffmpeg = await loadBrowserFfmpeg((fraction) =>
-    options.onProgress?.({ processedSeconds: 0, loadingDecoder: fraction }),
-  ).catch((error) => {
-    extractionInFlight = false;
-    throw error;
-  });
+  const owner = Symbol("subsync-extraction");
+  extractionOwner = owner;
 
-  let inputPath: string;
+  // Internal signal: the caller's abort and our own teardown both feed it.
+  const run = new AbortController();
+  const signal = run.signal;
+
+  // Release is idempotent; the first caller (an abort listener, or the
+  // failure path below) starts it, everyone else awaits the same promise.
+  let releasing: Promise<void> | null = null;
+  const retireDecoder = (): Promise<void> => {
+    if (!releasing) releasing = releaseBrowserFfmpeg();
+    run.abort();
+    return releasing;
+  };
+  const onCallerAbort = () => {
+    void retireDecoder();
+  };
+  if (options.signal?.aborted) onCallerAbort();
+  else options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+  let ffmpeg: FFmpeg | null = null;
   let mounted = false;
   let wrote = false;
-
-  try {
-    throwIfAborted(options.signal);
-  } catch (error) {
-    extractionInFlight = false;
-    throw error;
-  }
-
-  if (options.file) {
-    // WORKERFS reads through the File handle, so the multi-GB body never
-    // enters the wasm heap. If the runtime refuses the mount we do NOT fall
-    // back to writeFile — that would quietly turn a memory-safe path into an
-    // out-of-memory crash on exactly the large files this exists for.
-    const { FFFSType } = await import("@ffmpeg/ffmpeg");
-    try {
-      await ffmpeg.createDir(MOUNT_POINT);
-    } catch {
-      /* already there from an earlier run */
-    }
-    try {
-      await ffmpeg.mount(FFFSType.WORKERFS, { files: [options.file] }, MOUNT_POINT);
-      mounted = true;
-    } catch (error) {
-      throw new AudioExtractionUnavailableError(
-        "This browser cannot read the video file without loading all of it into memory, which is unsafe for a file this size.",
-        { cause: error },
-      );
-    }
-    inputPath = `${MOUNT_POINT}/${options.file.name}`;
-  } else if (options.url) {
-    // A BOUNDED prefix, never the whole thing: unlike a File, a URL cannot be
-    // read lazily from inside wasm, so whatever is fetched is held. See
-    // URL_FETCH_BYTE_CAP.
-    const prefix = await fetchBoundedPrefix(
-      options.url,
-      options.urlByteCap ?? URL_FETCH_BYTE_CAP,
-      options.signal,
-      (received) =>
-        options.onProgress?.({ processedSeconds: 0, downloadedBytes: received }),
-    ).catch((error) => {
-      extractionInFlight = false;
-      throw error;
-    });
-    await ffmpeg.writeFile(INPUT_NAME, prefix);
-    wrote = true;
-    inputPath = INPUT_NAME;
-  } else {
-    extractionInFlight = false;
-    throw new AudioExtractionUnavailableError("No video file or URL to read audio from.");
-  }
-
-  const totalSeconds =
-    maxDurationSeconds !== null
-      ? maxDurationSeconds
-      : options.durationSec
-        ? Math.max(0, options.durationSec - startSeconds)
-        : undefined;
-
   let processedSeconds = 0;
   let windowsWithAudio = 0;
+  let failure: unknown;
+  let failed = false;
 
   try {
+    ffmpeg = await loadBrowserFfmpeg(
+      (fraction) => {
+        if (signal.aborted) return;
+        options.onProgress?.({ processedSeconds: 0, loadingDecoder: fraction });
+      },
+      { signal },
+    );
+    throwIfAborted(signal);
+
+    let inputPath: string;
+
+    if (options.file) {
+      // WORKERFS reads through the File handle, so the multi-GB body never
+      // enters the wasm heap. If the runtime refuses the mount we do NOT fall
+      // back to writeFile — that would quietly turn a memory-safe path into an
+      // out-of-memory crash on exactly the large files this exists for.
+      try {
+        await ffmpeg.createDir(MOUNT_POINT);
+      } catch {
+        /* already there from an earlier run */
+      }
+      throwIfAborted(signal);
+      try {
+        // The enum's runtime value is the string the worker checks; passing
+        // the literal (cast only) keeps @ffmpeg out of any statically-loaded
+        // chunk while staying type-checked.
+        await ffmpeg.mount(WORKERFS as unknown as FFFSType, { files: [options.file] }, MOUNT_POINT);
+        mounted = true;
+      } catch (error) {
+        if (isAbortError(error) || signal.aborted) throw abortError();
+        throw new AudioExtractionUnavailableError(
+          "This browser cannot read the video file without loading all of it into memory, which is unsafe for a file this size.",
+          { cause: error },
+        );
+      }
+      inputPath = `${MOUNT_POINT}/${options.file.name}`;
+    } else if (options.url) {
+      // A BOUNDED prefix, never the whole thing: unlike a File, a URL cannot be
+      // read lazily from inside wasm, so whatever is fetched is held. See
+      // URL_FETCH_BYTE_CAP.
+      const prefix = await fetchBoundedPrefix(
+        options.url,
+        options.urlByteCap ?? URL_FETCH_BYTE_CAP,
+        signal,
+        (received) => {
+          if (signal.aborted) return;
+          options.onProgress?.({ processedSeconds: 0, downloadedBytes: received });
+        },
+      );
+      throwIfAborted(signal);
+      await ffmpeg.writeFile(INPUT_NAME, prefix, { signal });
+      wrote = true;
+      inputPath = INPUT_NAME;
+    } else {
+      throw new AudioExtractionUnavailableError("No video file or URL to read audio from.");
+    }
+
+    const totalSeconds =
+      maxDurationSeconds !== null
+        ? maxDurationSeconds
+        : options.durationSec
+          ? Math.max(0, options.durationSec - startSeconds)
+          : undefined;
+
     for (let offset = 0; ; offset += windowSeconds) {
-      throwIfAborted(options.signal);
+      throwIfAborted(signal);
       if (maxDurationSeconds !== null && offset >= maxDurationSeconds) break;
       if (totalSeconds !== undefined && offset >= totalSeconds) break;
 
@@ -541,8 +903,11 @@ export const extractReferenceAudio = async (options: ExtractAudioOptions): Promi
         OUTPUT_NAME,
       ];
 
-      const code = await ffmpeg.exec(args);
-      throwIfAborted(options.signal);
+      // The signal makes the waiting promise reject the moment the user
+      // cancels; terminating the decoder (in the abort listener) is what stops
+      // the wasm command itself.
+      const code = await ffmpeg.exec(args, -1, { signal });
+      throwIfAborted(signal);
       if (code !== 0) {
         if (windowsWithAudio === 0) {
           throw new AudioExtractionUnavailableError(
@@ -557,12 +922,13 @@ export const extractReferenceAudio = async (options: ExtractAudioOptions): Promi
 
       let data: Uint8Array;
       try {
-        data = (await ffmpeg.readFile(OUTPUT_NAME)) as Uint8Array;
+        data = (await ffmpeg.readFile(OUTPUT_NAME, "binary", { signal })) as Uint8Array;
       } finally {
         // Delete before doing anything with the bytes: the window's copy in
         // the wasm heap is dead weight from here on.
         await ffmpeg.deleteFile(OUTPUT_NAME).catch(() => undefined);
       }
+      throwIfAborted(signal);
       if (data.byteLength === 0) break;
 
       // Int16 view over the same bytes — no copy. `byteOffset` matters: the
@@ -570,6 +936,9 @@ export const extractReferenceAudio = async (options: ExtractAudioOptions): Promi
       const usable = data.byteLength - (data.byteLength % 2);
       const pcm = new Int16Array(data.buffer, data.byteOffset, usable / 2);
       await options.onWindow(pcm, startSeconds + offset);
+      // A cancel can land while the caller is processing the window. Nothing
+      // further — no progress, no next window — may be delivered after that.
+      throwIfAborted(signal);
       windowsWithAudio += 1;
 
       const windowSecondsRead = pcm.length / sampleRate;
@@ -581,16 +950,42 @@ export const extractReferenceAudio = async (options: ExtractAudioOptions): Promi
       // partial window still counts.
       if (windowSecondsRead < remaining - 0.5) break;
     }
-  } finally {
-    // Unmount and delete even on an abort: the next run mounts at the same
-    // path and writes the same filename, so a stale mount is not recoverable
-    // without this.
+  } catch (error) {
+    failed = true;
+    failure = error;
+  }
+
+  // Cleanup runs on the normal path too. Every step is best-effort: after a
+  // cancel the decoder may already be gone, and a failed unmount must not
+  // mask the real outcome. Wrapped so a release that races this cleanup (both
+  // call terminate/unmount) cannot escape as an unhandled rejection.
+  if (ffmpeg) {
     if (mounted) await ffmpeg.unmount(MOUNT_POINT).catch(() => undefined);
     if (wrote) await ffmpeg.deleteFile(INPUT_NAME).catch(() => undefined);
     await ffmpeg.deleteFile(OUTPUT_NAME).catch(() => undefined);
-    extractionInFlight = false;
   }
 
+  const aborted =
+    signal.aborted ||
+    options.signal?.aborted === true ||
+    (failed && isAbortError(failure));
+
+  // Any failure or cancellation retires the decoder: it may be terminated,
+  // mid-command, or half-initialised, and the next sync must load a fresh
+  // instance rather than inherit that. A clean run leaves the cache alone.
+  if (failed || aborted) {
+    await (releasing ?? releaseBrowserFfmpeg()).catch(() => undefined);
+    releasing = null;
+  }
+
+  options.signal?.removeEventListener("abort", onCallerAbort);
+  if (extractionOwner === owner) extractionOwner = null;
+
+  // A cancel that landed while cleanup was running is still a cancel: the
+  // listener above (or the caller's own flag) has retired the decoder, so
+  // reporting success here would hand back a run the user already stopped.
+  if (aborted || signal.aborted || options.signal?.aborted === true) throw abortError();
+  if (failed) throw failure;
   if (windowsWithAudio === 0) {
     throw new AudioExtractionUnavailableError("This video has no audio track to listen to.");
   }

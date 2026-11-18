@@ -43,6 +43,8 @@ export interface AlignOptions {
   /** Set when the reference is itself a subtitle track; enables ffsubsync's
    *  length-inferred framerate ratio, which is meaningless for a VAD signal. */
   referenceNumFrames?: number | null;
+  /** A flag that is set when the caller cancels, checked between passes. */
+  signal?: AbortSignal;
   quality?: QualityThresholds;
 }
 
@@ -104,6 +106,15 @@ export const alignCues = (
   cues: readonly SubtitleCue[],
   options: AlignOptions = {},
 ): AlignmentOutcome => {
+  const signal = options.signal;
+  // The correlation itself is one blocking pass and cannot be interrupted; the
+  // piecewise pass re-scores every framerate candidate and can run for a long
+  // time, so the signal is checked between candidates. A cancel mid-alignment
+  // then surfaces promptly rather than after the whole DP completes.
+  const throwIfAborted = (): void => {
+    if (signal?.aborted) throw new DOMException("Subtitle sync was cancelled", "AbortError");
+  };
+  throwIfAborted();
   const startSeconds = options.startSeconds ?? 0;
   const prepared = preprocessCues(cues, { startSeconds });
   if (prepared.length === 0) {
@@ -125,6 +136,7 @@ export const alignCues = (
     gss: options.gss,
     referenceNumFrames: options.referenceNumFrames,
   });
+  throwIfAborted();
 
   let scaleFactor = search.scaleFactor;
   let offsetSeconds = search.offsetSamples / SAMPLE_RATE;
@@ -141,6 +153,7 @@ export const alignCues = (
 
     // Every candidate the global search already rasterized is re-scored here.
     for (const candidate of search.candidates) {
+      throwIfAborted();
       if (!candidate.inRange) continue;
       const scaled =
         candidate.scaleFactor === search.scaleFactor

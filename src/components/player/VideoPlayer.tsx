@@ -40,6 +40,7 @@ import { PlayerNavBar } from "./PlayerNavBar";
 import { PlayerOverlay } from "./PlayerOverlay";
 import { SubtitleSyncPanel } from "./SubtitleSyncPanel";
 import { canSyncSubtitles, syncSubtitles } from "../../utils/subtitleSync";
+import { SubtitleSyncBusyError } from "../../utils/subsyncErrors";
 import type { SubtitleSyncPhase, SubtitleSyncResult } from "../../types/subtitleSync";
 
 interface VideoPlayerProps {
@@ -834,6 +835,11 @@ export const VideoPlayer = ({
     } catch (error) {
       if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
         setAutoSyncStatus(null);
+      } else if (error instanceof SubtitleSyncBusyError) {
+        // A run was already going — most likely started from another control
+        // or another item before this click. Say so plainly instead of
+        // "Sync failed"; the run that owns the work is unaffected.
+        setAutoSyncStatus(error.message);
       } else {
         setAutoSyncStatus(
           `Sync failed: ${error instanceof Error ? error.message : String(error)}`,

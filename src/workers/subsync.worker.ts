@@ -84,15 +84,18 @@ scope.onmessage = (event: MessageEvent<SubsyncRequest>) => {
       return;
     }
 
+    // A cancel for the whole worker, matching whichever run is active. The
+    // engine sends `runId`, so this is the ordinary case; matching the active
+    // run's id explicitly keeps it working if a newer `begin` arrived first.
+    if (message.type === "cancel") {
+      if (!active || active.begin.runId === message.runId) active = null;
+      return;
+    }
+
     // A message from a run the player has moved on from. Dropping it silently
     // is the point of the runId: cancelling mid-extraction otherwise leaves
     // windows in flight that would be folded into the NEXT run's reference.
     if (!active || active.begin.runId !== message.runId) return;
-
-    if (message.type === "cancel") {
-      active = null;
-      return;
-    }
 
     if (message.type === "pcm") {
       active.frameRate = message.frameRate;

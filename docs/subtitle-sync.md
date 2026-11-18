@@ -110,6 +110,30 @@ Detection and correlation run in a **Web Worker**, so playback does not stutter
 while a 2²¹-point transform runs. If a worker cannot be created at all, the
 same functions run on the main thread instead.
 
+### Cancelling, retrying, and the decoder's lifetime
+
+A sync can be cancelled at any point — while the ~32 MB wasm core downloads,
+while a URL prefix is being pulled, between windows, or inside a 100-second
+window decode. The abort signal reaches all of them: the core and prefix
+fetches are given it, `ffmpeg.exec`/`readFile` are given it (so their promises
+reject at once instead of after the window finishes), and the wasm worker
+itself is **terminated** so the command does not keep running in the
+background. Once cancelled, no further window or progress is delivered to the
+caller, and the run rejects with an `AbortError`.
+
+Only **one** sync runs at a time, page-wide. A second request — a double click,
+another item, a keyboard shortcut — is refused with `SubtitleSyncBusyError`
+*before* it touches any shared state, so the refusal cannot cancel the running
+run, evict its decoder, or leave a stale "busy" flag behind. The rejected
+caller sees a plain message; the active run finishes untouched.
+
+The decoder is reused across **successful** runs, but any failure or
+cancellation drops it, so the next sync loads a fresh instance rather than
+inheriting one that was terminated or half-initialised. Release is serialised
+against an in-flight load: a load that was superseded can only observe the
+mismatch and tear itself down, so a decoder can neither land after its release
+nor be resurrected by a stale promise.
+
 ## Before any of that: another subtitle track
 
 ffsubsync's own default (`subs_then_webrtc`) tries the video's embedded
@@ -163,7 +187,9 @@ The manual delay still works afterwards, as an adjustment on top.
 | [`src/utils/subsyncSplit.ts`](../src/utils/subsyncSplit.ts) | Piecewise (alass-style) alignment |
 | [`src/utils/subsyncVad.ts`](../src/utils/subsyncVad.ts) | Voice activity detection over PCM |
 | [`src/utils/subsyncEngine.ts`](../src/utils/subsyncEngine.ts) | The shared pipeline both engines run |
-| [`src/utils/subsyncAudio.ts`](../src/utils/subsyncAudio.ts) | ffmpeg.wasm extraction, in windows |
+| [`src/utils/subsyncAudio.ts`](../src/utils/subsyncAudio.ts) | ffmpeg.wasm extraction, in windows, cancellable |
+| [`src/utils/subsyncGate.ts`](../src/utils/subsyncGate.ts) | The page-wide "one sync at a time" gate |
+| [`src/utils/subsyncErrors.ts`](../src/utils/subsyncErrors.ts) | `SubtitleSyncBusyError` |
 | [`src/utils/subtitleSync.ts`](../src/utils/subtitleSync.ts) | The two engines, and which one to use |
 | [`src/workers/subsync.worker.ts`](../src/workers/subsync.worker.ts) | Worker shell — no algorithm of its own |
 | [`src-tauri/src/subsync.rs`](../src-tauri/src/subsync.rs) | Native ffsubsync + reference extraction |

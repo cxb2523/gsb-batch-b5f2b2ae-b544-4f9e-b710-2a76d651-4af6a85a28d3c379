@@ -23,19 +23,29 @@
  * ────────────────────────────────────────────────────────────────────────────
  */
 
-import { getRelayBase } from "./secureUrl";
-import { getRelayStatus } from "./relayDiscovery";
-import { EXTRACT_SAMPLE_RATE, extractReferenceAudio } from "./subsyncAudio";
-import { runAlignment } from "./subsyncEngine";
-import { cuesToSpeech, preprocessCues } from "./subsyncSpeech";
-import { SpeechAccumulator } from "./subsyncVad";
-import type { SubsyncRequest, SubsyncResponse } from "./subsyncWorkerProtocol";
+// Extensionful, .ts-style specifiers: `npm test` runs these modules under
+// Node's own resolver (no bundler), where an extensionless or directory
+// import does not resolve. Vite accepts both forms; keeping it uniform here is
+// what lets the gate/concurrency tests import the real engine offline.
+import { getRelayBase } from "./secureUrl.ts";
+import { getRelayStatus } from "./relayDiscovery.ts";
+import {
+  EXTRACT_SAMPLE_RATE,
+  extractReferenceAudio,
+  releaseBrowserFfmpeg,
+} from "./subsyncAudio.ts";
+import { runAlignment } from "./subsyncEngine.ts";
+import { subtitleSyncGate } from "./subsyncGate.ts";
+import { SubtitleSyncBusyError } from "./subsyncErrors.ts";
+import { cuesToSpeech, preprocessCues } from "./subsyncSpeech.ts";
+import { SpeechAccumulator } from "./subsyncVad.ts";
+import type { SubsyncRequest, SubsyncResponse } from "./subsyncWorkerProtocol.ts";
 import {
   BackendUnavailableError,
   type SubtitleSyncEngine,
   type SubtitleSyncInput,
   type SubtitleSyncResult,
-} from "../types/subtitleSync";
+} from "../types/subtitleSync.ts";
 
 /** `/api/subsync` on whichever backend is connected. Mirrors backupUrl(). */
 const subsyncUrl = (path = ""): string => `${getRelayBase()}/api/subsync${path}`;
@@ -155,17 +165,24 @@ const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
 
   if (!worker) {
     // No worker: buffer the audio through the same accumulator the worker uses
-    // and align when `finish` arrives.
+    // and align when `finish` arrives. `cancelled` makes the run inert: a
+    // `finish`/`pcm` that arrives after an abort must not resolve the promise,
+    // and every later message is dropped rather than folded into anything.
     let begin: Extract<SubsyncRequest, { type: "begin" }> | null = null;
     const accumulator = new SpeechAccumulator();
+    let cancelled = false;
     let resolve!: (value: SubtitleSyncResult) => void;
     let reject!: (reason: unknown) => void;
     const done = new Promise<SubtitleSyncResult>((res, rej) => {
       resolve = res;
       reject = rej;
     });
+    // The caller may abort before `done` is awaited; claim the rejection so it
+    // never surfaces as an unhandled one.
+    done.catch(() => undefined);
     return {
       post: (message) => {
+        if (cancelled) return;
         try {
           if (message.type === "begin") begin = message;
           else if (message.type === "pcm") {
@@ -173,7 +190,7 @@ const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
               frameRate: message.frameRate,
               startSeconds: message.startSeconds,
             });
-          } else if (message.type === "finish" && begin) {
+          } else if (message.type === "finish" && begin && !cancelled) {
             const reference = begin.referenceSpeech ?? accumulator.finish();
             if (reference.length === 0) {
               reject(new Error("No speech was detected in this video."));
@@ -191,38 +208,59 @@ const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
         }
       },
       done,
-      cancel: () => reject(new DOMException("Subtitle sync was cancelled", "AbortError")),
+      cancel: () => {
+        if (cancelled) return;
+        cancelled = true;
+        reject(new DOMException("Subtitle sync was cancelled", "AbortError"));
+      },
     };
   }
 
   let settle!: (value: SubtitleSyncResult) => void;
   let fail!: (reason: unknown) => void;
+  let settled = false;
   const done = new Promise<SubtitleSyncResult>((resolve, reject) => {
     settle = resolve;
     fail = reject;
   });
+  // Same reasoning as the main-thread path: a rejection may happen before the
+  // caller awaits `done` (an immediate abort), and must not go unhandled.
+  done.catch(() => undefined);
 
   const onMessage = (event: MessageEvent<SubsyncResponse>) => {
     const message = event.data;
-    // A reply from a run we have already abandoned.
-    if (message.runId !== runId) return;
+    // A reply from a run we have already abandoned — including a `result`
+    // that raced the abort. After a cancel nothing is delivered to the caller.
+    if (message.runId !== runId || settled) return;
     if (message.type === "result") {
       cleanup();
+      settled = true;
       settle(message.result);
     } else if (message.type === "error") {
       cleanup();
+      settled = true;
       fail(new Error(message.message));
     }
   };
   const onError = (event: ErrorEvent) => {
     cleanup();
+    if (settled) return;
+    settled = true;
     // A worker that threw at module scope will do it again — start fresh.
     discardWorker();
     fail(new Error(event.message || "The subtitle sync worker stopped."));
   };
   const onAbort = () => {
-    worker.postMessage({ type: "cancel", runId } satisfies SubsyncRequest);
     cleanup();
+    if (settled) return;
+    settled = true;
+    // Tell the worker to drop the run so its held state does not leak into the
+    // next one. Guarded: a terminated worker throws if posted to.
+    try {
+      worker.postMessage({ type: "cancel", runId } satisfies SubsyncRequest);
+    } catch {
+      /* worker already gone */
+    }
     fail(new DOMException("Subtitle sync was cancelled", "AbortError"));
   };
 
@@ -234,10 +272,14 @@ const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
 
   worker.addEventListener("message", onMessage as EventListener);
   worker.addEventListener("error", onError as EventListener);
-  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
 
   return {
-    post: (message, transfer) => worker.postMessage(message, transfer ?? []),
+    post: (message, transfer) => {
+      if (settled) return;
+      worker.postMessage(message, transfer ?? []);
+    },
     done,
     cancel: onAbort,
   };
@@ -253,6 +295,7 @@ const alignOptionsFrom = (input: SubtitleSyncInput) => ({
   noFixFramerate: input.noFixFramerate,
   gss: input.gss,
   splitPenaltySeconds: input.splitPenaltySeconds ?? null,
+  signal: input.signal,
 });
 
 /**
@@ -282,96 +325,125 @@ export const webSubtitleSyncEngine: SubtitleSyncEngine = {
     isFetchableByBackend(input.media.url),
 
   async sync(input: SubtitleSyncInput): Promise<SubtitleSyncResult> {
-    const runId = (runSequence += 1);
-    const run = startRun(runId, input.signal);
-    const startSeconds = input.startSeconds ?? 0;
-
-    if (input.referenceCues?.length) {
-      input.onProgress?.({ phase: "detecting-speech", detail: "Reading the other subtitle track" });
-      const reference = referenceFromCues(input.referenceCues, startSeconds);
-      run.post({
-        type: "begin",
-        runId,
-        cues: input.cues,
-        referenceSpeech: reference.samples,
-        referenceNumFrames: reference.numFrames,
-        reference: "subtitle-track",
-        processingMode: "web",
-        engine: "web",
-        options: alignOptionsFrom(input),
-      });
-      input.onProgress?.({ phase: "finding-alignment" });
-      run.post({ type: "finish", runId });
-      return run.done;
+    try {
+      return await runWebSync(input);
+    } catch (error) {
+      // A refused (busy) call must leave everything exactly as it found it —
+      // the decoder belongs to the run that is still in progress. Every other
+      // failure or cancellation drops the decoder so the next sync loads a
+      // fresh instance rather than reusing a terminated or half-initialised
+      // one. Clean runs keep the cache.
+      if (!(error instanceof SubtitleSyncBusyError)) {
+        await releaseBrowserFfmpeg().catch(() => undefined);
+      }
+      throw error;
     }
+  },
+};
 
+/**
+ * The body of a web sync, before the failure cleanup wrapper.
+ *
+ * Kept as a free function so `sync` can be a thin `try/catch` around it rather
+ * than an object method that has to look itself up (`this.run` is not visible
+ * through the `SubtitleSyncEngine` type).
+ */
+const runWebSync = async (input: SubtitleSyncInput): Promise<SubtitleSyncResult> => {
+  const runId = (runSequence += 1);
+  const run = startRun(runId, input.signal);
+  const startSeconds = input.startSeconds ?? 0;
+
+  if (input.referenceCues?.length) {
+    input.onProgress?.({ phase: "detecting-speech", detail: "Reading the other subtitle track" });
+    const reference = referenceFromCues(input.referenceCues, startSeconds);
     run.post({
       type: "begin",
       runId,
       cues: input.cues,
-      reference: "audio-vad",
+      referenceSpeech: reference.samples,
+      referenceNumFrames: reference.numFrames,
+      reference: "subtitle-track",
       processingMode: "web",
       engine: "web",
       options: alignOptionsFrom(input),
     });
-
-    input.onProgress?.({ phase: "preparing-audio" });
-    try {
-      await extractReferenceAudio({
-        file: input.media.file,
-        url: input.media.file ? undefined : input.media.url,
-        startSeconds,
-        maxDurationSeconds: input.maxDurationSeconds ?? DEFAULT_MAX_REFERENCE_SECONDS,
-        durationSec: input.media.durationSec,
-        signal: input.signal,
-        sampleRate: EXTRACT_SAMPLE_RATE,
-        onWindow: (pcm, windowStartSeconds) => {
-          // Copy out of the wasm heap and TRANSFER the copy, so the audio
-          // exists in exactly one place and is freed the moment the worker is
-          // done detecting it. The start time rides along so the worker can
-          // PLACE the block rather than append it — see SpeechAccumulator.
-          const copy = new Int16Array(pcm);
-          run.post(
-            {
-              type: "pcm",
-              runId,
-              buffer: copy.buffer,
-              frameRate: EXTRACT_SAMPLE_RATE,
-              // Relative to the analysed span, which is where the subtitle
-              // timeline starts too.
-              startSeconds: windowStartSeconds - startSeconds,
-            },
-            [copy.buffer],
-          );
-        },
-        onProgress: ({ processedSeconds, totalSeconds, loadingDecoder }) => {
-          if (loadingDecoder !== undefined) {
-            input.onProgress?.({
-              phase: "preparing-audio",
-              fraction: loadingDecoder,
-              detail: "Fetching the audio decoder",
-            });
-            return;
-          }
-          input.onProgress?.({
-            phase: "detecting-speech",
-            fraction: totalSeconds ? Math.min(1, processedSeconds / totalSeconds) : undefined,
-          });
-        },
-      });
-    } catch (error) {
-      // `cancel()` rejects the run's promise, and nothing is awaiting it once
-      // we rethrow — so it is claimed here to keep the rejection from reaching
-      // the window as an unhandled one.
-      run.done.catch(() => undefined);
-      run.cancel();
-      throw error;
-    }
-
     input.onProgress?.({ phase: "finding-alignment" });
     run.post({ type: "finish", runId });
     return run.done;
-  },
+  }
+
+  run.post({
+    type: "begin",
+    runId,
+    cues: input.cues,
+    reference: "audio-vad",
+    processingMode: "web",
+    engine: "web",
+    options: alignOptionsFrom(input),
+  });
+
+  input.onProgress?.({ phase: "preparing-audio" });
+  try {
+    await extractReferenceAudio({
+      file: input.media.file,
+      url: input.media.file ? undefined : input.media.url,
+      startSeconds,
+      maxDurationSeconds: input.maxDurationSeconds ?? DEFAULT_MAX_REFERENCE_SECONDS,
+      durationSec: input.media.durationSec,
+      signal: input.signal,
+      sampleRate: EXTRACT_SAMPLE_RATE,
+      onWindow: (pcm, windowStartSeconds) => {
+        // Copy out of the wasm heap and TRANSFER the copy, so the audio
+        // exists in exactly one place and is freed the moment the worker is
+        // done detecting it. The start time rides along so the worker can
+        // PLACE the block rather than append it — see SpeechAccumulator.
+        const copy = new Int16Array(pcm);
+        run.post(
+          {
+            type: "pcm",
+            runId,
+            buffer: copy.buffer,
+            frameRate: EXTRACT_SAMPLE_RATE,
+            // Relative to the analysed span, which is where the subtitle
+            // timeline starts too.
+            startSeconds: windowStartSeconds - startSeconds,
+          },
+          [copy.buffer],
+        );
+      },
+      onProgress: ({ processedSeconds, totalSeconds, loadingDecoder }) => {
+        if (loadingDecoder !== undefined) {
+          input.onProgress?.({
+            phase: "preparing-audio",
+            fraction: loadingDecoder,
+            detail: "Fetching the audio decoder",
+          });
+          return;
+        }
+        input.onProgress?.({
+          phase: "detecting-speech",
+          fraction: totalSeconds ? Math.min(1, processedSeconds / totalSeconds) : undefined,
+        });
+      },
+    });
+  } catch (error) {
+    // `cancel()` rejects the run's promise, and nothing is awaiting it once
+    // we rethrow — so it is claimed here to keep the rejection from reaching
+    // the window as an unhandled one. Decoder eviction is the wrapper's job.
+    run.done.catch(() => undefined);
+    run.cancel();
+    throw error;
+  }
+
+  // A cancel can land between the last window and here; post nothing more.
+  if (input.signal?.aborted) {
+    run.done.catch(() => undefined);
+    run.cancel();
+    throw new DOMException("Subtitle sync was cancelled", "AbortError");
+  }
+  input.onProgress?.({ phase: "finding-alignment" });
+  run.post({ type: "finish", runId });
+  return run.done;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -607,20 +679,25 @@ export const selectSubtitleSyncEngine = (
  * falls through, and everything else is surfaced.
  */
 export const syncSubtitles = async (input: SubtitleSyncInput): Promise<SubtitleSyncResult> => {
-  const engine = selectSubtitleSyncEngine(input);
-  try {
-    return await engine.sync(input);
-  } catch (error) {
-    if (engine.processingMode === "native" && error instanceof BackendUnavailableError) {
-      if (!webSubtitleSyncEngine.canSync(input)) throw error;
-      input.onProgress?.({
-        phase: "preparing-audio",
-        detail: "The helper app went away — finishing in the browser",
-      });
-      return webSubtitleSyncEngine.sync(input);
+  // One sync at a time, page-wide. The refusal is thrown here, before the
+  // engine is even chosen, so a busy call never touches the active run's
+  // signal, worker or decoder — see subsyncGate.ts.
+  return subtitleSyncGate.run(async () => {
+    const engine = selectSubtitleSyncEngine(input);
+    try {
+      return await engine.sync(input);
+    } catch (error) {
+      if (engine.processingMode === "native" && error instanceof BackendUnavailableError) {
+        if (!webSubtitleSyncEngine.canSync(input)) throw error;
+        input.onProgress?.({
+          phase: "preparing-audio",
+          detail: "The helper app went away — finishing in the browser",
+        });
+        return webSubtitleSyncEngine.sync(input);
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 };
 
 /** Whether to offer the action at all, for the current item. */
