@@ -163,6 +163,9 @@ Higher performance when canvas blend modes are supported [caniuse.com/#feat=canv
 
 ## Changelog
 
+### Unreleased
+* Film grain textures are now cached per size in an LRU cache (up to 8 sizes) instead of remembering only the last size, so alternating image sizes no longer rebuild the noise texture. Evicted or explicitly invalidated sizes are rebuilt pixel-identically, and a render rejected while loading its viewfinder rolls its grain textures back — the next successful render matches a cold start. No public API changes; works with both `HTMLCanvasElement` and `OffscreenCanvas`
+
 ### 2.5.0
 * New effect `grain`: film grain (0–1) that shows most in the midtones. It scales with the image size and is the same on every run, so previews match full-size renders
 * New effect `lightLeak`: a warm glow bleeding in from one edge (`{ intensity, edge?, color? }`)

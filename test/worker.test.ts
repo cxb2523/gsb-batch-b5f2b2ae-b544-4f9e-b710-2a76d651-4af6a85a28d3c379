@@ -13,6 +13,8 @@ class FakeBitmap {
 
 class FakeContext {
   globalCompositeOperation = 'source-over';
+  globalAlpha = 1;
+  imageSmoothingEnabled = false;
   fillStyle: unknown = null;
   constructor(private canvas: FakeOffscreenCanvas) {}
 
@@ -24,6 +26,9 @@ class FakeContext {
       data.set(src.data);
     }
   }
+  createImageData(width: number, height: number) {
+    return { data: new Uint8ClampedArray(width * height * 4) };
+  }
   getImageData() {
     return { data: new Uint8ClampedArray(this.canvas.data) };
   }
@@ -34,6 +39,8 @@ class FakeContext {
     return { addColorStop() {} };
   }
   fillRect() {}
+  save() {}
+  restore() {}
 }
 
 class FakeOffscreenCanvas {
@@ -56,6 +63,7 @@ class FakeOffscreenCanvas {
 const pixels = (...rgba: number[]) => new Uint8ClampedArray(rgba);
 
 let vintagejs: typeof import('../src/index').default;
+let effects: typeof import('../src/effects');
 
 beforeEach(async () => {
   vi.resetModules();
@@ -63,6 +71,7 @@ beforeEach(async () => {
   vi.stubGlobal('Image', undefined);
   vi.stubGlobal('OffscreenCanvas', FakeOffscreenCanvas);
   vi.stubGlobal('ImageBitmap', FakeBitmap);
+  effects = await import('../src/effects');
   vintagejs = (await import('../src/index')).default;
 });
 
@@ -158,5 +167,44 @@ describe('vintagejs without a DOM (Web Worker)', () => {
 
     expect(() => res.getDataURL()).toThrow('Use getBlob()');
     await expect(res.genImage()).rejects.toThrow('Use getBlob()');
+  });
+});
+
+describe('grain cache without a DOM (Web Worker)', () => {
+  const bitmap = (size: number) =>
+    new FakeBitmap(size, size, pixels(...Array(size * size * 4).fill(128).map((v, i) =>
+      i % 4 === 3 ? 255 : v,
+    )));
+
+  it('builds and reuses grain textures on OffscreenCanvas', async () => {
+    const res = await vintagejs<OffscreenCanvas>(
+      bitmap(4) as unknown as ImageBitmap,
+      { grain: 0.5 },
+    );
+    const canvas = res.getCanvas() as unknown as FakeOffscreenCanvas;
+
+    // Grain changed the flat input.
+    expect(Array.from(canvas.data)).not.toEqual(Array.from(bitmap(4).data));
+
+    const key = effects.grainCacheKey(4, 4);
+    expect(effects.getGrainCacheKeys()).toEqual([key]);
+    expect(effects.createGrain(4, 4)).toBe(effects.grainCache.peek(key));
+  });
+
+  it('rolls back the cache when a worker render rejects on the viewfinder', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 404 }),
+    );
+
+    await expect(
+      vintagejs(bitmap(4) as unknown as ImageBitmap, {
+        grain: 0.5,
+        viewfinder: '/missing.jpg',
+      }),
+    ).rejects.toThrow('HTTP 404');
+
+    // Nothing the rejected render built or touched stays in the cache.
+    expect(effects.getGrainCacheKeys()).toEqual([]);
   });
 });

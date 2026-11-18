@@ -30,7 +30,13 @@ import {
   loadImage,
   loadImageWithCache,
 } from './utils';
-import { applyGrain, applyLightLeak } from './effects';
+import {
+  applyGrain,
+  applyLightLeak,
+  beginGrainTransaction,
+  commitGrainTransaction,
+  rollbackGrainTransaction,
+} from './effects';
 
 const defaultEffect: TEffect = {
   curves: false,
@@ -102,103 +108,120 @@ const applyEffect = (effect: TEffect) => {
     [canvas, ctx]: [TCanvas, TContext],
   ): Promise<TResult<TCanvas>> =>
     new Promise((resolve, reject) => {
-      const { width, height } = canvas;
-      ctx.globalCompositeOperation = 'multiply';
-      const supportsBlendModes = ctx.globalCompositeOperation === 'multiply';
-      const data = ctx.getImageData(0, 0, width, height);
-      const id = data.data.slice(0);
-      const { sepia, saturation, gray } = effect;
+      // Grain textures used by this render only join the shared cache once the
+      // whole render succeeds. A rejected viewfinder load rolls them back, so
+      // a failed render cannot change cache contents or LRU order.
+      const grainTransaction = beginGrainTransaction();
+      const succeed: typeof resolve = result => {
+        commitGrainTransaction(grainTransaction);
+        resolve(result);
+      };
+      const fail: typeof reject = error => {
+        rollbackGrainTransaction(grainTransaction);
+        reject(error);
+      };
 
-      for (let i = id.length / 4; i >= 0; --i) {
-        let ri = i << 2;
-        let gi = ri + 1;
-        let bi = ri + 2;
+      try {
+        const { width, height } = canvas;
+        ctx.globalCompositeOperation = 'multiply';
+        const supportsBlendModes = ctx.globalCompositeOperation === 'multiply';
+        const data = ctx.getImageData(0, 0, width, height);
+        const id = data.data.slice(0);
+        const { sepia, saturation, gray } = effect;
 
-        let r = LUT[0][id[ri]];
-        let g = LUT[1][id[gi]];
-        let b = LUT[2][id[bi]];
+        for (let i = id.length / 4; i >= 0; --i) {
+          let ri = i << 2;
+          let gi = ri + 1;
+          let bi = ri + 2;
 
-        if (sepia) {
-          [r, g, b] = [
-            r * 0.393 + g * 0.769 + b * 0.189,
-            r * 0.349 + g * 0.686 + b * 0.168,
-            r * 0.272 + g * 0.534 + b * 0.131,
-          ];
+          let r = LUT[0][id[ri]];
+          let g = LUT[1][id[gi]];
+          let b = LUT[2][id[bi]];
+
+          if (sepia) {
+            [r, g, b] = [
+              r * 0.393 + g * 0.769 + b * 0.189,
+              r * 0.349 + g * 0.686 + b * 0.168,
+              r * 0.272 + g * 0.534 + b * 0.131,
+            ];
+          }
+
+          if (gray) {
+            [r, g, b] = [
+              r * 0.21 + g * 0.72 + b * 0.07,
+              r * 0.21 + g * 0.72 + b * 0.07,
+              r * 0.21 + g * 0.72 + b * 0.07,
+            ];
+          }
+
+          if (saturation < 1) {
+            const avg = (r + g + b) / 3;
+            r += (avg - r) * (1 - saturation);
+            g += (avg - g) * (1 - saturation);
+            b += (avg - b) * (1 - saturation);
+          }
+
+          id[ri] = r;
+          id[gi] = g;
+          id[bi] = b;
         }
 
-        if (gray) {
-          [r, g, b] = [
-            r * 0.21 + g * 0.72 + b * 0.07,
-            r * 0.21 + g * 0.72 + b * 0.07,
-            r * 0.21 + g * 0.72 + b * 0.07,
-          ];
+        data.data.set(id);
+        ctx.putImageData(data, 0, 0);
+
+        if (effect.vignette) {
+          ctx.globalCompositeOperation = supportsBlendModes
+            ? 'multiply'
+            : 'source-over';
+          ctx.fillStyle = getGradient(ctx, width, height, [
+            'rgba(0,0,0,0)',
+            'rgba(0,0,0,0)',
+            `rgba(0,0,0,${effect.vignette})`,
+          ]);
+          ctx.fillRect(0, 0, width, height);
         }
 
-        if (saturation < 1) {
-          const avg = (r + g + b) / 3;
-          r += (avg - r) * (1 - saturation);
-          g += (avg - g) * (1 - saturation);
-          b += (avg - b) * (1 - saturation);
+        if (effect.lighten) {
+          ctx.globalCompositeOperation = supportsBlendModes
+            ? 'screen'
+            : 'lighter';
+          ctx.fillStyle = getGradient(ctx, width, height, [
+            `rgba(255,255,255,${effect.lighten})`,
+            'rgba(255,255,255,0)',
+            'rgba(0,0,0,0)',
+          ]);
+          ctx.fillRect(0, 0, width, height);
         }
 
-        id[ri] = r;
-        id[gi] = g;
-        id[bi] = b;
-      }
-
-      data.data.set(id);
-      ctx.putImageData(data, 0, 0);
-
-      if (effect.vignette) {
-        ctx.globalCompositeOperation = supportsBlendModes
-          ? 'multiply'
-          : 'source-over';
-        ctx.fillStyle = getGradient(ctx, width, height, [
-          'rgba(0,0,0,0)',
-          'rgba(0,0,0,0)',
-          `rgba(0,0,0,${effect.vignette})`,
-        ]);
-        ctx.fillRect(0, 0, width, height);
-      }
-
-      if (effect.lighten) {
-        ctx.globalCompositeOperation = supportsBlendModes
-          ? 'screen'
-          : 'lighter';
-        ctx.fillStyle = getGradient(ctx, width, height, [
-          `rgba(255,255,255,${effect.lighten})`,
-          'rgba(255,255,255,0)',
-          'rgba(0,0,0,0)',
-        ]);
-        ctx.fillRect(0, 0, width, height);
-      }
-
-      if (effect.lightLeak) {
-        applyLightLeak(ctx, width, height, effect.lightLeak, supportsBlendModes);
-      }
-
-      if (effect.grain > 0) {
-        applyGrain(ctx, width, height, Math.min(1, effect.grain), supportsBlendModes);
-      }
-
-      if (!effect.viewfinder) {
-        return resolve(getResult(canvas));
-      }
-
-      return loadImageWithCache(effect.viewfinder).then(img => {
-        if (supportsBlendModes) {
-          ctx.globalCompositeOperation = 'multiply';
-          ctx.drawImage(img, 0, 0, width, height);
-        } else {
-          const [, vfCtx] = createCanvasAndCtxFromImage(img, width, height);
-          const { data: vfData } = vfCtx.getImageData(0, 0, width, height);
-          const imageData = ctx.getImageData(0, 0, width, height);
-          imageData.data.set(imageData.data.map((v, i) => v * vfData[i] / 255));
-          ctx.putImageData(imageData, 0, 0);
+        if (effect.lightLeak) {
+          applyLightLeak(ctx, width, height, effect.lightLeak, supportsBlendModes);
         }
 
-        return resolve(getResult(canvas));
-      }, reject);
+        if (effect.grain > 0) {
+          applyGrain(ctx, width, height, Math.min(1, effect.grain), supportsBlendModes);
+        }
+
+        if (!effect.viewfinder) {
+          return succeed(getResult(canvas));
+        }
+
+        return loadImageWithCache(effect.viewfinder).then(img => {
+          if (supportsBlendModes) {
+            ctx.globalCompositeOperation = 'multiply';
+            ctx.drawImage(img, 0, 0, width, height);
+          } else {
+            const [, vfCtx] = createCanvasAndCtxFromImage(img, width, height);
+            const { data: vfData } = vfCtx.getImageData(0, 0, width, height);
+            const imageData = ctx.getImageData(0, 0, width, height);
+            imageData.data.set(imageData.data.map((v, i) => v * vfData[i] / 255));
+            ctx.putImageData(imageData, 0, 0);
+          }
+
+          return succeed(getResult(canvas));
+        }, fail);
+      } catch (error) {
+        return fail(error);
+      }
     });
 };
 

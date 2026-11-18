@@ -6,6 +6,7 @@ import type {
   TRGBColor,
 } from './types';
 
+import { GrainTextureCache } from './grainCache';
 import { createCanvas, get2dContext } from './utils';
 
 /**
@@ -15,6 +16,9 @@ import { createCanvas, get2dContext } from './utils';
  */
 export const GRAIN_CELLS = 1200;
 const GRAIN_SEED = 0x5eed;
+
+/** Maximum number of differently sized grain textures kept around. */
+export const GRAIN_CACHE_LIMIT = 8;
 
 /** mulberry32: a small seeded PRNG, so grain is identical on every run. */
 export const seededRandom = (seed: number): (() => number) => {
@@ -36,14 +40,25 @@ export const grainSize = (width: number, height: number): [number, number] => {
   ];
 };
 
-let grainCache: { key: string; canvas: TCanvas } | null = null;
-
-/** Mid-grey noise texture; the last one is reused (same size, same seed). */
-export const createGrain = (width: number, height: number): TCanvas => {
+/** Cache key for the grain texture of an image of the given size. */
+export const grainCacheKey = (width: number, height: number): string => {
   const [gw, gh] = grainSize(width, height);
-  const key = `${gw}x${gh}`;
-  if (grainCache && grainCache.key === key) return grainCache.canvas;
+  return `${gw}x${gh}`;
+};
 
+/**
+ * LRU cache of grain textures keyed by texture size. Holds at most
+ * GRAIN_CACHE_LIMIT sizes; the least recently used one is evicted past that
+ * and rebuilt (identically) on the next render at that size.
+ */
+export const grainCache = new GrainTextureCache<TCanvas>(GRAIN_CACHE_LIMIT);
+
+/**
+ * Builds a mid-grey noise texture for a grain size. Pure apart from the
+ * deterministic PRNG, so the texture for a given size is pixel-identical on
+ * every build — including after an eviction or invalidation.
+ */
+const buildGrainTexture = (gw: number, gh: number): TCanvas => {
   const random = seededRandom(GRAIN_SEED);
   // The sum of three uniform values is roughly normally distributed.
   const noise = (amplitude: number) =>
@@ -80,9 +95,44 @@ export const createGrain = (width: number, height: number): TCanvas => {
     data[i + 2] = v;
   }
   ctx.putImageData(image, 0, 0);
-  grainCache = { key, canvas };
   return canvas;
 };
+
+/**
+ * Mid-grey noise texture for an image size. Textures are cached per size and
+ * reused; a miss builds the texture and commits it straight away. Renders that
+ * may reject after applying grain (e.g. a viewfinder load failure) should use
+ * the transaction API below instead, so a failed render cannot pollute the
+ * cache.
+ */
+export const createGrain = (width: number, height: number): TCanvas => {
+  const [gw, gh] = grainSize(width, height);
+  const key = grainCacheKey(width, height);
+  return grainCache.acquire(key, () => buildGrainTexture(gw, gh));
+};
+
+/** Opens a grain-cache transaction for one render. */
+export const beginGrainTransaction = (): unknown => grainCache.begin();
+
+/** Publishes textures the render built/touched and updates LRU recency. */
+export const commitGrainTransaction = (transaction: unknown): void =>
+  grainCache.commit(transaction as Parameters<GrainTextureCache['commit']>[0]);
+
+/**
+ * Discards textures the failed render built, leaving the committed cache and
+ * its LRU order untouched, so the next successful render matches a cold start.
+ */
+export const rollbackGrainTransaction = (transaction: unknown): void =>
+  grainCache.rollback(
+    transaction as Parameters<GrainTextureCache['rollback']>[0],
+  );
+
+/** Committed texture keys in LRU order, least recently used first. */
+export const getGrainCacheKeys = (): string[] => grainCache.keys();
+
+/** Invalidates a size's texture (or the whole cache) so it is rebuilt. */
+export const invalidateGrainCache = (key?: string): void =>
+  grainCache.invalidate(key);
 
 /**
  * Film grain, blended with "overlay" so it shows most in the midtones (as on
