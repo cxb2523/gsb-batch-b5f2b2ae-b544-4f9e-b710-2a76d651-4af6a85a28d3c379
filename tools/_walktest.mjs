@@ -16,7 +16,7 @@
  */
 import { WashPath } from '../src/path.js';
 import { Terrain } from '../src/terrain.js';
-import { buildCorridor, confine, corridorAt, BAND } from '../src/corridor.js';
+import { buildCorridor, confine, corridorAt, corridorState, projectInside, BAND } from '../src/corridor.js';
 
 const path = new WashPath();
 const terrain = new Terrain(path);
@@ -32,8 +32,23 @@ const G = 9.81, JUMP_H = 0.45, JUMP_V = Math.sqrt(2 * G * JUMP_H);
 function spawn(d) {
   const p = path.posAt(d);
   return { x: p.x, y: groundAt(p.x, p.z), z: p.z, vx: 0, vz: 0,
-           vy: 0, air: false,
-           yaw: path.headingAt(d), pitch: 0, bob: 0 };
+           vy: 0, air: false, settle: 0, settleV: 0,
+           yaw: path.headingAt(d), pitch: 0, bob: 0, bob0: 0 };
+}
+
+/* The landing spring, mirrored from `src/main.js`. It is the one piece of the
+   frame whose absence would make the fixed point look better than it is: a
+   walker with no spring would never have to prove that the spring returns to
+   zero after a projected landing. */
+const SETTLE_W = 8;
+function settleStep(pl) {
+  if (!pl.settle && !pl.settleV) return;
+  const a = -SETTLE_W * SETTLE_W * pl.settle - 2 * SETTLE_W * pl.settleV;
+  pl.settleV += a * DT;
+  pl.settle += pl.settleV * DT;
+  if (Math.abs(pl.settle) < 1e-4 && Math.abs(pl.settleV) < 1e-4) {
+    pl.settle = 0; pl.settleV = 0;
+  }
 }
 
 /** One frame of src/main.js's `step`, with the keys given as f/r in [-1, 1].
@@ -72,14 +87,24 @@ function step(pl, f, r, speed, sp) {
   pl.x += pl.vx * DT;
   pl.z += pl.vz * DT;
 
+  /* The position invariant, exactly as src/main.js applies it: after
+     integration, before the ground is read. */
+  projectInside(corridor, path, pl);
+
   const g0 = groundAt(pl.x, pl.z);
   if (pl.air) {
     pl.vy -= G * DT;
     pl.y += pl.vy * DT;
-    if (pl.y <= g0) { pl.y = g0; pl.vy = 0; pl.air = false; }
+    if (pl.y <= g0) {
+      pl.y = g0; pl.air = false;
+      /* The impact hands the spring a downward velocity; `arrest`, mirrored. */
+      pl.settleV += Math.min(-pl.vy, 1.5 / 0.25) * 0.25;
+      pl.vy = 0;
+    }
   } else {
     pl.y = g0;
   }
+  settleStep(pl);
   return hit;
 }
 
@@ -87,6 +112,19 @@ function state(pl) {
   const q = path.atZ(pl.z, _q);
   const u = (pl.x - q.x) * Math.cos(q.th);
   return { s: q.s, u, lim: corridorAt(corridor, q.s, u >= 0 ? 1 : -1) };
+}
+
+/* The invariant under test, in one place: on *every* frame, of *every* path —
+ * walking, jumping, turbo strafing, and both ends of the walk — the player's
+ * lateral distance from the centreline must not exceed the corridor width there.
+ * This is the assertion the soft band alone could not make: it bounded velocity,
+ * and the position could still be up to a frame of travel outside. */
+const INVARIANT_EPS = 1e-6;
+function invariant(pl) {
+  const st = state(pl);
+  const over = Math.abs(st.u) - st.lim;
+  const endOver = Math.max(corridor.sMin - st.s, st.s - corridor.sMax);
+  return { ...st, over, endOver, ok: over <= INVARIANT_EPS && endOver <= INVARIANT_EPS };
 }
 
 let fails = 0;
@@ -145,16 +183,105 @@ for (const d of [8, 46, 120, 220, 300]) {
     let over = 0, maxOver = 0;
     for (let n = 0; n < 120 * 60; n++) {
       step(pl, 0, r, 12);
-      const st = state(pl);
-      const x = Math.abs(st.u) - st.lim;
-      if (x > 1e-3) { over++; if (x > maxOver) maxOver = x; }
+      const st = invariant(pl);
+      if (!st.ok) { over++; if (st.over > maxOver) maxOver = st.over; }
     }
     const st = state(pl);
-    check(Math.abs(st.u) <= st.lim + 0.01,
+    /* The invariant, on every frame rather than on the last one. This is what
+       the velocity band could not guarantee: it bounded how fast the player
+       left, and turbo still ran a frame's travel past the limit. */
+    check(over === 0,
           `held at d=${d} strafing ${r > 0 ? 'right' : 'left '}`,
           `|u|=${Math.abs(st.u).toFixed(2)} against a limit of ${st.lim.toFixed(2)}` +
           (over ? `  (${over} frames up to ${maxOver.toFixed(3)} m outside)` : ''));
   }
+}
+
+/* ── 2b. the same while jumping, which is where the frame of overshoot was ── */
+for (const d of [8, 46, 120, 220, 300]) {
+  for (const r of [1, -1]) {
+    const pl = spawn(d);
+    let over = 0, maxOver = 0, air = 0, airFrames = 0;
+    for (let n = 0; n < 120 * 60; n++) {
+      const wasAir = pl.air;
+      step(pl, 0, r, 12, !pl.air);
+      const st = invariant(pl);
+      airFrames++;
+      if (pl.air) air++;
+      if (!st.ok) {
+        over++;
+        if (wasAir) air++;             // count the airborne violations apart
+        if (st.over > maxOver) maxOver = st.over;
+      }
+    }
+    check(over === 0,
+          `jumping at the wall d=${d} ${r > 0 ? 'right' : 'left '}`,
+          `${(100 * air / airFrames).toFixed(0)}% airborne, worst over ` +
+          `${over ? maxOver.toFixed(4) + ' m on ' + over + ' frames' : 'none'}`);
+  }
+}
+
+/* ── 2c. a jump that is projected keeps its momentum and its landing ────────
+ * The projection moves the position only. What must not happen is what a
+ * velocity clamp would do if it were used as the fix: zero the speed, or change
+ * the height the landing test compares against. So the check is that an airborne
+ * frame which was pushed back still arrives at the ground height under its final
+ * position, and that the spring then settles to exactly zero. */
+{
+  let bad = 0, worstLand = 0, unsettled = 0, tested = 0;
+  for (let s = 8; s <= 320; s += 4) {
+    for (const side of [1, -1]) {
+      const lim = corridorAt(corridor, s, side);
+      const p = path.posAt(s), th = path.headingAt(s);
+      /* Start one stride inside the limit and jump outward at turbo, which is
+         the case that reaches the projection airborne. */
+      const pl = spawn(s);
+      pl.x = p.x + Math.cos(th) * side * (lim - 1.0);
+      pl.z = p.z + Math.sin(th) * side * (lim - 1.0);
+      pl.y = groundAt(pl.x, pl.z);
+      pl.yaw = path.headingAt(s) + side * Math.PI / 2;
+      step(pl, 0, 1, 12, true);
+      /* Give the settle the same step the page does, so "the spring finished"
+         means the same thing in both places. */
+      pl.settle = 0; pl.settleV = 0;
+      let air = 0;
+      while (pl.air && air < 120 * 2) { step(pl, 0, 1, 12, false); air++; }
+      tested++;
+      const g = groundAt(pl.x, pl.z);
+      const d = Math.abs(pl.y - g);
+      if (d > worstLand) worstLand = d;
+      if (d > 1e-9) bad++;
+      /* The settle settles: an airborne projection that handed the spring a
+         velocity has to come back to zero, not stay dipped. */
+      for (let n = 0; n < 120 * 3; n++) step(pl, 0, 0, 1.55, false);
+      if (pl.settle !== 0 || pl.settleV !== 0) unsettled++;
+    }
+  }
+  check(bad === 0, 'landing height is the height under the final position',
+        `${tested} outward turbo jumps, worst off-surface ${worstLand.toExponential(1)} m`);
+  check(unsettled === 0, 'and the landing spring still returns to zero',
+        `${unsettled} of ${tested} left a settle residue`);
+}
+
+/* A jump into the projection must not have zeroed the speed: the arc is
+   unchanged. Measured as the along-wall speed after the first constrained frame,
+   which a velocity clamp would have cut. */
+{
+  const s = 46, side = 1;
+  const lim = corridorAt(corridor, s, side);
+  const p = path.posAt(s), th = path.headingAt(s);
+  const pl = spawn(s);
+  pl.x = p.x + Math.cos(th) * side * (lim - 0.6);
+  pl.z = p.z + Math.sin(th) * side * (lim - 0.6);
+  pl.y = groundAt(pl.x, pl.z);
+  const v0 = 12;
+  pl.vx = Math.cos(th) * side * v0; pl.vz = Math.sin(th) * side * v0;
+  pl.air = true; pl.vy = JUMP_V;
+  step(pl, 0, 0, 1.55, false);
+  const speed = Math.hypot(pl.vx, pl.vz);
+  check(speed > 0 && pl.vy !== 0,
+        'a constrained jump keeps its speed and its vy',
+        `speed ${speed.toFixed(2)} m/s, vy ${pl.vy.toFixed(2)} m/s after one projected frame`);
 }
 
 /* ── 3. the two ends of the walk ─────────────────────────────────────────── */
@@ -323,6 +450,94 @@ for (const d of [8, 46, 120, 220, 300]) {
         pl.vy === 0 && pl.air === false,
         'standing still is a fixed point with jump in the loop',
         `dx=${(pl.x - p.x).toExponential(1)} vy=${pl.vy} air=${pl.air}`);
+}
+
+/* ── 7. teleport ───────────────────────────────────────────────────────────
+ *
+ * `placeAt` is `src/main.js`'s teleport and is copied here for the same reason
+ * `step` is: main.js owns the canvas. What this pins down is that the three
+ * arrival paths — bare spawn, first `walkTo`, second `walkTo` — all land on the
+ * same state, and that a teleport taken mid-flight or mid-settle leaves nothing
+ * behind. The fields a teleport must clear are the ones the task names: the
+ * airborne flag and vertical speed, both settle terms, the bob and its phase,
+ * and the lift budget. */
+function teleport(pl, d) {
+  const p = path.posAt(d);
+  pl.x = p.x; pl.z = p.z;
+  pl.vx = 0; pl.vz = 0; pl.bob = 0; pl.bob0 = 0;
+  pl.vy = 0; pl.air = false;
+  pl.settle = 0; pl.settleV = 0;
+  projectInside(corridor, path, pl);
+  pl.y = groundAt(pl.x, pl.z);
+  pl.lifted = 0;
+  return pl;
+}
+
+{
+  /* Mid-flight: airborne, moving outward at turbo, with a settle just handed a
+     velocity and head-bob phase accumulated. The worst case a player can hand
+     `walkTo`. */
+  const a = spawn(46);
+  a.yaw = path.headingAt(46) + Math.PI / 2;
+  for (let n = 0; n < 40; n++) step(a, 0, 1, 12, n === 0);
+  a.settle = 0.02; a.settleV = 0.5; a.bob0 = 7.3; a.bob = 0.031; a.lifted = 0.1;
+  teleport(a, 120);
+  teleport(a, 8);
+
+  const b = teleport(spawn(8), 8);          // what a direct walkTo(8) gives
+
+  const same = a.x === b.x && a.z === b.z && a.y === b.y &&
+    a.vx === 0 && a.vz === 0 && a.vy === 0 && a.air === false &&
+    a.settle === 0 && a.settleV === 0 && a.bob === 0 && a.bob0 === 0 &&
+    (a.lifted || 0) === 0;
+  check(same, 'two teleports leave one teleport\'s state',
+        `air=${a.air} vy=${a.vy} settle=${a.settle} settleV=${a.settleV} ` +
+        `bob=${a.bob} bob0=${a.bob0} lift=${a.lifted || 0}`);
+  check(a.x === b.x && a.z === b.z && a.y === b.y,
+        'and land on the same point as a direct teleport',
+        `dx=${(a.x - b.x).toExponential(1)} dz=${(a.z - b.z).toExponential(1)} ` +
+        `dy=${(a.y - b.y).toExponential(1)}`);
+}
+
+{
+  /* And the invariant survives the teleport itself, including the one place it
+     could not without `placeAt` doing it: a `d` whose centreline is inside the
+     corridor at one end and outside it at the other is impossible on this path,
+     but a teleport taken while the player is outside — which the narrow head can
+     produce if the walk is ever changed — has to be projected. Simulated by
+     handing `placeAt` a position that is laterally out by the limit, then
+     stepping, and requiring the corridor holds one frame later. */
+  const pl = spawn(46);
+  pl.x += 40;                        // 40 m out, well into the rock
+  pl.vx = 9; pl.vz = 0;              // still carrying turbo speed
+  teleport(pl, 46);
+  const st = invariant(pl);
+  /* The bound is the arc-length table's own precision, not a metre. `posAt` is
+     a linear interpolation between resampled points, so "on the centreline"
+     reads back as a fraction of a millimetre even when it is exact. */
+  check(st.ok && Math.abs(st.u) < 1e-3,
+        'a teleport resets a player who was outside the corridor',
+        `|u|=${Math.abs(st.u).toExponential(1)} against a limit of ${st.lim.toFixed(2)}`);
+}
+
+{
+  /* The last invariant: every teleport destination, from the keyboard's table
+     and beyond, must be inside the corridor by at least the frame that follows,
+     and a teleport followed by no keys held must be a fixed point. */
+  let bad = 0, moved = 0;
+  for (const d of [0, 8, 30, 46, 62, 92, 120, 160, 170, 220, 270, 300, 320, 330]) {
+    const pl = spawn(46);
+    pl.air = true; pl.vy = 3; pl.settleV = 1;
+    teleport(pl, d);
+    if (!invariant(pl).ok) bad++;
+    const x0 = pl.x, z0 = pl.z, y0 = pl.y;
+    for (let n = 0; n < 240; n++) step(pl, 0, 0, 1.55, false);
+    if (pl.x !== x0 || pl.z !== z0 || pl.y !== y0) moved++;
+  }
+  check(bad === 0, 'every teleport destination is inside the corridor',
+        `${bad} of 14 destinations outside on arrival`);
+  check(moved === 0, 'and every teleport destination is a fixed point',
+        `${moved} of 14 drifted over two seconds at rest`);
 }
 
 console.log(`\n  ${fails ? `${fails} FAILED` : 'all ok'}\n`);

@@ -85,7 +85,11 @@ you dead against something invisible, and the same happens at the head of the
 wash and a little way behind the start. The limit sits seven to eighteen metres
 either side of the channel depending on its width, which is far enough out that
 wandering five or six metres off the line never touches it — 4.2 minutes of
-driven wandering, 5.8 m off the centreline, never touched a frame of it.
+driven wandering, 5.8 m off the centreline, never touched a frame of it. The
+limit holds on every frame of every route into it: walking, jumping and
+teleporting all end up inside the same bound, including a jump taken at the wall
+at a run, which keeps its speed and its landing arc and is only moved sideways
+enough to stay out of the rock.
 
 ![The juniper on its bank, with the litter and the shadow it throws down the
 wash](media/02-juniper.webp)

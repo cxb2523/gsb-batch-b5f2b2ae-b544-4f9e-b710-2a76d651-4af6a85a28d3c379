@@ -57,6 +57,36 @@
  * velocity is rebuilt from the key state every frame. At rest it is identically
  * zero, so the render loop is still a fixed point; `walkTo` places the player on
  * the centreline, so no capture ever touches this code path.
+ *
+ * ── and then the invariant, which velocity alone cannot give ──────────────
+ *
+ * Confining velocity is what makes the limit *feel* like ground rather than a
+ * box, but it does not bound the position. Between the pre-integration bleed
+ * and the integrated step there is one frame of travel — 0.6 m at the 12 m/s
+ * turbo, and up to a metre if the frame runs to the 50 ms dt ceiling — plus the
+ * `RESTORE` nudge back, which is deliberately slow (1.4 m/s) because it is meant
+ * to be felt as being eased in when the corridor narrows ahead. Turbo strafing
+ * measurably ran up to 0.25 m outside the limit, and the same gap is what let an
+ * airborne player who was pushed sideways end up inside the rock for a frame
+ * before the nudge began. `walkTo` was the third route in: anything that places
+ * a position has to be checked against the same bound, or the invariant depends
+ * on which of the three ways the player arrived.
+ *
+ * `projectInside` is the backstop. It runs *after* integration, on the position
+ * that is about to be rendered, and moves the player exactly back onto the limit
+ * along the local normal — no easing, no accumulation, because it is a
+ * projection and not a correction: a point already inside is untouched, so it is
+ * the identity at rest and the render loop stays a fixed point. Velocity is
+ * deliberately **not** touched. The soft band is what decides how a body feels
+ * at the wall, and a jump that is projected back has to keep its vertical speed
+ * and its along-wall component — the landing arc and the settle that follows are
+ * unchanged; only the position is clamped.
+ *
+ * It iterates because the normal it moves along is read at the *new* z, and the
+ * wash curves; one pass leaves a residue of `u sin θ` — up to 1.3 mm at the far
+ * side of a 17 m corridor where the wash turns through eighteen degrees. Twelve
+ * passes drive that to the last bit of a double, and the overwhelmingly common
+ * case (inside the corridor) costs one table read and leaves on the first test.
  */
 import * as THREE from 'three';
 
@@ -166,7 +196,13 @@ export function buildCorridor(path, terrain) {
     rawL[i] = clampR(march(terrain, p.x, p.z, -nx, -nz, want, reach));
   }
 
-  return { sMin, sMax, step: STEP, n, L: boxSmooth(rawL), R: boxSmooth(rawR) };
+  /* The two ends' world z, resolved here rather than per frame. `atZ` is a
+     table read of z that saturates outside the table, so the along-wash
+     position is recovered from z and the ends have to be held in z. */
+  const zMin = path.posAt(sMax).z, zMax = path.posAt(sMin).z;
+
+  return { sMin, sMax, step: STEP, n, L: boxSmooth(rawL), R: boxSmooth(rawR),
+           zMin, zMax };
 }
 
 /** Half-width of the corridor at arc length `s`, on `side` (+1 right, −1 left). */
@@ -246,4 +282,101 @@ export function confine(cor, path, player, q, dt) {
     }
   }
   return hit;
+}
+
+/* Working scratch for the projection, so the per-frame path allocates nothing. */
+const _pq = {};
+/* The invariant is stated in metres and enforced in floating point, so it is
+ * held to the resolution of the arithmetic rather than to a millimetre. A hair
+ * of slack so `au - lim` landing one ulp positive on a player already on the
+ * limit cannot trigger a correction that then oscillates; anything a viewer
+ * could measure is many orders of magnitude above this. */
+const OVER_EPS = 1e-9;
+
+/**
+ * The invariant, applied to the position rather than to the velocity.
+ *
+ * `u` is measured the way `WashPath.uOf` measures it — against the centreline
+ * at the player's z, with `cos(th)` — and is the quantity the corridor's width
+ * is defined in. Anything outside is moved back along the local right-hand
+ * normal (the same `(cos th, sin th)` the table was built with) until it is on
+ * the limit. Then the along-wash ends are held the same way.
+ *
+ * The loop is what makes it exact rather than nearly exact. The normal is read
+ * at the post-move z, and z changes under the correction, so a single pass on
+ * an eighteen-degree bend leaves a residual of `u sin θ` — 1.3 mm at the far
+ * side of a 17 m corridor. Twelve passes drive it to the last bit of a double,
+ * and a position already inside leaves on the first test, which is the case
+ * every frame of ordinary walking and every `walkTo` framing falls into.
+ *
+ * Returns the mask, like `confine`. Momentum is untouched by design: this is a
+ * position projection, so a body pushed back by it keeps the speed it had —
+ * including its `vy` — and the ground is then read under the returned position,
+ * which is what keeps the landing test and the spring on the same footing they
+ * had. Call it *before* the ground clamp so the height is that of the place the
+ * player is actually rendered at.
+ */
+export function projectInside(cor, path, player) {
+  let hit = 0;
+  for (let pass = 0; pass < 12; pass++) {
+    const q = path.atZ(player.z, _pq);
+    const cos = Math.cos(q.th), sin = Math.sin(q.th);
+    const u = (player.x - q.x) * cos;
+    const au = u < 0 ? -u : u;
+    const side = u >= 0 ? 1 : -1;
+    const lim = corridorAt(cor, q.s, side);
+    const over = au - lim;
+    let moved = false;
+    if (over > OVER_EPS) {
+      player.x -= over * side * cos;
+      player.z -= over * side * sin;
+      hit |= 1;
+      moved = true;
+    }
+    /* ── the ends ──────────────────────────────────────────────────────────
+     * Unlike the lateral limit there is no width here: the walk stops. The
+     * along-wash coordinate is `atZ(z).s`, so this is a one-dimensional
+     * problem in z, and its derivative is known — a step of `ds` along the
+     * tangent moves z by `-cos th ds` — so stepping by the residual and
+     * re-reading converges geometrically.
+     *
+     * The hard z clamp comes first and is not belt and braces: outside the
+     * table `atZ` saturates, so a z far past the head reports the same arc
+     * length on every pass and the residual step would stand still. Placing z
+     * on the end's own world z — which is inside the table, since the two ends
+     * are — is one step from the target and cannot stall.
+     *
+     * `x` is deliberately untouched by the clamp, because the end is about the
+     * walk stopping and not about the sides; the lateral pass above picks up
+     * whatever the shift along z does to `u`. */
+    if (player.z < cor.zMin || player.z > cor.zMax) {
+      const stop = player.z < cor.zMin;
+      player.z = stop ? cor.zMin : cor.zMax;
+      hit |= 2;
+      moved = true;
+    } else {
+      /* Whichever ends the player is past, `d` is the arc length owed *inward*:
+         `+1` steps along +s, which is `(sin θ, −cos θ)`, and `−1` along −s. */
+      for (const [edge, dir] of [[cor.sMin, 1], [cor.sMax, -1]]) {
+        const d = dir > 0 ? edge - q.s : q.s - edge;
+        if (d > OVER_EPS) {
+          player.x += dir * sin * d;
+          player.z += dir * -cos * d;
+          hit |= 2;
+          moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  return hit;
+}
+
+/** |u| and the limit at the player's current position — the invariant's own
+ *  readout, so a probe can assert the thing the projection enforces rather than
+ *  reconstruct it. */
+export function corridorState(cor, path, player) {
+  const q = path.atZ(player.z, _pq);
+  const u = (player.x - q.x) * Math.cos(q.th);
+  return { s: q.s, u, side: u >= 0 ? 1 : -1, lim: corridorAt(cor, q.s, u >= 0 ? 1 : -1) };
 }

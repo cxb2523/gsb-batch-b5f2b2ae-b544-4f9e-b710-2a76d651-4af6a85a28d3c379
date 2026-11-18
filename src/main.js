@@ -12,7 +12,7 @@
  */
 import * as THREE from 'three';
 import { WashPath } from './path.js';
-import { buildCorridor, confine } from './corridor.js';
+import { buildCorridor, confine, corridorState, projectInside } from './corridor.js';
 import { Terrain, buildTerrainMesh, makeTerrainMaterial, syncWind, applyScour } from './terrain.js';
 import { buildScatter } from './scatter.js';
 import { buildWalls, buildDistantButtes, buildTalus, makeRockMaterial } from './rock.js';
@@ -338,7 +338,8 @@ const player = {
   settleV: 0,
   yaw: 0,        // absolute world yaw, radians; 0 = looking straight down -Z
   pitch: 0,
-  bob: 0,
+  bob: 0,        // metres of head lift this frame; the rendered value
+  bob0: 0,       // radians of head-bob phase the lift is derived from
 };
 
 /* Degrees of pitch the arrival lift has spent; declared here because placeAt
@@ -360,9 +361,17 @@ function placeAt(d) {
   const p = path.posAt(d);
   player.x = p.x;
   player.z = p.z;
-  player.vx = 0; player.vz = 0; player.bob = 0;
+  player.vx = 0; player.vz = 0; player.bob = 0; player.bob0 = 0;
   player.vy = 0; player.air = false;
   player.settle = 0; player.settleV = 0;
+  /* Every route to a position has to leave the same state behind it, and a
+     teleport is the only one whose destination is not already covered by the
+     frame's own projection: `walkTo` clamps `d` to the path, but a caller can
+     hand it anything, and the corridor narrows from 17 m at the mouth to 7 m at
+     the head — so the same `u` is inside at one end and in the rock at the
+     other. Projecting here makes "teleported to d" and "walked to d" the same
+     point, which is what makes the fixed point survive a jump from any state. */
+  projectInside(corridor, path, player);
   player.y = groundAt(player.x, player.z);
   /* A teleport is a fresh approach, so the arrival lift's budget refills. It
      spends nothing here — only walking does — so this cannot move a capture. */
@@ -730,6 +739,15 @@ function step(dt) {
   player.x += player.vx * dt;
   player.z += player.vz * dt;
 
+  /* The invariant, after integration and before the ground is read. `confine`
+     bounds velocity and is what the wall *feels* like; this bounds the position
+     that is about to be rendered, so the frame after a jump pushed sideways, a
+     turbo strafe, or a teleport cannot be outside the corridor even for one
+     frame. It is a projection and not a spring: already-inside positions are
+     bit-identical, so `walkTo` framings and the standing fixed point are
+     untouched. See corridor.js. */
+  projectInside(corridor, path, player);
+
   /* The ground clamp, which is the oldest solid thing in this file, is kept
      exactly as it was for the grounded case. Airborne is the new branch and it
      lands by the same clamp, so there is one definition of "on the ground" and
@@ -738,7 +756,12 @@ function step(dt) {
      The landing test is against the height *under where you now are*, not where
      you took off, so an arc that carries you onto a rising talus lands early on
      the slope and one over a cut bank falls the extra distance. Both reseat on
-     the field itself; neither needs a special case. */
+     the field itself; neither needs a special case. Reading it after the
+     projection means the height the landing test uses is the height at the
+     position the player will actually be rendered at — the projection may have
+     moved them laterally onto different ground, and a landing against the
+     pre-projection height would have the eye a few centimetres off the floor for
+     the frame it touched down. */
   const g0 = groundAt(player.x, player.z);
   if (player.air) {
     player.vy -= G * dt;
@@ -756,8 +779,18 @@ function step(dt) {
 
   /* No headbob in the air — a body in flight is not taking steps. */
   const sp = player.air ? 0 : Math.hypot(player.vx, player.vz);
-  if (sp < 0.004) player.bob = 0;
-  else player.bob = Math.sin((player.bob0 = (player.bob0 || 0) + dt * sp * 5.4)) * 0.032;
+  if (sp < 0.004) {
+    /* The phase is cleared with the lift, not just the rendered lift. A body
+       that stopped mid-stride and then started again would otherwise resume the
+       crest it froze on, and — the part that matters for the record — a
+       teleport would have to remember to clear two fields instead of one.
+       Clearing both here means any route to rest leaves the same state, which
+       is the property `placeAt` relies on. */
+    player.bob = 0;
+    player.bob0 = 0;
+  } else {
+    player.bob = Math.sin((player.bob0 += dt * sp * 5.4)) * 0.032;
+  }
 }
 
 /* ── frame probe ───────────────────────────────────────────────────────── */
@@ -920,8 +953,13 @@ const api = {
   setPaused(b) { paused = !!b; },
   renderOnce,
   walkTo(d) {
+    /* One call, one destination. This used to be `placeAt` followed by a
+       separate `player.bob0 = 0`; that is the same state, but only because the
+       second line happened to undo what the first left. `placeAt` resets the
+       whole arrival now — air, both settle terms, the bob and its phase, the
+       lift budget — so `walkTo(46); walkTo(220)` and `walkTo(220)` are the same
+       state by construction rather than by matching two lists. */
     placeAt(+d || 0);
-    player.bob0 = 0;
     syncCamera();
     syncShadow();
     /* Settles the air too: the particle clock becomes a pure function of the
@@ -971,6 +1009,25 @@ const api = {
      head bob as a 1.6 s hop because the bob is bigger than the threshold. The
      state is not a proxy and cannot be fooled by either. */
   _player: player,
+  /* The invariant, readable without reconstructing it. `u` is lateral distance
+     from the wash centreline, `lim` the corridor's half-width there, `over` how
+     far outside (negative inside), and `inCorridor` the one boolean a checker
+     actually needs. The projection runs every frame and on every teleport, so
+     this reads the same numbers it enforces rather than a second derivation of
+     them that can drift from it.
+     `lift` is the arrival-lift budget already spent, in degrees, and `bobPhase`
+     the head-bob phase in radians — the two pieces of state a teleport has to
+     clear that `_player` alone cannot show. */
+  _state: {
+    get corridor() {
+      const c = corridorState(corridor, path, player);
+      return { s: c.s, u: c.u, side: c.side, lim: c.lim,
+               over: Math.abs(c.u) - c.lim, inCorridor: Math.abs(c.u) <= c.lim };
+    },
+    get lift() { return lifted / DEG; },
+    get bobPhase() { return player.bob0; },
+    get liftRemaining() { return LIFT_DEG - lifted / DEG; },
+  },
   _scene: scene, _camera: camera, _terrain: terrain, _path: path, _atmo: atmo,
   _post: post,
   /* When the loading message reached the screen, how long each generation phase

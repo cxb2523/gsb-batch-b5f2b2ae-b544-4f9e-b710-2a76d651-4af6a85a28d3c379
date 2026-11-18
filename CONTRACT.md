@@ -5502,6 +5502,34 @@ zero at rest — so the render loop is still the fixed point every capture depen
 reads as the ground refusing rather than as a box. `walkTo` places the player on the
 centreline, so no capture ever enters this code path.
 
+**The velocity band bound how fast you left, not where you were, and that turned out to be
+one invariant short.** Between the pre-integration bleed and the integrated step there is a
+frame of travel — 0.6 m at the 12 m/s turbo cheat, up to a metre at the 50 ms dt ceiling —
+and the `RESTORE` nudge back is deliberately slow (1.4 m/s), because it is meant to be felt
+as being eased in when the corridor narrows ahead. Turbo strafing measurably ran **0.25 m
+outside** the limit for up to 1632 frames, and the same gap let an airborne player pushed
+sideways sit inside the rock for a frame before the nudge began. `walkTo` was a third route
+in: any code that places a position has to be checked against the same bound, or the
+invariant depends on which of the three ways the player arrived.
+
+So there is a second, positional term: `projectInside(cor, path, player)` in
+`src/corridor.js`, called from `step` after integration and before the ground clamp, and
+from `placeAt` after the teleport. It moves a position that is outside the limit back onto
+it along the local normal, and it is a projection and not a correction — a position already
+inside is bit-identical, so ordinary walking and every capture framing are untouched. **It
+does not touch velocity.** That is the requirement, stated as code: a jump that is
+projected keeps its `vy` and its along-wall speed, so the arc and the landing are unchanged;
+the ground height is then read under the *returned* position, so the landing test compares
+against the floor the player is actually rendered over rather than the one a few centimetres
+away. The end-of-wash limits are held the same way, in z, because `atZ` is a table read of
+z.
+
+It iterates because the normal is read at the post-move z and the wash curves; one pass
+leaves `u sin θ` — 1.3 mm at the far side of a 17 m corridor where the wash turns through
+eighteen degrees — and twelve passes drive that to the last bit of a double. Over 8124
+sampled positions across the whole route, projected from up to six corridor-widths outside,
+the worst residual is **1.0e-9 m**. At the ends, over 1600 positions, 6.5e-13 m.
+
 **The verification is a driven trajectory, and it belongs in Node.** "Does it stop you" is
 easy and a hard clamp would pass it; the question is whether it can be *felt* while walking
 the walk, and that is a property of a trajectory. `src/corridor.js` is pure JavaScript over
@@ -5513,9 +5541,45 @@ only stop it meets is the head of the wash 0.05 m short of it. `tools/_corridor.
 the limit against `rock.js`'s own plan position for the cliff foot, reproduced from its
 constants; clearance runs 1.1 to 16 m positive over the walk.
 
+The invariant itself is asserted per frame rather than at the end of a run: every strafing
+sample, every airborne sample, every jump-at-the-wall station and every teleport destination
+must satisfy `|u| <= lim` and `sMin <= s <= sMax`. Before this, turbo strafing failed that
+check on eight of ten stations; now it passes all of them, including the airborne ones.
+`tools/_state.mjs` asks the same questions of the page — the real key handlers, the real
+`walkTo`, the real framebuffer — because the properties a player feels (a teleport that
+leaves no dip in the camera, two renders in a row being pixel-identical) cannot be checked
+from a copy of `step` in Node.
+
 The one thing the walk test copies rather than imports is `step` itself, because `main.js`
 owns the canvas and cannot be loaded without a document. If the two drift, the walk test is
-measuring a game nobody is playing.
+measuring a game nobody is playing. It now copies `settleStep` too, for the same reason: a
+walker with no landing spring would never have to prove that the spring returns to zero
+after a projected landing.
+
+## The arrival reset: one teleport, one state
+
+`walkTo` has to be a complete reset, because it is both the capture API and the number keys.
+The state a teleport must clear is the whole arrival: `air`, `vy`, both settle terms, the
+head bob and its phase, and the arrival lift's budget. Those were split across two places —
+`placeAt` reset most of them and `walkTo` reset the bob phase separately — which is the same
+state only by coincidence of a second line undoing what the first left behind. Now `placeAt`
+resets all of it, so `walkTo(46); walkTo(220)` and `walkTo(220)` are the same state by
+construction. Measured: camera world matrix bit-identical, `air=false vy=0 settle=0
+settleV=0 bob0=0 lift=0`, ground exactly under the eye.
+
+Two details beyond the obvious list. `bob0` is reset whenever the player comes to rest, not
+just on teleport — otherwise a body that stopped mid-stride resumes the crest it froze on,
+and a teleport would have to know about two fields instead of one. And `placeAt` calls
+`projectInside` after placing: `walkTo` clamps `d` to the path, but the corridor is 17 m wide
+at the mouth and 7 m at the head, so a position placed without projection could be in the
+rock at one end and in the open at the other. That is what makes a teleport from any origin
+land on the same state as one from rest.
+
+`window.__game._state` exposes the invariant readably rather than making a checker
+reconstruct it: `corridor` is `{s, u, side, lim, over, inCorridor}` from the same function
+the projection enforces, and `lift`/`bobPhase` are the two pieces of reset state `_player`
+alone cannot show. `__game`'s existing surface is unchanged.
+
 
 ## An aphorism that explains the observation is not evidence for it
 
