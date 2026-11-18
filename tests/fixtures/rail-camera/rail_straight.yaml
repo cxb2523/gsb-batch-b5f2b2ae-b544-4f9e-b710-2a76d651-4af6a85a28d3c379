@@ -1,0 +1,71 @@
+# ==============================================================================
+# RAIL CAMERA FIXTURE 01 — STRAIGHT LINEAR DOLLY TRACK
+# ==============================================================================
+# Acceptance fixture: a straight `track` rig carries the camera cart along the
+# X axis while a lead actor walks the opposite way. The eye point must be governed
+# purely by eased rail progress (linear easing here), and the camera head must
+# continually reverse-solve yaw / pitch / distance from eye -> live actor anchor.
+# Authored `distance`, `yaw`, and `pitch` values are deliberately absurd to prove
+# they are ignored whenever the rail camera is target-locked.
+# ==============================================================================
+
+version: "1.0"
+id: "rail-fixture-straight"
+title: "Rail Fixture · Straight Track"
+subtitle: "Linear 6m dolly rail · continuous look-at tracking"
+video: "procedural://rail-straight"
+aspect_ratio: "16:9"
+duration: 8.0
+
+stage:
+  width: 12
+  depth: 12
+  grid_step: 1
+  observer_camera:
+    target: [0, 1.1, 0]
+    distance: 14.0
+    pitch: 28
+    yaw: 35
+    lens: 35mm
+  stage_camera:
+    target: [0, 1.2, 0]
+    distance: 4.0
+    pitch: 8
+    yaw: 0
+    lens: 35mm
+
+entities:
+  - id: "hero"
+    label: "Hero (Walking)"
+    kind: "character"
+    position: [-3.0, 0, 0]
+    rotation: 90
+    color: "#38bdf8"
+
+blocking:
+  - id: "hero-walk"
+    entity: "hero"
+    start: 0.0
+    end: 8.0
+    position: [3.0, 0, 0]
+    easing: "linear"
+
+shots:
+  - id: "shot-01-rail-straight"
+    shot: 1
+    label: "Straight Rail · Inverse Look-At"
+    description: "Cart glides from -X to +X along a fixed rail while the head tracks the walking hero."
+    start: 0.0
+    end: 8.0
+    stage_camera:
+      rig:
+        type: "track"
+        from: [-3.0, 1.4, 5.0]
+        to: [3.0, 1.4, 5.0]
+      target: "hero"
+      easing: "linear"
+      # Deliberately wrong framing scalars: rail look-at must ignore them.
+      distance: 2.0
+      yaw: 70deg
+      pitch: 40deg
+      lens: 35mm

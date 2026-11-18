@@ -84,6 +84,7 @@ stageflow/
 │   │   ├── entityKinematicUtils.ts  # 3D dimension parsing, OBB footprint math, lerpAngleShortest, look_at target & trail generation
 │   │   ├── cameraTargetResolver.ts  # Multi-subject 3D centroid resolution, dot-notation sub-anchors, offsets & roll/offset flow
 │   │   ├── cameraRigEvaluator.ts    # Physical camera rig mounts (tripod, track, spline_track) & inverse look-at kinematics
+│   │   ├── cameraRigKinematics.ts   # Pure rail sampling (linear/Catmull-Rom) + inverse sightline pose & fixed-gaze projection
 │   │   ├── shotPoseEvaluator.ts     # Single-shot pose evaluation, Catmull-Rom splines & 3D path sampling
 │   │   ├── trajectoryChain.ts       # Forward pose chaining (P_0 -> P_k) & multi-shot timeline tracks
 │   │   ├── frameEngine.ts           # Master stateless evaluator: computeStageFrame(t, score)
@@ -213,32 +214,40 @@ stageflow/
 │   ├── main.tsx                     # Application entry point
 │   └── index.css                    # Tailwind CSS v4 + blueprint design tokens
 └── tests/
-    └── unit/                        # Vitest deterministic unit test suites
-        ├── opticsMath.test.ts
-        ├── exportMath.test.ts
-        ├── exportScrubberMath.test.ts
-        ├── storyboardMath.test.ts
-        ├── storyboardBlobCache.test.ts
-        ├── zipBuilder.test.ts
-        ├── sphericalMath.test.ts
-        ├── cameraRigs.test.ts
-        ├── entityEngine.test.ts
-        ├── frameEngine.test.ts
-        ├── scoreParser.test.ts
-        ├── scoreContract.test.ts
-        ├── scoreYamlUtils.test.ts
-        ├── scoreUrlLoader.test.ts
-        ├── telemetryYamlFormatter.test.ts
-        ├── shotBreakdownUtils.test.ts
-        ├── scoreMinimapUtils.test.ts
-        ├── guideUtils.test.ts
-        ├── guideSnippets.test.ts
-        ├── storage.test.ts
-        ├── multiTargetFraming.test.ts
-        ├── mediaDrivers.test.ts
-        ├── billboardLabelLod.test.ts
-        ├── useIsMobile.test.ts
-        ├── stagePerfHelpers.test.ts
-        └── recorder.test.ts
+    ├── unit/                        # Vitest deterministic unit test suites
+    │   ├── opticsMath.test.ts
+    │   ├── exportMath.test.ts
+    │   ├── exportScrubberMath.test.ts
+    │   ├── storyboardMath.test.ts
+    │   ├── storyboardBlobCache.test.ts
+    │   ├── zipBuilder.test.ts
+    │   ├── sphericalMath.test.ts
+    │   ├── cameraRigs.test.ts
+    │   ├── railCameraKinematics.test.ts # Rail camera eye/orientation invariants (straight, curved, continuous, degenerate)
+    │   ├── railCameraFixtures.test.ts   # Local YAML fixture acceptance suite for rail camera behavior
+    │   ├── entityEngine.test.ts
+    │   ├── frameEngine.test.ts
+    │   ├── scoreParser.test.ts
+    │   ├── scoreContract.test.ts
+    │   ├── scoreYamlUtils.test.ts
+    │   ├── scoreUrlLoader.test.ts
+    │   ├── telemetryYamlFormatter.test.ts
+    │   ├── shotBreakdownUtils.test.ts
+    │   ├── scoreMinimapUtils.test.ts
+    │   ├── guideUtils.test.ts
+    │   ├── guideSnippets.test.ts
+    │   ├── storage.test.ts
+    │   ├── multiTargetFraming.test.ts
+    │   ├── mediaDrivers.test.ts
+    │   ├── billboardLabelLod.test.ts
+    │   ├── useIsMobile.test.ts
+    │   ├── stagePerfHelpers.test.ts
+    │   └── recorder.test.ts
+    └── fixtures/
+        └── rail-camera/             # Local YAML scores backing railCameraFixtures.test.ts
+            ├── rail_straight.yaml
+            ├── rail_curved.yaml
+            ├── rail_continuous_boundaries.yaml
+            └── rail_missing_endpoints.yaml
 ```
 

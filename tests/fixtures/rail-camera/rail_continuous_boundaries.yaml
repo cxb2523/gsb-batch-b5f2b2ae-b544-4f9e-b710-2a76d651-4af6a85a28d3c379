@@ -1,0 +1,91 @@
+# ==============================================================================
+# RAIL CAMERA FIXTURE 03 — CONTINUOUS VS NON-CONTINUOUS BOUNDARIES
+# ==============================================================================
+# Acceptance fixture: three consecutive rail shots.
+#   1. s1  — linear track, hard-cut opener (non-continuous).
+#   2. s2  — `continuous: true` track that omits `from:`; it must inherit s1's
+#            terminal eye AND heading, even though the target switches to villain.
+#   3. s3  — `continuous: false` track; it must hard-cut to its own authored rail
+#            start rather than continuing from s2.
+# ==============================================================================
+
+version: "1.0"
+id: "rail-fixture-boundaries"
+title: "Rail Fixture · Continuous vs Cut Boundaries"
+subtitle: "Continuous inheritance then explicit hard cut"
+video: "procedural://rail-boundaries"
+aspect_ratio: "16:9"
+duration: 12.0
+
+stage:
+  width: 12
+  depth: 12
+  grid_step: 1
+  observer_camera:
+    target: [0, 1.1, 0]
+    distance: 15.0
+    pitch: 28
+    yaw: 30
+    lens: 35mm
+  stage_camera:
+    target: [0, 1.2, 0]
+    distance: 4.0
+    pitch: 6
+    yaw: 0
+    lens: 35mm
+
+entities:
+  - id: "hero"
+    label: "Hero"
+    kind: "character"
+    position: [-2.0, 0, 0]
+    color: "#38bdf8"
+  - id: "villain"
+    label: "Villain"
+    kind: "character"
+    position: [3.0, 0, -2.0]
+    color: "#fb7185"
+
+shots:
+  - id: "shot-01-track-hero"
+    shot: 1
+    label: "Track · Hero Lock (Opener)"
+    description: "Hard-cut opener on a short linear rail tracking the hero."
+    start: 0.0
+    end: 4.0
+    stage_camera:
+      rig:
+        type: "track"
+        from: [-2.0, 1.5, 4.0]
+        to: [0.0, 1.5, 4.0]
+      target: "hero"
+      easing: "linear"
+
+  - id: "shot-02-track-villain-continuous"
+    shot: 2
+    label: "Continuous Track · Villain Switch"
+    description: "Continuous beat: cart continues from the s1 terminal eye and re-aims at villain."
+    start: 4.0
+    end: 8.0
+    continuous: true
+    stage_camera:
+      rig:
+        type: "track"
+        to: [2.0, 1.5, 4.0] # 'from:' omitted -> inherit previous terminal eye
+      target: "villain"
+      easing: "linear"
+
+  - id: "shot-03-track-villain-cut"
+    shot: 3
+    label: "Hard Cut Track · Villain"
+    description: "Non-continuous beat: hard cut to a fresh authored rail."
+    start: 8.0
+    end: 12.0
+    continuous: false
+    stage_camera:
+      rig:
+        type: "track"
+        from: [-3.0, 1.5, 6.0]
+        to: [3.0, 1.5, 6.0]
+      target: "villain"
+      easing: "linear"

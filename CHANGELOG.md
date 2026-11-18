@@ -9,9 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rail-Mounted Camera Orientation & Eye Continuity (`src/core/cameraRigKinematics.ts`, `src/core/cameraRigEvaluator.ts`, `src/core/trajectoryChain.ts`, `src/core/shotPoseEvaluator.ts`)**:
+  - Split pure rail sampling (linear + Catmull-Rom, with finite-coordinate sanitization) and inverse sightline math into a new `src/core/cameraRigKinematics.ts` (Layer 1, ≤250 lines) exposing `evaluateRigEyePosition`, `sampleRigRailPoints`, `poseFromSightline`, `projectFixedGazeTarget`, and metric clamp helpers.
+  - Rail cameras are now strictly eye-first: the nodal point is sampled from the rail at eased progress and `pitch`/`yaw`/`distance` are reverse-solved from the eye → target sightline. Authored `distance`/`pitch`/`yaw` on a target-locked rail cue are ignored, eliminating the framing-vs-rail tug-of-war.
+  - `poseFromSightline` reconstructs the anchor from the (clamped) distance/elevation so `sphericalToCartesian(pose).position` reproduces the sampled eye bit-for-bit — even when the sightline is under `0.4m` / over `100m` or the eye coincides with the target (`RIG_SIGHTLINE_EPSILON_M = 1e-6`, finite fallback heading at `0.4m`).
+  - `trajectoryChain.ts` now caches a deterministic per-cue rail seed eye (`cueRailFallbackEyes`) computed once at cue start: the previous shot's terminal eye when continuous, otherwise the cue's authored start-pose eye. Live evaluation, the 32-sample dashed trajectory ribbon, and rail visualization all share this seed, so the eye no longer drifts with live target motion and rail samples coincide with the actual eye.
+  - Continuous rig cues inherit the previous shot's terminal eye **and** heading across the boundary (fixed-gaze rails forward-chain `yaw`/`pitch` instead of resetting to the default pose); non-continuous rigs still hard-cut to their own authored rail start.
+  - Explicit degenerate-endpoint fallbacks with zero NaN: `track` with only `from:` holds stationary; only `to:` glides from the seed eye; single-point `spline_track` glides from the seed eye; empty `spline_track` holds at the seed eye.
 - **Headless Viewport Recorder Frame 0 Black Screen (`src/recorder/HeadlessRecorderView.tsx`, `src/stage/DioramaCanvas.tsx`)**:
   - Updated `HeadlessRecorderView` `init()` to track R3F `useFrame` execution ticks (`r3fTickCountRef`) via `evaluateTick60fps` and await 4 R3F render ticks (with a 5s safety deadline) plus 2 `requestAnimationFrame`s before resolving, ensuring WebGL shader compilation, canvas resizing, and Drei `<Html>` overlays complete before `stepFrame(0)` captures Frame 0.
   - Enabled `preserveDrawingBuffer: true` in `DioramaCanvas` `<Canvas gl={...}>` options so the WebGL drawing buffer is preserved between swaps during headless `page.screenshot()` captures.
+
+### Added
+
+- **Rail Camera Acceptance Tests & Local YAML Fixtures (`tests/unit/railCameraKinematics.test.ts`, `tests/unit/railCameraFixtures.test.ts`, `tests/fixtures/rail-camera/*.yaml`)**:
+  - Added deterministic suites covering straight linear tracks, curved Catmull-Rom spline tracks, continuous vs non-continuous boundaries, and missing/degenerate endpoints, asserting eye-on-rail progress tracking, sightline-derived orientation, `sphericalToCartesian` eye round-trips, rail/trajectory-vs-eye coincidence, and finite pose scalars throughout.
+  - Authored four local YAML fixture scores (`rail_straight.yaml`, `rail_curved.yaml`, `rail_continuous_boundaries.yaml`, `rail_missing_endpoints.yaml`) loaded from disk by the fixture suite.
+
+### Changed
+
+- **Living Documentation Sync (`docs/ARCHITECTURE_FILE_MAP.md`, `docs/CORE_MATH_AND_SCORE_SPECIFICATIONS.md`, `docs/STAGEFLOW_SCRIPT_SPECIFICATION.md`, `docs/YAML_AUTHORING_GUIDE.md`)**:
+  - Documented the eye-first / sightline-solved rail camera contract, deterministic per-cue rail seed, degenerate-endpoint fallbacks, rail ↔ eye coincidence, and continuous boundary eye + heading inheritance; added `cameraRigKinematics.ts`, the two new test suites, and the `tests/fixtures/rail-camera/` tree to the architecture file map.
 
 ## [1.2.0] - 2026-11-16
 

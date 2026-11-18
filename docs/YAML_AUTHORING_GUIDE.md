@@ -722,12 +722,14 @@ StageFlow solves this with the declarative `rig:` mount block.
 
 #### 4.9.2 Target-Tracking vs. Fixed-Gaze Framing
 
-- **Target-Tracking Mode (`target:` declared)**: The camera head uses inverse spherical projection at 60fps to derive `yaw`, `pitch`, and `distance` from eye to target ($\vec{T} - \vec{E}$), panning and tilting to track the subject while the mount stays on its tripod or rail.
-- **Fixed-Gaze Mode (`target:` omitted)**: The camera holds or transitions fixed `yaw` and `pitch` (and Dutch `roll`), projecting its target anchor forward along the sightline at distance $d$. This enables pure lateral trucking shots, push/pulls, or drive-bys where actors cross through the frame without pulling camera orientation.
+- **Target-Tracking Mode (`target:` or `from:` declared)**: The eye point is fixed by the rail at eased progress $u = E(\tau)$, and the camera head reverse-solves `yaw`, `pitch`, and `distance` from the eye → target sightline ($\vec{T} - \vec{E}$), panning and tilting to track the subject while the mount stays on its tripod or rail. **Authored `distance`, `pitch`, and `yaw` on a target-locked rail cue are ignored** — the sightline always wins, so the cart cannot "leave" the rail to chase a framing distance.
+- **Fixed-Gaze Mode (`target:` omitted)**: The camera holds or transitions fixed `yaw` and `pitch` (and Dutch `roll`), projecting its target anchor forward along the sightline at the authored (or forward-chained) distance $d$. This enables pure lateral trucking shots, push/pulls, or drive-bys where actors cross through the frame without pulling camera orientation.
+- **Degenerate Endpoints (No NaN)**: Missing or degenerate rails fall back deterministically: a `track` with only `from:` holds stationary at that point; a `track` with only `to:` glides from the cue's start-pose eye; a single-point `spline_track` glides from the start-pose eye to that point; an empty `spline_track` holds stationary at the start-pose eye. If the rail eye coincides with the target, a finite fallback heading is used at the metric distance floor ($0.4\text{m}$).
+- **Rail ↔ Eye Coincidence**: The rendered 3D rail polyline and dashed trajectory ribbon are produced by the *same* rail evaluator used at runtime, so a visualization sample at any eased progress always coincides with the actual camera eye at that moment.
 
 #### 4.9.3 Continuous Rig Chaining (`continuous: true`)
 
-On continuous camera rigs (`continuous: true`), omitting `from:` on a `track` (or omitting `position:` on `tripod` / single-point `spline_track`) inherits the preceding shot's terminal world-space eye position $\vec{E}_{\text{prev}}$ seamlessly across cuts, even if the destination `target:` changes or moves:
+On continuous camera rigs (`continuous: true`), omitting `from:` on a `track` (or omitting `position:` on `tripod` / a single-point `spline_track`) inherits the preceding shot's terminal world-space eye position $\vec{E}_{\text{prev}}$ **and its heading**, seamlessly across cuts, even if the destination `target:` changes or moves. In target-tracking mode the inherited eye re-aims at the new target immediately; in fixed-gaze mode the inherited `yaw`/`pitch` continue (no reset to the default pose). Non-continuous rigs (`continuous: false` or an omitted flag) still hard-cut to their own authored rail start:
 
 ```yaml
 shots:

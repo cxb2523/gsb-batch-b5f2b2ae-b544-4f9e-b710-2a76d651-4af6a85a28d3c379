@@ -70,6 +70,7 @@ Visualizes the physical camera filming the shot inside the 3D diorama:
   - Positioned at floor level $Y=0$ beneath the camera eye position $\vec{E}(t)$, tracking the camera's spatial coordinates imperatively in R3F `useFrame`.
   - When `rig.type === 'tripod'`: Renders a 3-legged blueprint tripod stand with tubular splayed legs ($0.52\text{m}$ base spread), circular floor pucks, and a vertical telescoping column rising to the camera chassis mount.
   - When `rig.type === 'track'` or `'spline_track'`: Renders physical twin steel rails ($0.42\text{m}$ gauge) with orthogonal sleepers spaced every $0.5\text{m}$ along the track line or Catmull-Rom spline curve, plus a low-profile 4-wheeled dolly cart riding the rails with an upright column supporting the camera chassis.
+  - The rendered rail polyline (`rig.railPoints`) and the dashed trajectory ribbon (`trajectoryPoints`) are sampled by the same rail evaluator used at runtime, so a visualization sample coincides exactly with the live camera eye at the same eased progress — the cart never floats off the drawn rail.
   - Opt-in visual suppression via `show_rig: false` (per cue) or `stage: { show_rigs: false }` (global), or in `'stage-pov'` viewfinder mode.
 
 ### 2.4 Shared 3D Scene & Stage Cam Monitor Viewport (`BlueprintStageScene.tsx`, `StageCamMonitorCanvas.tsx`)

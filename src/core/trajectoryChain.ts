@@ -100,7 +100,13 @@ interface CueTrackCache {
   cueEndOffsets: Map<string, Vec3>;
   cueBaseStartPoses: Map<string, SphericalPose>;
   cueEndPoses: Map<string, SphericalPose>;
-  cuePrevEndEyes: Map<string, Vec3>;
+  /**
+   * Deterministic per-cue rail seed eye: the preceding shot's terminal eye for
+   * continuous rigs, otherwise the cue's authored start-pose eye sampled at cue
+   * start. Cached once (never re-derived from live entities) so the rail position,
+   * trajectory ribbon, and live camera eye stay in lockstep.
+   */
+  cueRailFallbackEyes: Map<string, Vec3>;
   cueTrajectoryPoints: Map<string, Vec3[]>;
   cueRailPoints: Map<string, Vec3[]>;
 }
@@ -158,6 +164,7 @@ function sampleCueTrajectoryPoints(
   baselinePose: SphericalPose,
   prevEndOffset: Vec3,
   isFirst: boolean,
+  railFallbackEye: Vec3 | undefined,
   samples = 32
 ): Vec3[] {
   const spec = cue.spec;
@@ -168,7 +175,7 @@ function sampleCueTrajectoryPoints(
   const isContinuousMove =
     Boolean(cue.continuous ?? score.continuous) &&
     !isFirst;
-  const prevEndEye = isContinuousMove
+  const cueStartFallbackEye = isContinuousMove
     ? sphericalToCartesian(prevEndPose).position
     : undefined;
 
@@ -201,7 +208,7 @@ function sampleCueTrajectoryPoints(
       startOffset,
       endOffset,
       isContinuousMove,
-      prevEndEye
+      railFallbackEye ?? cueStartFallbackEye
     );
     const cart = sphericalToCartesian(pose, score.aspectRatio);
     points.push(cart.position);
@@ -238,7 +245,7 @@ function getOrCreateCueTrackCache(
   const cueEndOffsets = new Map<string, Vec3>();
   const cueBaseStartPoses = new Map<string, SphericalPose>();
   const cueEndPoses = new Map<string, SphericalPose>();
-  const cuePrevEndEyes = new Map<string, Vec3>();
+  const cueRailFallbackEyes = new Map<string, Vec3>();
   const cueTrajectoryPoints = new Map<string, Vec3[]>();
   const cueRailPoints = new Map<string, Vec3[]>();
 
@@ -251,18 +258,7 @@ function getOrCreateCueTrackCache(
       Boolean(cue.continuous ?? score.continuous) &&
       i > 0 &&
       cue.spec.maneuver !== 'cut';
-    const prevEndEye = sphericalToCartesian(runningPose).position;
-    cuePrevEndEyes.set(cue.id, prevEndEye);
-
-    const points = sampleCueTrajectoryPoints(
-      cue,
-      score,
-      runningPose,
-      baselinePose,
-      runningOffset,
-      i === 0
-    );
-    cueTrajectoryPoints.set(cue.id, points);
+    const prevBaseEye = sphericalToCartesian(runningPose).position;
 
     // Advance runningPose and runningOffset for contiguous chaining
     const prevEndOffset = runningOffset;
@@ -272,8 +268,14 @@ function getOrCreateCueTrackCache(
     cueEndOffsets.set(cue.id, endOffset);
     runningOffset = endOffset;
 
+    // Deterministic rail seed eye, sampled ONCE at cue start and reused by live
+    // evaluation, trajectory sampling, and rail visualization. Continuous rigs
+    // inherit the preceding shot's terminal eye; standard rigs seed from the
+    // cue's authored start pose resolved with the cue-start entity state.
+    // Non-rig cues never read this seed, so skip the extra entity evaluation.
+    let railFallbackEye: Vec3 | undefined;
     if (cue.spec.rig) {
-      let railFallbackEye = prevEndEye;
+      railFallbackEye = prevBaseEye;
       if (!isContinuous) {
         const { entitiesById: startEntities } = evaluateEntitiesAtTime(cue.startSec, score);
         const startPoseAtCueStart = resolveCueStartPose(
@@ -287,7 +289,22 @@ function getOrCreateCueTrackCache(
         );
         railFallbackEye = sphericalToCartesian(startPoseAtCueStart).position;
       }
-      cueRailPoints.set(cue.id, sampleRigRailPoints(cue.spec.rig, railFallbackEye));
+      cueRailFallbackEyes.set(cue.id, railFallbackEye);
+    }
+
+    const points = sampleCueTrajectoryPoints(
+      cue,
+      score,
+      runningPose,
+      baselinePose,
+      prevEndOffset,
+      i === 0,
+      railFallbackEye
+    );
+    cueTrajectoryPoints.set(cue.id, points);
+
+    if (cue.spec.rig) {
+      cueRailPoints.set(cue.id, sampleRigRailPoints(cue.spec.rig, railFallbackEye!));
     } else {
       cueRailPoints.set(cue.id, []);
     }
@@ -316,7 +333,7 @@ function getOrCreateCueTrackCache(
       startOffset,
       endOffset,
       isContinuous,
-      isContinuous ? prevEndEye : undefined
+      railFallbackEye
     );
     cueEndPoses.set(cue.id, runningPose);
   }
@@ -327,7 +344,7 @@ function getOrCreateCueTrackCache(
     cueEndOffsets,
     cueBaseStartPoses,
     cueEndPoses,
-    cuePrevEndEyes,
+    cueRailFallbackEyes,
     cueTrajectoryPoints,
     cueRailPoints,
   };
@@ -426,9 +443,9 @@ export function evaluateCameraTrack(
       Boolean(activeCue.continuous ?? score.continuous) &&
       activeCueIdx > 0 &&
       activeCue.spec.maneuver !== 'cut';
-    const prevEndEye = isContinuous
-      ? trackCacheData.cuePrevEndEyes.get(activeCue.id)
-      : undefined;
+    // Same deterministic rail seed used when the cache was built, so the live
+    // frame lands on exactly the same rail point as the sampled trajectory.
+    const railFallbackEye = trackCacheData.cueRailFallbackEyes.get(activeCue.id);
 
     const livePose = evaluateShotCameraPose(
       startPose,
@@ -440,7 +457,7 @@ export function evaluateCameraTrack(
       startOffset,
       endOffset,
       isContinuous,
-      prevEndEye
+      railFallbackEye
     );
     const trajectoryPoints =
       trackCacheData.cueTrajectoryPoints.get(activeCue.id) ?? [];

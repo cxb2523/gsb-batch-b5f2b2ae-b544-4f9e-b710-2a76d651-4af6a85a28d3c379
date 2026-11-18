@@ -67,21 +67,22 @@ Given $\vec{E}$ and $\vec{T}$ with displacement $\Delta\vec{p} = \vec{E} - \vec{
 $$d = \sqrt{\Delta x^2 + \Delta y^2 + \Delta z^2}, \quad d_{xz} = \sqrt{\Delta x^2 + \Delta z^2}, \quad \theta = \operatorname{atan2}(\Delta y, d_{xz}), \quad \psi = \operatorname{atan2}(\Delta x, \Delta z)$$
 
 ### 2.3 Physical Camera Rigs & Inverse Look-At Kinematics
-When a camera cue mounts onto a physical studio rig (`CameraRigSpec`), camera eye position $\vec{E}(t)$ is constrained directly in world space rather than calculated as a spherical offset from the subject:
+When a camera cue mounts onto a physical studio rig (`CameraRigSpec`), camera eye position $\vec{E}(t)$ is constrained directly in world space rather than calculated as a spherical offset from the subject. The eye is a function of the sampled rail and the eased progress $u = E(\tau)$ only; orientation is reverse-solved from the eye → target sightline. Pure rail sampling and inverse sightline math live in [`cameraRigKinematics.ts`](../src/core/cameraRigKinematics.ts).
 1. **Stationary Tripod (`type: "tripod"`)**: Eye position is held stationary at the authored world coordinate:
    $$\vec{E}(t) \equiv \vec{P}_{\text{tripod}} = (x_0, y_0, z_0)$$
-   If `position` is omitted, $\vec{P}_{\text{tripod}}$ falls back to the preceding shot's terminal eye position $\vec{E}_{\text{prev}}$ when `continuous: true` (for cue index $i > 0$ and `maneuver !== 'cut'`, even when `target:` changes), or otherwise to the cue's start spherical eye $\text{sphericalToCartesian}(P_0)$.
+   If `position` is omitted, $\vec{P}_{\text{tripod}}$ falls back to the deterministic per-cue seed eye $E_{\text{seed}}$: the preceding shot's terminal eye position $\vec{E}_{\text{prev}}$ when `continuous: true` (for cue index $i > 0$ and `maneuver !== 'cut'`, even when `target:` changes), or otherwise $\text{sphericalToCartesian}(P_0)$ sampled once at cue start.
 2. **Linear Dolly Track (`type: "track"`)**: Camera cart glides along a linear rail from $\vec{A}$ to $\vec{B}$ with eased progress $u = E(\tau)$:
    $$\vec{E}(u) = (1 - u)\vec{A} + u\vec{B}$$
-   When `from:` is omitted (`to:` also defaults to $\vec{A}$ if omitted), $\vec{A}$ inherits the preceding shot's terminal eye position $\vec{E}_{\text{prev}}$ when `continuous: true` ($i > 0$, `maneuver !== 'cut'`, even if `target:` changes), or otherwise $\text{sphericalToCartesian}(P_0)$.
+   When `from:` is omitted, $\vec{A} = E_{\text{seed}}$; when `to:` is omitted, $\vec{B} = \vec{A}$ (cart holds stationary). $E_{\text{seed}}$ inherits $\vec{E}_{\text{prev}}$ when `continuous: true` ($i > 0$, `maneuver !== 'cut'`, even if `target:` changes), otherwise $\text{sphericalToCartesian}(P_0)$.
 3. **Curved Spline Dolly Track (`type: "spline_track"`)**: Camera cart glides along a multi-point uniform piecewise standard Catmull-Rom rail evaluated at eased progress $u = E(\tau)$ over $m \ge 2$ control points:
    $$s_{\text{scaled}} = u(m - 1), \quad i = \min(m - 2,\; \lfloor s_{\text{scaled}} \rfloor), \quad s = s_{\text{scaled}} - i$$
    $$\vec{E}(u) = \operatorname{CatmullRom}\left(\mathbf{P}_{\max(0, i-1)},\; \mathbf{P}_i,\; \mathbf{P}_{\min(m-1, i+1)},\; \mathbf{P}_{\min(m-1, i+2)},\; s\right)$$
-   *(If `points` contains 1 point, it prepends the fallback eye as `[E_fallback, points[0]]`; if empty, it holds `[E_fallback, E_fallback]`, where `E_fallback` inherits $\vec{E}_{\text{prev}}$ when `continuous: true` with $i > 0$ and `maneuver !== 'cut'`, even if `target:` changes, or otherwise $\text{sphericalToCartesian}(P_0)$.)*
+   *(If `points` contains 1 point, it prepends $E_{\text{seed}}$ as `[E_seed, points[0]]`; if empty, it holds `[E_seed, E_seed]`. All control points are sanitized to finite coordinates before evaluation, so malformed points cannot yield NaN.)*
 4. **Inverse Look-At Orientation**:
-   - **Target-Tracking Mode (`target:` present)**: With evaluated eye $\vec{E}(u)$ and target anchor $\vec{T}(u)$, orientation is resolved via inverse projection $\operatorname{cartesianToSpherical}(\vec{E}(u), \vec{T}(u), f_{\text{mm}}, \gamma)$, automatically panning and tilting the camera head to center the subject.
+   - **Target-Tracking Mode (`target:` or `from:` present)**: With evaluated eye $\vec{E}(u)$ and target anchor $\vec{T}(u)$, orientation is resolved via inverse projection $\psi = \operatorname{atan2}(\Delta x, \Delta z)$, $\theta = \operatorname{atan2}(\Delta y, \sqrt{\Delta x^2 + \Delta z^2})$, $d = \|\Delta\vec{p}\|$ (with $\Delta\vec{p} = \vec{E} - \vec{T}$), then $\vec{T}$ is reconstructed from the clamped $d$ and $\theta$ so $\vec{E}$ round-trips exactly. Authored `distance`/`pitch`/`yaw` are ignored. When $\|\Delta\vec{p}\| < 10^{-6}\text{ m}$ a finite fallback heading (cue start pose) is used at $d = 0.4\text{ m}$.
    - **Fixed / Animated Gaze Mode (`target:` omitted)**: With fixed or eased angles $(\theta(u), \psi(u))$, target $\vec{T}(u)$ is projected forward along the sightline at distance $d$:
      $$T_x = E_x - d\cos\theta\sin\psi, \quad T_y = E_y - d\sin\theta, \quad T_z = E_z - d\cos\theta\cos\psi$$
+5. **Rail ↔ Eye Coincidence**: `sampleRigRailPoints` and the dashed trajectory ribbon call the same `evaluateRigEyePosition` used at runtime, so a visualization sample at eased progress $u$ coincides exactly with the live eye.
 
 ---
 

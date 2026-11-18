@@ -1,0 +1,60 @@
+# ==============================================================================
+# RAIL CAMERA FIXTURE 02 — CURVED SPLINE DOLLY TRACK
+# ==============================================================================
+# Acceptance fixture: a Catmull-Rom `spline_track` bows the camera through four
+# control points while framing a fixed subject. The eye must follow the spline at
+# eased progress (`smooth`), the rail visualization samples must coincide with the
+# live eye, and yaw / pitch / distance must be derived from the eye -> target line.
+# ==============================================================================
+
+version: "1.0"
+id: "rail-fixture-curved"
+title: "Rail Fixture · Curved Spline Track"
+subtitle: "4-point Catmull-Rom rail · inverse look-at"
+video: "procedural://rail-curved"
+aspect_ratio: "2.39:1"
+duration: 8.0
+
+stage:
+  width: 12
+  depth: 12
+  grid_step: 1
+  observer_camera:
+    target: [0, 1.1, 0]
+    distance: 15.0
+    pitch: 30
+    yaw: 20
+    lens: 35mm
+  stage_camera:
+    target: [0, 1.2, 0]
+    distance: 5.0
+    pitch: 6
+    yaw: 0
+    lens: 40mm
+
+entities:
+  - id: "hero"
+    label: "Hero (Standing)"
+    kind: "character"
+    position: [1.0, 0, 0]
+    rotation: -90
+    color: "#f59e0b"
+
+shots:
+  - id: "shot-01-rail-spline"
+    shot: 1
+    label: "Curved Rail · Catmull-Rom Glide"
+    description: "Cart rolls along a curved rail while maintaining look-at lock on the subject."
+    start: 0.0
+    end: 8.0
+    stage_camera:
+      rig:
+        type: "spline_track"
+        points:
+          - [-4.0, 1.4, 5.0]
+          - [-1.5, 1.9, 3.0]
+          - [1.5, 1.9, 3.0]
+          - [4.0, 1.4, 5.0]
+      target: "hero"
+      easing: "smooth"
+      lens: 40mm

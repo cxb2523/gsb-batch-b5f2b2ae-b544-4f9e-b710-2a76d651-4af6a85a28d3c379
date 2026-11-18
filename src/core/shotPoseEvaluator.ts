@@ -131,6 +131,12 @@ export function evaluateSplineCameraPose(
 
 /**
  * Evaluates a single shot's camera pose at normalized progress tRaw in [0, 1].
+ *
+ * For rig-mounted cues, `fallbackEyeOverride` seeds the rail when the authored
+ * rig omits an explicit start (`track.from`, `spline_track` first point, or
+ * `tripod.position`). Callers in `trajectoryChain.ts` pass the cached,
+ * deterministic per-cue rail seed so live frames, trajectory ribbons, and rail
+ * visualization all agree; standalone callers may omit it to seed from `P0`.
  */
 export function evaluateShotCameraPose(
   P0: SphericalPose,
