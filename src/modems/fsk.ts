@@ -33,13 +33,23 @@ export const DEFAULT_FSK_CONFIG: FSKConfig = {
 };
 
 /**
+ * Default amplitude threshold (I/Q envelope) below which a sample counts as
+ * silence for end-of-data detection. This is also the "pristine" value that
+ * every full/soft demodulator reset restores.
+ */
+const DEFAULT_SILENCE_THRESHOLD = 0.01;
+
+/**
  * Automatic Gain Control processor
+ *
+ * Owned exclusively by the demodulation path. `reset()` restores the initial
+ * gain so one frame can never leave a gain that starves the next frame.
  */
 class AGCProcessor {
-  private targetLevel: number;
+  private readonly targetLevel: number;
   private currentGain: number;
-  private attackRate: number;
-  private releaseRate: number;
+  private readonly attackRate: number;
+  private readonly releaseRate: number;
 
   constructor(sampleRate: number, targetLevel = 0.5) {
     this.targetLevel = targetLevel;
@@ -47,6 +57,10 @@ class AGCProcessor {
     // AGC time constants (attack faster than release)
     this.attackRate = 1.0 - Math.exp(-1.0 / (sampleRate * 0.001)); // 1ms attack
     this.releaseRate = 1.0 - Math.exp(-1.0 / (sampleRate * 0.01)); // 10ms release
+  }
+
+  reset(): void {
+    this.currentGain = 1.0;
   }
 
   process(samples: Float32Array): void {
@@ -124,8 +138,15 @@ export class FSKCore extends BaseModulator<FSKConfig> {
   // Byte assembly state
   private readonly byteState = { current: 0, bitPosition: 0, buffer: [] as number[] };
   
-  // Silence detection state  
-  private readonly silence = { threshold: 0.01, samplesForEOD: 0, sampleCount: 0 };
+  // Silence detection state
+  // `eodFired` latches so a single silent stretch emits exactly one 'eod',
+  // even when the silence is much longer than `samplesForEOD`.
+  private readonly silence = {
+    threshold: DEFAULT_SILENCE_THRESHOLD, samplesForEOD: 0, sampleCount: 0, eodFired: false
+  };
+
+  // Reusable scratch buffer so demodulation never mutates the caller's samples
+  private inputScratch = new Float32Array(0);
 
   // Debug counters
   private readonly debug = { syncDetections: 0, demodulationCalls: 0, totalSamples: 0 };
@@ -176,45 +197,86 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     // Reset all state objects
     Object.assign(this.iqState, { localOscPhase: 0, lastPhase: 0 });
     Object.assign(this.bitSync, { globalSampleCounter: 0, bitSampleCounter: 0, bitAccumulator: 0, bitAccumCount: 0, nextBitSampleIndex: 0 });
-    Object.assign(this.byteState, { current: 0, bitPosition: 0 });
+    Object.assign(this.byteState, { current: 0, bitPosition: 0, buffer: [] });
     this.frame.started = false;
     this.silence.sampleCount = 0;
-    
-    // Reset filters and downsampling state
+    this.silence.eodFired = false;
+    this.silence.threshold = DEFAULT_SILENCE_THRESHOLD;
+
+    // Discard any buffered frame-sync history: leftovers from a previous frame
+    // must never be able to re-trigger a sync in the next one.
+    this.frame.syncSamplesBuffer?.clear();
+    this.frame.syncAmplitudeBuffer?.clear();
+
+    // Reset DSP (AGC, pre-filter, I/Q, post-filter) and downsampling state
+    this.dsp.agc?.reset();
+    this.dsp.preFilter?.reset();
     this.dsp.iqFilters?.i.reset();
     this.dsp.iqFilters?.q.reset();
     this.dsp.postFilter?.reset();
     Object.assign(this.downsample, { counter: 0, iAccumulator: 0, qAccumulator: 0 });
+
+    // Diagnostics describe the demodulator state, so they restart with it.
+    Object.assign(this.debug, { syncDetections: 0, demodulationCalls: 0, totalSamples: 0 });
+  }
+
+  /**
+   * Soft reset used when a single frame ends (either through a detected
+   * end-of-data silence run or a corrupted byte/stop bit).
+   *
+   * Unlike `resetState()` this keeps the adaptive silence threshold learned
+   * from the frame's own amplitude, and leaves the frame-sync ring buffer
+   * alone so samples still in flight are not thrown away. It still rewinds
+   * the bit clock and byte assembly so the next frame starts clean.
+   */
+  private resetFrame(): void {
+    Object.assign(this.bitSync, { bitSampleCounter: 0, bitAccumulator: 0, bitAccumCount: 0, nextBitSampleIndex: 0 });
+    Object.assign(this.byteState, { current: 0, bitPosition: 0 });
+    this.frame.started = false;
   }
 
   async demodulateData(samples: Float32Array): Promise<Uint8Array> {
     if (!this.ready || !this.config) {
       throw new Error('FSK demodulator not configured');
     }
-    
+
     this.debug.demodulationCalls++;
     this.debug.totalSamples += samples.length;
-    
+
     try {
-      // Process samples through AGC and preFilter
-      let processedSamples = samples;
-      if (this.dsp.agc) this.dsp.agc.process(processedSamples);
-      if (this.dsp.preFilter) processedSamples = this.dsp.preFilter.processBuffer(processedSamples);
-      
+      // Process samples through AGC and preFilter.
+      //
+      // The modulation path shares no state with demodulation, and
+      // demodulation never writes into the caller's buffer: AGC works on a
+      // private scratch copy so repeated/lent buffers stay intact.
+      let processedSamples: Float32Array = samples;
+      if (this.dsp.agc) {
+        if (this.inputScratch.length < samples.length) {
+          this.inputScratch = new Float32Array(samples.length);
+        }
+        const scratch = this.inputScratch.subarray(0, samples.length);
+        scratch.set(samples);
+        this.dsp.agc.process(scratch);
+        processedSamples = scratch;
+      }
+      if (this.dsp.preFilter) {
+        processedSamples = this.dsp.preFilter.processBuffer(processedSamples);
+      }
+
       // Stream processing: process each sample individually
       for (let i = 0; i < processedSamples.length; i++) {
         this.processSample(processedSamples[i]);
       }
-      
+
       // Return accumulated bytes
       if (this.byteState.buffer.length > 0) {
         const result = new Uint8Array(this.byteState.buffer);
         this.byteState.buffer = [];
         return result;
       }
-      
+
       return new Uint8Array(0);
-      
+
     } catch (error) {
       this.emit('error', { data: error });
       return new Uint8Array(0);
@@ -281,17 +343,22 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     this.frame.syncSamplesBuffer.put(bitValue);
     this.frame.syncAmplitudeBuffer.put(amplitude);
 
-    // Silence detection and sample counting
+    // Silence detection and sample counting.
+    //
+    // A silent run longer than `samplesForEOD` ends the current frame. The
+    // `eodFired` latch makes sure one silent stretch reports exactly one end
+    // of data no matter how long it lasts; the latch re-arms as soon as the
+    // signal comes back, so the next frame can be received independently.
     this.bitSync.globalSampleCounter++;
     if (amplitude < this.silence.threshold) {
       this.silence.sampleCount++;
-      if (this.silence.sampleCount >= this.silence.samplesForEOD) {
-        this.emit('eod');
-        this.resetState();
+      if (this.silence.sampleCount >= this.silence.samplesForEOD && !this.silence.eodFired) {
+        this.handleEndOfData();
         return true;
       }
     } else {
       this.silence.sampleCount = 0;
+      this.silence.eodFired = false;
     }
 
     if (!this.frame.started) {
@@ -343,14 +410,32 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     return false; // Continue processing
   }
 
+  /**
+   * End-of-data handling.
+   *
+   * Uses the soft frame reset so the adaptive silence threshold survives and
+   * the sync ring buffer keeps any samples still in flight. `eodFired` is
+   * latched and re-armed only when signal returns (see
+   * `processDownsampledBit`), which makes a long silent gap emit a single
+   * 'eod' while a following frame still re-synchronizes normally.
+   */
+  private handleEndOfData(): void {
+    this.silence.eodFired = true;
+    this.silence.sampleCount = 0;
+    this.resetFrame();
+    this.emit('eod');
+  }
+
   private processByte(bit: number): void {
     const { bitPosition } = this.byteState;
     const stopBitPosition = this.config.parity === 'none' ? 9 : 10;
-    
+
     if (bitPosition === 0) {
-      // Start bit validation
+      // Start bit validation: a bogus start bit means we lost the frame, so
+      // rewind only the frame state (not the DSP/sync history) and let the
+      // sync detector look for the next preamble.
       if (bit !== 0) {
-        this.resetState();
+        this.resetFrame();
         return;
       }
     } else if (bitPosition >= 1 && bitPosition <= 8) {
@@ -361,16 +446,16 @@ export class FSKCore extends BaseModulator<FSKConfig> {
     } else if (bitPosition === stopBitPosition) {
       // Stop bit validation and byte completion
       if (bit !== 1) {
-        this.frame.started = false;
+        this.resetFrame();
         return;
       }
       this.byteState.buffer.push(this.byteState.current);
       Object.assign(this.byteState, { current: 0, bitPosition: -1 }); // -1 because it will be incremented below
     } else {
-      this.frame.started = false;
+      this.resetFrame();
       return;
     }
-    
+
     this.byteState.bitPosition++;
   }
 
@@ -462,10 +547,9 @@ export class FSKCore extends BaseModulator<FSKConfig> {
   }
 
   reset(): void {
+    // Full state reset: DSP, sync, byte assembly, silence detection and the
+    // pending output all return to their pristine post-configure state.
     this.resetState();
-    this.frame.syncSamplesBuffer?.clear();
-    this.byteState.buffer = [];
-    Object.assign(this.debug, { syncDetections: 0, demodulationCalls: 0, totalSamples: 0 });
   }
 
   getSignalQuality() {
