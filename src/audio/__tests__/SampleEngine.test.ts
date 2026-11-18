@@ -101,7 +101,7 @@ vi.mock("../../state/store", () => ({
 import type { SampleKit, SamplePad } from "../../types/mpc.types";
 // ── Helpers ────────────────────────────────────────────────────────────────────
 // eslint-disable-next-line import/first
-import { SampleEngine } from "../SampleEngine";
+import { MissingImportedSampleError, SampleEngine } from "../SampleEngine";
 
 function makeSamplePad(overrides: Partial<SamplePad> = {}): SamplePad {
   return {
@@ -139,6 +139,44 @@ function mockFetch(ok = true): void {
     statusText: ok ? "OK" : "Not Found",
     arrayBuffer: vi.fn().mockResolvedValue(ab),
   });
+}
+
+function okResponse(): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)),
+  } as unknown as Response;
+}
+
+/**
+ * Deferred fetch: the returned promise only settles when the test calls
+ * resolve/reject. Every call records the AbortSignal so kit-switch abort
+ * behaviour can be asserted directly.
+ */
+function deferredFetch() {
+  const calls: Array<{ url: string; signal?: AbortSignal }> = [];
+  let resolveFn!: (r: Response) => void;
+  let rejectFn!: (e: unknown) => void;
+  global.fetch = vi.fn((url: string | URL | Request, opts?: RequestInit) => {
+    calls.push({ url: String(url), signal: opts?.signal });
+    return new Promise<Response>((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+  }) as typeof fetch;
+  return {
+    calls,
+    resolve: (r: Response) => resolveFn(r),
+    reject: (e: unknown) => rejectFn(e),
+  };
+}
+
+/** Flush all pending microtasks (fetch → arrayBuffer → decode chains). */
+async function flushMicrotasks(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -609,6 +647,481 @@ describe("SampleEngine", () => {
         engine.dispose();
         engine.dispose();
       }).not.toThrow();
+    });
+  });
+
+  // ── Kit-switch isolation ──────────────────────────────────────────────────────
+
+  describe("kit switch while requests are in flight", () => {
+    it("aborts the previous kit's fetch via AbortController", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav" })]));
+      engine.trigger(0, 0.9);
+      expect(engine.isPadLoading(0)).toBe(true);
+
+      await engine.loadKit(makeKit([makeSamplePad({ globalPadIdx: 1, sampleId: "b.wav" })]));
+
+      expect(deferred.calls).toHaveLength(1);
+      expect(deferred.calls[0].signal?.aborted).toBe(true);
+    });
+
+    it("a stale response after switching kits is never written into the buffer table", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      const kit1 = makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]);
+      const kit2 = makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]);
+
+      await engine.loadKit(kit1);
+      engine.trigger(0, 0.9); // starts fetching a.wav
+      await engine.loadKit(kit2); // generation bumped; a.wav request aborted/guarded
+
+      // The old request resolves anyway (e.g. abort happened mid-decode).
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
+
+      // Re-trigger under kit2: b.wav is NOT buffered, so a fresh fetch starts.
+      mockFetch();
+      engine.trigger(0, 0.9);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledWith(
+        "/b.wav",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    it("a stale response cannot change the new kit's loading flags", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      expect(engine.isPadLoading(0)).toBe(true);
+      mockSetPadLoading.mockClear();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+
+      // loadKit clears the loading flag itself, exactly once for pad 0.
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+      expect(engine.isPadLoading(0)).toBe(false);
+      mockSetPadLoading.mockClear();
+
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
+
+      // No further store syncs and the new kit's pad stays out of loading.
+      expect(mockSetPadLoading).not.toHaveBeenCalled();
+      expect(engine.isPadLoading(0)).toBe(false);
+    });
+
+    it("a stale response never starts playback on the new kit's pad", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+
+      const MockPlayer = vi.mocked(Tone.Player);
+      MockPlayer.mockClear();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
+
+      // No player was created for the superseded play-on-resolve continuation.
+      expect(MockPlayer).not.toHaveBeenCalled();
+    });
+
+    it("retains already-decoded buffers so shared samples are not re-downloaded", async () => {
+      await engine.start();
+      mockFetch();
+
+      const shared = makeSamplePad({ globalPadIdx: 0, sampleId: "shared.wav", url: "/shared.wav" });
+      await engine.loadKit(makeKit([shared]));
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(mockSetPadLoading).toHaveBeenCalledWith(0, false));
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+
+      // Switch away and back to a kit reusing the same sampleId.
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 2, sampleId: "other.wav", url: "/other.wav" })]),
+      );
+      vi.mocked(global.fetch).mockClear();
+      await engine.loadKit(makeKit([{ ...shared, globalPadIdx: 5 }]));
+
+      engine.trigger(5, 0.9);
+      await flushMicrotasks();
+
+      // Buffer survived the kit switch — no new fetch, playback is immediate.
+      expect(global.fetch).not.toHaveBeenCalled();
+      expect(engine.isPadLoading(5)).toBe(false);
+    });
+
+    it("clears loading flags for every loading pad when the kit changes", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([
+          makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" }),
+          makeSamplePad({ globalPadIdx: 1, sampleId: "b.wav", url: "/b.wav" }),
+        ]),
+      );
+      engine.trigger(0, 0.9);
+      engine.trigger(1, 0.9);
+      expect(engine.isPadLoading(0)).toBe(true);
+      expect(engine.isPadLoading(1)).toBe(true);
+
+      await engine.loadKit(makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "c.wav" })]));
+
+      expect(engine.isPadLoading(0)).toBe(false);
+      expect(engine.isPadLoading(1)).toBe(false);
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+      expect(mockSetPadLoading).toHaveBeenCalledWith(1, false);
+
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
+    });
+  });
+
+  // ── Loading flag consistency on failure / cancel ──────────────────────────────
+
+  describe("loading flag consistency", () => {
+    // These tests intentionally drive failure paths; the engine logs them, so
+    // keep console output noise out of the test report.
+    beforeEach(() => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("clears the loading flag when the fetch rejects", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      expect(engine.isPadLoading(0)).toBe(true);
+
+      deferred.reject(new TypeError("network down"));
+      await vi.waitFor(() => expect(engine.isPadLoading(0)).toBe(false));
+
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+    });
+
+    it("clears the loading flag on a non-OK HTTP response", async () => {
+      await engine.start();
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: "Server Error",
+        arrayBuffer: vi.fn(),
+      });
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+
+      await vi.waitFor(() => expect(engine.isPadLoading(0)).toBe(false));
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+    });
+
+    it("allows a later trigger to retry after a failed fetch", async () => {
+      await engine.start();
+      global.fetch = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError("network down"))
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)),
+        });
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(engine.isPadLoading(0)).toBe(false));
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(engine.isPadLoading(0)).toBe(false));
+    });
+
+    it("an aborted in-flight request leaves no permanent loading state", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+
+      // Simulate the platform rejecting the fetch promise because it was aborted.
+      deferred.reject(new DOMException("Aborted", "AbortError"));
+      await flushMicrotasks();
+
+      expect(engine.isPadLoading(0)).toBe(false);
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+    });
+
+    it("setPadSample clears a stuck loading flag for the reassigned pad", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      const first = makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" });
+      await engine.loadKit(makeKit([first]));
+      engine.trigger(0, 0.9);
+      expect(engine.isPadLoading(0)).toBe(true);
+
+      const replacement = makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" });
+      engine.setPadSample(0, replacement);
+
+      expect(engine.isPadLoading(0)).toBe(false);
+      expect(mockSetPadLoading).toHaveBeenCalledWith(0, false);
+
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
+    });
+  });
+
+  // ── Concurrent dedup ──────────────────────────────────────────────────────────
+
+  describe("concurrent request deduplication", () => {
+    it("two different pads sharing one sampleId trigger only a single fetch", async () => {
+      await engine.start();
+      mockFetch();
+
+      await engine.loadKit(
+        makeKit([
+          makeSamplePad({ globalPadIdx: 0, sampleId: "shared.wav", url: "/shared.wav" }),
+          makeSamplePad({ globalPadIdx: 1, sampleId: "shared.wav", url: "/shared.wav" }),
+        ]),
+      );
+
+      engine.trigger(0, 0.8);
+      engine.trigger(1, 0.8);
+
+      await vi.waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+      await flushMicrotasks();
+
+      // Both pads settle out of loading.
+      expect(engine.isPadLoading(0)).toBe(false);
+      expect(engine.isPadLoading(1)).toBe(false);
+    });
+
+    it("a new trigger after kit switch starts a fresh request (inflight table was reset)", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      expect(deferred.calls).toHaveLength(1);
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+
+      mockFetch();
+      engine.trigger(0, 0.9);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledWith(
+        "/b.wav",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+  });
+
+  // ── Imported samples (url === null) ───────────────────────────────────────────
+
+  describe("imported samples without a registered buffer", () => {
+    // The engine reports this condition loudly by design; silence it here.
+    beforeEach(() => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("trigger rejects with MissingImportedSampleError instead of silently skipping", async () => {
+      await engine.start();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "dropped.wav", url: null })]),
+      );
+
+      // trigger() itself stays synchronous; observe the rejection via the
+      // loading flag settling and the exposed error class on prefetchAll.
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(engine.isPadLoading(0)).toBe(false));
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining("dropped.wav"));
+
+      await expect(engine.prefetchAll()).rejects.toBeInstanceOf(MissingImportedSampleError);
+    });
+
+    it("prefetchAll rejects with MissingImportedSampleError carrying the sampleId", async () => {
+      await engine.start();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 3, sampleId: "missing-import.wav", url: null })]),
+      );
+
+      await expect(engine.prefetchAll()).rejects.toMatchObject({
+        name: "MissingImportedSampleError",
+        sampleId: "missing-import.wav",
+      });
+    });
+
+    it("prefetchAll succeeds once the imported buffer is registered (no fetch)", async () => {
+      await engine.start();
+      mockFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "imported.wav", url: null })]),
+      );
+      await engine.registerImportedSample("imported.wav", new Uint8Array(4));
+
+      await expect(engine.prefetchAll()).resolves.toBeUndefined();
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Player / gain node release and rebuild ────────────────────────────────────
+
+  describe("per-pad player lifecycle", () => {
+    it("loadKit disposes every per-pad player and gain node", async () => {
+      await engine.start();
+      mockFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(mockSetPadLoading).toHaveBeenCalledWith(0, false));
+
+      const MockPlayer = vi.mocked(Tone.Player);
+      const firstPlayer = MockPlayer.mock.results.at(-1)?.value as {
+        stop: ReturnType<typeof vi.fn>;
+        dispose: ReturnType<typeof vi.fn>;
+      };
+      const MockGain = vi.mocked(Tone.Gain);
+      // Index 0 is the master gain; the most recent gain is the per-pad one.
+      const padGain = MockGain.mock.results.at(-1)?.value as {
+        dispose: ReturnType<typeof vi.fn>;
+      };
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+
+      expect(firstPlayer.stop).toHaveBeenCalled();
+      expect(firstPlayer.dispose).toHaveBeenCalled();
+      expect(padGain.dispose).toHaveBeenCalled();
+    });
+
+    it("rebuilds the player from the new kit's sample after retrigger", async () => {
+      await engine.start();
+      mockFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(mockSetPadLoading).toHaveBeenCalledWith(0, false));
+
+      const MockPlayer = vi.mocked(Tone.Player);
+      MockPlayer.mockClear();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "b.wav", url: "/b.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(mockSetPadLoading).toHaveBeenCalledWith(0, false));
+
+      // A brand-new player was built for the new kit (no reused stale node).
+      await vi.waitFor(() => expect(MockPlayer).toHaveBeenCalledTimes(1));
+      const rebuilt = MockPlayer.mock.results[0].value as {
+        start: ReturnType<typeof vi.fn>;
+      };
+      expect(rebuilt.start).toHaveBeenCalled();
+    });
+
+    it("setPadSample(null) disposes the pad's player and gain node", async () => {
+      await engine.start();
+      mockFetch();
+
+      await engine.loadKit(
+        makeKit([makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" })]),
+      );
+      engine.trigger(0, 0.9);
+      await vi.waitFor(() => expect(mockSetPadLoading).toHaveBeenCalledWith(0, false));
+
+      const MockPlayer = vi.mocked(Tone.Player);
+      const padPlayer = MockPlayer.mock.results.at(-1)?.value as {
+        stop: ReturnType<typeof vi.fn>;
+        dispose: ReturnType<typeof vi.fn>;
+      };
+      const MockGain = vi.mocked(Tone.Gain);
+      const padGain = MockGain.mock.results.at(-1)?.value as {
+        dispose: ReturnType<typeof vi.fn>;
+      };
+
+      engine.setPadSample(0, null);
+
+      expect(padPlayer.stop).toHaveBeenCalled();
+      expect(padPlayer.dispose).toHaveBeenCalled();
+      expect(padGain.dispose).toHaveBeenCalled();
+    });
+
+    it("dispose() releases pad players and aborts in-flight requests", async () => {
+      await engine.start();
+      const deferred = deferredFetch();
+
+      await engine.loadKit(
+        makeKit([
+          makeSamplePad({ globalPadIdx: 0, sampleId: "a.wav", url: "/a.wav" }),
+          makeSamplePad({ globalPadIdx: 1, sampleId: "b.wav", url: "/b.wav" }),
+        ]),
+      );
+      engine.trigger(0, 0.9);
+      engine.trigger(1, 0.9);
+
+      const MockPlayer = vi.mocked(Tone.Player);
+      // No player yet (fetches pending); assert abort + flag clearing instead.
+      engine.dispose();
+
+      for (const call of deferred.calls) {
+        expect(call.signal?.aborted).toBe(true);
+      }
+      expect(engine.isPadLoading(0)).toBe(false);
+      expect(engine.isPadLoading(1)).toBe(false);
+      expect(MockPlayer).not.toHaveBeenCalled();
+
+      deferred.resolve(okResponse());
+      await flushMicrotasks();
     });
   });
 });

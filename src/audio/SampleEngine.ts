@@ -19,6 +19,37 @@ type PadPlayer = {
 const PREFETCH_CONCURRENCY = 6;
 
 /**
+ * Thrown when a pad references an imported sample (`url === null`) whose
+ * decoded buffer was never registered via `registerImportedSample()`.
+ * Imported samples have no URL to fetch, so failing loudly (instead of
+ * silently skipping) lets callers surface a precise error to the user.
+ */
+export class MissingImportedSampleError extends Error {
+  constructor(public readonly sampleId: SampleId) {
+    super(
+      `SampleEngine: imported sample "${sampleId}" has no registered buffer ` +
+        "(call registerImportedSample() before triggering this pad).",
+    );
+    this.name = "MissingImportedSampleError";
+  }
+}
+
+/**
+ * A single in-flight fetch/decode request for one `sampleId`.
+ *
+ * - `promise` resolves to the decoded ToneAudioBuffer.
+ * - `controller` aborts the underlying `fetch` when the request is invalidated
+ *   by a kit switch or engine disposal.
+ * - `generation` records the kit generation that started the request, so a
+ *   response arriving after a kit switch can never mutate current state.
+ */
+type InflightRequest = {
+  promise: Promise<Tone.ToneAudioBuffer>;
+  controller: AbortController;
+  generation: number;
+};
+
+/**
  * SampleEngine — sample-based playback engine implementing `AudioEngineLike`.
  *
  * Audio graph:
@@ -29,8 +60,17 @@ const PREFETCH_CONCURRENCY = 6;
  * - Lazy buffer load: buffers are only fetched on first `trigger` for that pad.
  * - Inflight deduplication: concurrent triggers on the same unloaded pad share
  *   a single fetch Promise; the buffer is stored once and used by all.
+ * - Kit-generation isolation: every `loadKit()` (and `dispose()`) bumps a
+ *   monotonic generation and aborts all in-flight requests. Async continuations
+ *   only mutate engine/store state while their captured generation is current,
+ *   so a slow response from a previous kit can never write into the buffer
+ *   table, flip the new kit's loading flags, or play on the wrong pad.
+ * - Buffer reuse across kits: decoded buffers are keyed by `sampleId` and
+ *   survive kit switches — a sample used by the new kit is never re-downloaded,
+ *   and buffers still referenced by a pad are never released early.
  * - StrictMode / HMR safety: `start()` is idempotent; `dispose()` is thorough.
- * - Per-pad Tone.Player: created on demand at first trigger, reused on retrigger.
+ * - Per-pad Tone.Player: created on demand at first trigger, released on kit
+ *   switch / pad reassignment / disposal and rebuilt from the current sample.
  */
 export class SampleEngine implements AudioEngineLike {
   private master: Tone.Gain | null = null;
@@ -38,14 +78,15 @@ export class SampleEngine implements AudioEngineLike {
   private fft: Tone.FFT | null = null;
   private ready = false;
 
-  /** Decoded audio buffers keyed by SampleId. */
+  /** Decoded audio buffers keyed by SampleId. Retained across kit switches. */
   private buffers = new Map<SampleId, Tone.ToneAudioBuffer>();
 
   /**
    * In-flight fetch promises keyed by SampleId.
    * Ensures concurrent triggers on the same unloaded pad share a single fetch.
+   * Each entry carries an AbortController and the generation that started it.
    */
-  private inflight = new Map<SampleId, Promise<Tone.ToneAudioBuffer>>();
+  private inflight = new Map<SampleId, InflightRequest>();
 
   /** Current kit pad assignments (globalPadIdx → SamplePad). */
   private padMap = new Map<PadIndex, SamplePad>();
@@ -55,6 +96,13 @@ export class SampleEngine implements AudioEngineLike {
 
   /** Set of pad indices whose buffers are currently being fetched/decoded. */
   private loading = new Set<PadIndex>();
+
+  /**
+   * Monotonic kit-generation counter. Bumped on every `loadKit()` and on
+   * `dispose()`. Any async continuation captured under an older generation is
+   * stale and must not mutate `buffers`, `loading`, the store, or playback.
+   */
+  private generation = 0;
 
   async start(): Promise<void> {
     if (this.ready) return;
@@ -72,23 +120,35 @@ export class SampleEngine implements AudioEngineLike {
   }
 
   /**
-   * Load a SampleKit: clear pad assignments and populate from kit.pads.
-   * Lazy — no buffers are fetched here.
+   * Load a SampleKit, fully replacing the previously loaded kit.
+   *
+   * Lazy — no buffers are fetched here. Kit-switch guarantees:
+   * 1. All in-flight requests from the previous kit are aborted; any response
+   *    that still resolves is generation-guarded and cannot touch state.
+   * 2. Every per-pad player/gain node is released, so the old kit's voices do
+   *    not leak into the new kit (rebuilt lazily from the new sample).
+   * 3. Loading flags (engine + store UI) are cleared — no pad can stay stuck
+   *    in "loading" because of a request owned by the previous kit.
+   * 4. Decoded buffers in `buffers` are intentionally retained so shared
+   *    samples are not re-downloaded or released.
    */
   async loadKit(kit: SampleKit): Promise<void> {
-    // Dispose per-pad players for slots that are changing, to avoid
-    // stale player references after a kit switch.
-    for (const [idx, pp] of this.padPlayers) {
-      if (!kit.pads.some((p) => p.globalPadIdx === idx)) {
-        pp.player.stop();
-        pp.player.dispose();
-        pp.gainNode.dispose();
-      }
+    // Invalidate every async continuation started under the previous kit.
+    this.generation += 1;
+    this.abortAllInflight();
+
+    // Release all per-pad playback nodes — the new kit rebuilds them lazily
+    // against its own samples.
+    this.disposeAllPadPlayers();
+
+    // Clear loading flags and mirror the reset to the store so pad UIs stop
+    // showing spinners for requests that no longer belong to this engine.
+    for (const idx of this.loading) {
+      useMPCStore.getState().setPadLoading(idx, false);
     }
-    this.padMap.clear();
-    this.padPlayers.clear();
     this.loading.clear();
 
+    this.padMap.clear();
     for (const pad of kit.pads) {
       this.padMap.set(pad.globalPadIdx, { ...pad });
     }
@@ -97,30 +157,17 @@ export class SampleEngine implements AudioEngineLike {
   setPadSample(idx: PadIndex, pad: SamplePad | null): void {
     if (pad === null) {
       this.padMap.delete(idx);
-      const pp = this.padPlayers.get(idx);
-      if (pp) {
-        try {
-          pp.player.stop();
-          pp.player.dispose();
-          pp.gainNode.dispose();
-        } catch {
-          // ignore — may already be disposed
-        }
-        this.padPlayers.delete(idx);
-      }
     } else {
       this.padMap.set(idx, { ...pad });
-      const pp = this.padPlayers.get(idx);
-      if (pp) {
-        try {
-          pp.player.stop();
-          pp.player.dispose();
-          pp.gainNode.dispose();
-        } catch {
-          // ignore
-        }
-        this.padPlayers.delete(idx);
-      }
+    }
+
+    // The pad's sample assignment changed: its existing player is bound to the
+    // old buffer, and any in-flight load for the old assignment is now
+    // irrelevant to this slot. Release the node and clear the loading flag;
+    // the next trigger rebuilds the player from the current sample.
+    this.disposePadPlayer(idx);
+    if (this.loading.delete(idx)) {
+      useMPCStore.getState().setPadLoading(idx, false);
     }
   }
 
@@ -161,6 +208,10 @@ export class SampleEngine implements AudioEngineLike {
    * - If not yet loaded: mark pad as loading, kick off the fetch, and
    *   play-on-resolve so the first tap still produces sound (with ~network delay).
    * - Concurrent triggers while loading share the same inflight promise (deduped).
+   *
+   * The resolve/reject continuations capture the current generation and the
+   * pad's sampleId. After a kit switch, pad reassignment, or disposal they are
+   * stale and cannot flip loading flags, write buffers, or start playback.
    */
   trigger(idx: PadIndex, velocity: number, time?: number): void {
     if (!this.ready || !this.master) return;
@@ -180,7 +231,11 @@ export class SampleEngine implements AudioEngineLike {
       return;
     }
 
-    // Buffer not yet loaded.
+    const requestGeneration = this.generation;
+    const requestSampleId = pad.sampleId;
+
+    // Buffer not yet loaded. The flag is only pushed to the store on a real
+    // false→true transition, keeping UI state consistent with this.loading.
     if (!this.loading.has(idx)) {
       this.loading.add(idx);
       useMPCStore.getState().setPadLoading(idx, true);
@@ -188,7 +243,16 @@ export class SampleEngine implements AudioEngineLike {
 
     this.ensureBuffer(pad)
       .then((loadedBuf) => {
-        this.loading.delete(idx);
+        // Stale after kit switch / disposal, or the pad was reassigned to a
+        // different sample while the request was in flight — do not touch the
+        // loading flag and do not play. The current generation owns this slot.
+        if (
+          requestGeneration !== this.generation ||
+          this.padMap.get(idx)?.sampleId !== requestSampleId
+        ) {
+          return;
+        }
+        if (!this.loading.delete(idx)) return;
         useMPCStore.getState().setPadLoading(idx, false);
         // Play-on-resolve: use Tone.now() since the scheduled time may be stale.
         try {
@@ -198,9 +262,18 @@ export class SampleEngine implements AudioEngineLike {
         }
       })
       .catch((err) => {
-        this.loading.delete(idx);
-        useMPCStore.getState().setPadLoading(idx, false);
-        console.warn(`SampleEngine: failed to load sample "${pad.sampleId}"`, err);
+        if (requestGeneration !== this.generation) {
+          // Superseded by a kit switch / disposal — the failure is owned by a
+          // previous generation and must not alter current UI state.
+          return;
+        }
+        // Any failure of a still-current request (network error, bad HTTP
+        // status, decode failure, cancellation) must release the loading flag
+        // so the pad never stays stuck in "loading".
+        if (this.loading.delete(idx)) {
+          useMPCStore.getState().setPadLoading(idx, false);
+        }
+        console.warn(`SampleEngine: failed to load sample "${requestSampleId}"`, err);
       });
   }
 
@@ -221,16 +294,19 @@ export class SampleEngine implements AudioEngineLike {
   /**
    * Eagerly fetch and decode all sample URLs in the currently loaded kit.
    * Uses a sliding window of `PREFETCH_CONCURRENCY` concurrent fetches.
-   * Imported samples (url === null) that are already buffered are skipped.
+   * Already-buffered samples (including registered imports) are skipped.
+   * An imported pad (`url === null`) without a registered buffer rejects with
+   * {@link MissingImportedSampleError} rather than being silently skipped.
    */
   async prefetchAll(onProgress?: (loaded: number, total: number) => void): Promise<void> {
     const pads = [...this.padMap.values()];
 
-    // Only pads that need network fetching.
-    const toFetch = pads.filter((p) => !this.buffers.has(p.sampleId) && p.url !== null);
+    // Pads that still need work: anything without a decoded buffer. Imported
+    // pads (url === null) cannot be fetched and reject explicitly below.
+    const toFetch = pads.filter((p) => !this.buffers.has(p.sampleId));
 
     const total = pads.length;
-    let loaded = pads.length - toFetch.length; // already-buffered count
+    let loaded = total - toFetch.length; // already-buffered count
 
     if (toFetch.length === 0) {
       onProgress?.(total, total);
@@ -240,21 +316,21 @@ export class SampleEngine implements AudioEngineLike {
     // Sliding-window concurrency.
     let queueIdx = 0;
 
-    async function runOne(engine: SampleEngine, pad: SamplePad): Promise<void> {
-      await engine.ensureBuffer(pad);
+    const runOne = async (pad: SamplePad): Promise<void> => {
+      await this.ensureBuffer(pad);
       loaded += 1;
       onProgress?.(loaded, total);
-    }
+    };
 
-    async function worker(engine: SampleEngine): Promise<void> {
+    async function worker(): Promise<void> {
       while (queueIdx < toFetch.length) {
         const pad = toFetch[queueIdx++];
-        await runOne(engine, pad);
+        await runOne(pad);
       }
     }
 
     const workers = Array.from({ length: Math.min(PREFETCH_CONCURRENCY, toFetch.length) }, () =>
-      worker(this),
+      worker(),
     );
     await Promise.all(workers);
   }
@@ -262,6 +338,7 @@ export class SampleEngine implements AudioEngineLike {
   /**
    * Decode raw WAV bytes and register them under `sampleId` for immediate
    * playback. Called after the user drag-drops a `.wav` file.
+   * Re-registering the same id disposes the previous buffer first.
    */
   async registerImportedSample(sampleId: SampleId, bytes: Uint8Array): Promise<void> {
     // Copy the bytes into a fresh ArrayBuffer to avoid detached-buffer issues.
@@ -269,6 +346,15 @@ export class SampleEngine implements AudioEngineLike {
     const audioCtx = Tone.getContext().rawContext as AudioContext;
     const decoded = await audioCtx.decodeAudioData(copy as ArrayBuffer);
     const buf = new Tone.ToneAudioBuffer(decoded);
+
+    const previous = this.buffers.get(sampleId);
+    if (previous) {
+      try {
+        previous.dispose();
+      } catch {
+        // ignore — best-effort replacement
+      }
+    }
     this.buffers.set(sampleId, buf);
   }
 
@@ -343,19 +429,23 @@ export class SampleEngine implements AudioEngineLike {
     } else {
       this.padPlayers.delete(idxA);
     }
+
+    // Any in-flight load is keyed to the pre-swap assignment; clear the flags
+    // so the swapped slots cannot stay stuck in loading. The next trigger
+    // resolves the (possibly shared, deduped) buffer against the new pad.
+    for (const idx of [idxA, idxB]) {
+      if (this.loading.delete(idx)) {
+        useMPCStore.getState().setPadLoading(idx, false);
+      }
+    }
   }
 
   dispose(): void {
-    for (const [, pp] of this.padPlayers) {
-      try {
-        pp.player.stop();
-        pp.player.dispose();
-        pp.gainNode.dispose();
-      } catch {
-        // ignore — already disposed
-      }
-    }
-    this.padPlayers.clear();
+    // Invalidate every in-flight continuation before tearing nodes down.
+    this.generation += 1;
+    this.abortAllInflight();
+
+    this.disposeAllPadPlayers();
 
     for (const [, buf] of this.buffers) {
       try {
@@ -367,6 +457,10 @@ export class SampleEngine implements AudioEngineLike {
     this.buffers.clear();
     this.inflight.clear();
     this.padMap.clear();
+
+    for (const idx of this.loading) {
+      useMPCStore.getState().setPadLoading(idx, false);
+    }
     this.loading.clear();
 
     try {
@@ -394,22 +488,32 @@ export class SampleEngine implements AudioEngineLike {
    * Ensure a buffer is available for the given pad. Returns the buffer once
    * decoded. Uses the `inflight` map to deduplicate concurrent fetches for
    * the same `sampleId`.
+   *
+   * The fetch is tagged with the generation that started it. Once the network
+   * response arrives it is only committed to the buffer table when that
+   * generation is still current, guaranteeing a previous kit's response can
+   * never land here; the request is aborted outright on kit switch/disposal.
    */
   private ensureBuffer(pad: SamplePad): Promise<Tone.ToneAudioBuffer> {
     const existing = this.buffers.get(pad.sampleId);
     if (existing) return Promise.resolve(existing);
 
     const inFlight = this.inflight.get(pad.sampleId);
-    if (inFlight) return inFlight;
+    if (inFlight) return inFlight.promise;
 
     if (pad.url === null) {
       // Imported sample — must have been registered via registerImportedSample.
-      // If the buffer is missing, we cannot load it from a URL.
-      console.warn(`SampleEngine: imported sample "${pad.sampleId}" not yet registered.`);
-      return Promise.reject(new Error(`Missing imported sample buffer for "${pad.sampleId}"`));
+      // There is no URL to fall back to, so reject with an explicit error.
+      const error = new MissingImportedSampleError(pad.sampleId);
+      console.error(error.message);
+      return Promise.reject(error);
     }
 
-    const fetchPromise: Promise<Tone.ToneAudioBuffer> = fetch(pad.url)
+    const controller = new AbortController();
+    const startedGeneration = this.generation;
+    const fetchPromise: Promise<Tone.ToneAudioBuffer> = fetch(pad.url, {
+      signal: controller.signal,
+    })
       .then((res) => {
         if (!res.ok) {
           throw new Error(`SampleEngine: HTTP ${res.status} fetching "${pad.url}"`);
@@ -417,22 +521,82 @@ export class SampleEngine implements AudioEngineLike {
         return res.arrayBuffer();
       })
       .then((arrayBuf) => {
+        // The kit may have switched (or the engine been disposed) while the
+        // network round-trip was in flight. Never decode into / write the
+        // shared buffer table on behalf of a stale generation.
+        if (startedGeneration !== this.generation) {
+          throw new DOMException(
+            `SampleEngine: request for "${pad.sampleId}" superseded by a kit switch`,
+            "AbortError",
+          );
+        }
         const audioCtx = Tone.getContext().rawContext as AudioContext;
         return audioCtx.decodeAudioData(arrayBuf);
       })
       .then((audioBuffer) => {
+        if (startedGeneration !== this.generation) {
+          throw new DOMException(
+            `SampleEngine: request for "${pad.sampleId}" superseded by a kit switch`,
+            "AbortError",
+          );
+        }
         const toneBuf = new Tone.ToneAudioBuffer(audioBuffer);
         this.buffers.set(pad.sampleId, toneBuf);
-        this.inflight.delete(pad.sampleId);
+        this.removeInflight(pad.sampleId, controller);
         return toneBuf;
       })
       .catch((err) => {
-        this.inflight.delete(pad.sampleId);
+        this.removeInflight(pad.sampleId, controller);
         throw err;
       });
 
-    this.inflight.set(pad.sampleId, fetchPromise);
+    this.inflight.set(pad.sampleId, {
+      promise: fetchPromise,
+      controller,
+      generation: startedGeneration,
+    });
     return fetchPromise;
+  }
+
+  /** Abort and forget every in-flight request (kit switch / disposal). */
+  private abortAllInflight(): void {
+    for (const [, entry] of this.inflight) {
+      try {
+        entry.controller.abort();
+      } catch {
+        // ignore — already aborted
+      }
+    }
+    this.inflight.clear();
+  }
+
+  /** Remove an inflight entry only if it is still the same request instance. */
+  private removeInflight(sampleId: SampleId, controller: AbortController): void {
+    const current = this.inflight.get(sampleId);
+    if (current?.controller === controller) {
+      this.inflight.delete(sampleId);
+    }
+  }
+
+  /** Stop and dispose one pad's Player + Gain pair. */
+  private disposePadPlayer(idx: PadIndex): void {
+    const pp = this.padPlayers.get(idx);
+    if (!pp) return;
+    try {
+      pp.player.stop();
+      pp.player.dispose();
+      pp.gainNode.dispose();
+    } catch {
+      // ignore — may already be disposed
+    }
+    this.padPlayers.delete(idx);
+  }
+
+  /** Stop and dispose every per-pad Player + Gain pair. */
+  private disposeAllPadPlayers(): void {
+    for (const idx of [...this.padPlayers.keys()]) {
+      this.disposePadPlayer(idx);
+    }
   }
 
   /**
@@ -479,7 +643,7 @@ export class SampleEngine implements AudioEngineLike {
       if (audioBuffer && audioBuffer.sampleRate > 0) {
         const sr = audioBuffer.sampleRate;
         const offsetSec = sampleStart / sr;
-        const durationSec = Math.max(0, (sampleEnd - sampleStart)) / sr;
+        const durationSec = Math.max(0, sampleEnd - sampleStart) / sr;
         pp.player.start(playTime, offsetSec, durationSec);
         return;
       }
