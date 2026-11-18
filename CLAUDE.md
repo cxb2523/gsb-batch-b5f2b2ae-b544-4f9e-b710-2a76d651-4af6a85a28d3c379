@@ -14,6 +14,9 @@ npm run start:dev
 
 # Production build
 npm run build
+
+# Unit tests (vitest, tests/ directory)
+npm run test
 ```
 
 Build outputs:

@@ -51,6 +51,8 @@ export default class ZoomManager {
     public minZoom: number | null = null;
     public zoomLevel: ZoomLevel;
     private lastPointer: [number, number] | null = null;
+    private zoomInteractionActive: boolean = true;
+    private multiSelectZoomPaused: boolean = false;
 
 
     constructor(private _self: SeatMapCanvas) {
@@ -61,7 +63,6 @@ export default class ZoomManager {
 
     public init() {
 
-        console.log('zoom init')
         this.calculateZoomLevels();
         this.zoomInit();
         // this._self.eventManager.addEventListener(EventType.UPDATE_BLOCK, (blocks: Array<BlockModel>) => {
@@ -72,14 +73,25 @@ export default class ZoomManager {
             this.lastPointer = cor;
         });
 
+        // Zoom thresholds depend on the stage/window bounding boxes.
+        // Recalculate them whenever the viewport size changes so stale
+        // values are never reused.
+        this._self.eventManager.addEventListener(EventType.RESIZE_WINDOW, () => {
+            this.calculateZoomLevels();
+            this.calculateActiveBlocks();
+        });
+
         this._self.eventManager.addEventListener(EventType.KEYDOWN_SVG, (e: any) => {
-            if (e.which == 17 || e.which === 91) {
+            if ((e.which == 17 || e.which === 91) && !this.multiSelectZoomPaused) {
+                this.multiSelectZoomPaused = true;
                 this._self.eventManager.dispatch(EventType.MULTI_SELECT_ENABLE, e);
                 e?.preventDefault?.();
                 this.zoomDisable();
             }
         });
         this._self.eventManager.addEventListener(EventType.KEYUP_SVG, (e: any) => {
+            if (!this.multiSelectZoomPaused) return;
+            this.multiSelectZoomPaused = false;
             this._self.eventManager.dispatch(EventType.MULTI_SELECT_DISABLE, e);
             e?.preventDefault?.();
             this.zoomEnable();
@@ -88,7 +100,6 @@ export default class ZoomManager {
     }
 
     zoomInit() {
-        console.info('zoomInit')
         this.zoomTypes.normal = d3Zoom()
             .scaleExtent([this._self.config.min_zoom, this._self.config.max_zoom])
             .on("end", this.zoomEnd(this))
@@ -104,12 +115,15 @@ export default class ZoomManager {
             .on("end", this.animatedFastZoomEnd(this))
             .on("zoom", this.zoomHandFastAnimated(this));
 
-        this._self.svg.node.call(this.zoomTypes.normal);
-        this._self.svg.node.on("dblclick.zoom", null);
+        // Rebinding must not silently resume zooming while multi-select
+        // (or anything else) has paused the interaction.
+        if (this.zoomInteractionActive) {
+            this._self.svg.node.call(this.zoomTypes.normal);
+            this._self.svg.node.on("dblclick.zoom", null);
+        }
     }
 
     zoomEnd(_self: this): any {
-        console.info('zoomEnd')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -122,7 +136,6 @@ export default class ZoomManager {
     }
 
     animatedZoomEnd(_self: this): any {
-        console.info('animatedZoomEnd')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -134,7 +147,6 @@ export default class ZoomManager {
     }
 
     animatedFastZoomEnd(_self: this): any {
-        console.info('animatedFastZoomEnd')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -146,7 +158,6 @@ export default class ZoomManager {
     }
 
     zoomHand(_self: this): any {
-        console.info('zoomHand')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -157,7 +168,6 @@ export default class ZoomManager {
     }
 
     zoomHandAnimated(_self: this): any {
-        console.info('zoomHandAnimated')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -169,7 +179,6 @@ export default class ZoomManager {
     }
 
     zoomHandFastAnimated(_self: this): any {
-        console.info('zoomHandFastAnimated')
         return function (event: any) {
             let x = event.transform.x;
             let y = event.transform.y;
@@ -181,7 +190,6 @@ export default class ZoomManager {
     }
 
     calculateZoomLevel(k: number) {
-        // console.info('calculateZoomLevel')
         if (!this.zoomLevels.BLOCK?.k || !this.zoomLevels.VENUE?.k) {
             return;
         }
@@ -205,10 +213,20 @@ export default class ZoomManager {
             _zoomLevel = ZoomLevel.VENUE;
         }
 
-        if (_zoomLevel !== this.zoomLevel) {
-            this.zoomLevel = _zoomLevel as ZoomLevel;
-            this.dispatchZoomEvent();
-        }
+        this.setZoomLevel(_zoomLevel);
+    }
+
+    /**
+     * The zoom level is the single source of truth for block rendering
+     * (masks, seat colors, info positions). A ZOOM_LEVEL_CHANGE event is
+     * dispatched only when the level actually changes, so listeners never
+     * re-render for a level that is already applied. An undetermined level
+     * keeps the current state instead of resetting it.
+     */
+    private setZoomLevel(level: ZoomLevel | null) {
+        if (!level || level === this.zoomLevel) return;
+        this.zoomLevel = level;
+        this.dispatchZoomEvent();
     }
 
     canvasScopeHandler() {
@@ -231,8 +249,14 @@ export default class ZoomManager {
 
     public calculateZoomLevels(blocks: Array<BlockModel> = this._self.data.getBlocks()): this {
 
-        // console.info('calculateZoomLevels')
         let _wm = this._self.windowManager;
+        // Reset the accumulated stage bounds: thresholds must be derived
+        // from the current data, never carried over from a previous
+        // dataset or window size.
+        _wm.stage = {
+            width: 0,
+            height: 0
+        };
         let _stage = _wm.stage;
 
         blocks.map((block: BlockModel) => {
@@ -337,6 +361,10 @@ export default class ZoomManager {
         if (this.activeBlocks.length) {
             let _activeBlock: BlockModel = this.activeBlocks[0].block.item;
             this.zoomLevels.BLOCK = _activeBlock.zoom_bbox;
+        } else {
+            // No block inside the viewport: drop the previous BLOCK
+            // threshold instead of keeping a stale result.
+            this.zoomLevels.BLOCK = null;
         }
 
         return this.activeBlocks;
@@ -361,8 +389,7 @@ export default class ZoomManager {
         } else {
             this._self.svg.node.interrupt().call(this.zoomTypes.normal.translateTo, x, y).call(this.zoomTypes.normal.scaleTo, k);
         }
-        this.zoomLevel = ZoomLevel.SEAT;
-        this.dispatchZoomEvent();
+        this.setZoomLevel(ZoomLevel.SEAT);
 
     }
 
@@ -384,18 +411,15 @@ export default class ZoomManager {
 
             // if (_block.zoom_bbox.k > this._self.config.max_zoom + gap || _block.zoom_bbox.k < this._self.config.max_zoom - gap) {
             if (_block.zoom_bbox.k === this._self.config.max_zoom) {
-                this.zoomLevel = ZoomLevel.SEAT;
+                this.setZoomLevel(ZoomLevel.SEAT);
             } else {
-                this.zoomLevel = ZoomLevel.BLOCK;
+                this.setZoomLevel(ZoomLevel.BLOCK);
             }
-
-            this.dispatchZoomEvent();
         }
     }
 
     public zoomToVenue(animation: boolean = true, fastAnimated: boolean = false) {
 
-        console.info('zoomToVenue')
         let x = this.zoomLevels.VENUE.x;
         let y = this.zoomLevels.VENUE.y;
         let k = this.zoomLevels.VENUE.k;
@@ -423,20 +447,25 @@ export default class ZoomManager {
             } else {
                 this._self.svg.node.interrupt().call(this.zoomTypes.normal.translateTo, x, y).call(this.zoomTypes.normal.scaleTo, k);
             }
-            this.zoomLevel = ZoomLevel.VENUE;
-            this.dispatchZoomEvent();
+            this.setZoomLevel(ZoomLevel.VENUE);
         }
 
     }
 
 
     public zoomEnable(): this {
+        // Idempotent: rebinding an already-active zoom would be a no-op
+        // anyway, and the stored transform keeps the current level.
+        if (this.zoomInteractionActive) return this;
+        this.zoomInteractionActive = true;
         this._self.svg.node.call(this.zoomTypes.normal);
-        //this._self.svg.node.on('.zoom', null);
+        this._self.svg.node.on("dblclick.zoom", null);
         return this;
     }
 
     public zoomDisable(): this {
+        if (!this.zoomInteractionActive) return this;
+        this.zoomInteractionActive = false;
         this._self.svg.node.on('.zoom', null);
         return this;
     }

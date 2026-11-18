@@ -19,6 +19,7 @@
   "scripts": {
     "start:dev": "rollup --config --watch --bundleConfigAsCjs",
     "build": "rollup -c --environment PRODUCTION --bundleConfigAsCjs",
+    "test": "vitest run",
     "docs:dev": "cd docs-site && npm run start",
     "docs:build": "cd docs-site && npm run build",
     "docs:serve": "cd docs-site && npm run serve"
@@ -86,7 +87,9 @@
     "rxjs": "^6.3.3",
     "sass": "^1.69.5",
     "tslib": "^2.8.1",
-    "typescript": "^4.7.4"
+    "typescript": "^4.7.4",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.1"
   },
   "peerDependencies": {
     "@angular/common": ">=14.0.0",

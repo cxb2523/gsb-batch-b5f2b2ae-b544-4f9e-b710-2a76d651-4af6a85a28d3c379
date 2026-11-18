@@ -45,21 +45,7 @@ export default class Block extends SvgBase {
         this.attr("opacity", 0);
 
         this.global.eventManager.addEventListener(EventType.ZOOM_LEVEL_CHANGE, (levelObject: any) => {
-            if (levelObject.level === ZoomLevel.VENUE) {
-                this.mask.blockLevelMask.show();
-                this.mask.seatLevelMask.show();
-                this.seats.resetSeatsColors(false);
-                this.infosToCenter();
-            } else if (levelObject.level === ZoomLevel.BLOCK) {
-                this.mask.blockLevelMask.hide();
-                this.mask.seatLevelMask.show();
-                this.infosToTop();
-            } else if (levelObject.level === ZoomLevel.SEAT) {
-                this.mask.blockLevelMask.hide();
-                this.mask.seatLevelMask.hide();
-                this.seats.resetSeatsColors(false);
-                this.infosToTop();
-            }
+            this.applyZoomLevel(levelObject.level);
         });
 
         this.global.eventManager.addEventListener(EventType.MULTI_SELECT_ENABLE, () => {
@@ -161,7 +147,9 @@ export default class Block extends SvgBase {
         this.updateChilds();
 
 
-        this.infosToCenter();
+        // Apply the current zoom level so a (re)rendered block never
+        // stays in a state left over from a previous level.
+        this.applyZoomLevel(this.global.zoomManager.zoomLevel);
 
 
         this.node.interrupt().transition().duration(this.global.config.animation_speed).attr("opacity", 1);
@@ -173,6 +161,31 @@ export default class Block extends SvgBase {
 
 
         return this;
+    }
+
+    /**
+     * Apply a zoom level to this block: masks, seat colors and info
+     * position all follow the level. Called from the ZOOM_LEVEL_CHANGE
+     * listener (only fired on real level changes) and after (re)rendering
+     * so the block matches the current level.
+     */
+    public applyZoomLevel(level: ZoomLevel) {
+        if (!this.mask || !this.mask.blockLevelMask || !this.seats || !this.info) return;
+        if (level === ZoomLevel.VENUE) {
+            this.mask.blockLevelMask.show();
+            this.mask.seatLevelMask.show();
+            this.seats.resetSeatsColors(false);
+            this.infosToCenter();
+        } else if (level === ZoomLevel.BLOCK) {
+            this.mask.blockLevelMask.hide();
+            this.mask.seatLevelMask.show();
+            this.infosToTop();
+        } else if (level === ZoomLevel.SEAT) {
+            this.mask.blockLevelMask.hide();
+            this.mask.seatLevelMask.hide();
+            this.seats.resetSeatsColors(false);
+            this.infosToTop();
+        }
     }
 
     public infosToTop() {
