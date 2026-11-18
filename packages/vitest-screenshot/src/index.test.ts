@@ -1,9 +1,10 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import sharp from 'sharp';
 import { type Comparator, extendMatchers, pixelmatchComparator, type RgbaImage } from './index.js';
 import { distortion, metricsComparator, ssim } from './metrics.js';
 import { resolveScreenshotUpdateState } from './update-policy.js';
@@ -366,13 +367,66 @@ it('compares against in-memory references and names diff files after the test', 
   await expect(expect(red).toMatchScreenshot(solid(2, 2, [0, 0, 0, 255]), { baselineDir: dir })).rejects.toThrow(
     /4 pixels \(100.000%\) differ/,
   );
-  await expect(expect(red).toMatchScreenshot(solid(1, 2, [0, 0, 0, 255]), { baselineDir: dir })).rejects.toThrow(
-    /size mismatch: baseline 1x2, actual 2x2/,
-  );
   expect(readdirSync(dir).toSorted()).toEqual([
     'compares_against_in-memory_references_and_names_diff_files_after_the_test.actual.png',
     'compares_against_in-memory_references_and_names_diff_files_after_the_test.diff.png',
   ]);
+});
+
+it('reports a size mismatch with an in-memory baseline and writes only the actual image', async () => {
+  await expect(expect(red).toMatchScreenshot(solid(1, 2, [0, 0, 0, 255]), { baselineDir: dir })).rejects.toThrow(
+    /size mismatch: baseline 1x2, actual 2x2/,
+  );
+  const files = readdirSync(dir);
+  expect(files).toHaveLength(1);
+  expect(files[0]).toMatch(/^.*\.actual\.png$/);
+  expect(files.some((name) => name.endsWith('.diff.png'))).toBe(false);
+});
+
+it('reports a size mismatch against a file baseline and writes actual without a diff', async () => {
+  const wide = solid(4, 2, [10, 20, 30, 255]);
+  await expect(wide).toMatchScreenshot('size.png', { baselineDir: dir, update: true });
+  const tall: RgbaImage = { width: 4, height: 3, data: new Uint8Array(4 * 3 * 4) };
+  await expect(expect(tall).toMatchScreenshot('size.png', { baselineDir: dir })).rejects.toThrow(
+    /size\.png: size mismatch: baseline 4x2, actual 4x3/,
+  );
+  expect(readdirSync(dir).toSorted()).toEqual(['size.actual.png', 'size.png']);
+  const actual = await sharp(join(dir, 'size.actual.png')).metadata();
+  expect(actual).toMatchObject({ width: 4, height: 3 });
+});
+
+describe('sharp pipeline cleanup on failure paths', () => {
+  // All sharp instances (including the ones the matcher builds internally) share this prototype.
+  const sharpPrototype = Object.getPrototypeOf(
+    sharp({ create: { width: 1, height: 1, channels: 4, background: '#000' } }),
+  ) as { destroy: () => unknown };
+  let destroy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    destroy = vi.spyOn(sharpPrototype, 'destroy');
+  });
+  afterEach(() => {
+    destroy.mockRestore();
+  });
+
+  it('releases the decode pipeline when a baseline cannot be read', async () => {
+    writeFileSync(join(dir, 'broken.png'), 'not a png');
+    await expect(expect(red).toMatchScreenshot('broken.png', { baselineDir: dir })).rejects.toThrow();
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it('releases the encode pipeline when writing a baseline fails', async () => {
+    mkdirSync(join(dir, 'bad.png')); // toFile() onto an existing directory rejects asynchronously
+    await expect(expect(red).toMatchScreenshot('bad.png', { baselineDir: dir, update: true })).rejects.toThrow();
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it('releases the actual-image pipeline on a size-mismatch write failure and writes no diff', async () => {
+    await expect(solid(1, 1, [0, 0, 0, 255])).toMatchScreenshot('m.png', { baselineDir: dir, update: true });
+    mkdirSync(join(dir, 'm.actual.png'));
+    await expect(expect(red).toMatchScreenshot('m.png', { baselineDir: dir })).rejects.toThrow();
+    expect(destroy).toHaveBeenCalled();
+    expect(readdirSync(dir).toSorted()).toEqual(['m.actual.png', 'm.png']);
+  });
 });
 
 it('reads pixels from canvas-like and image-like sources', async () => {

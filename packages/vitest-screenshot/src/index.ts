@@ -132,19 +132,30 @@ const raw = ({ width, height, data }: RgbaImage) => sharp(data, { raw: { width, 
 /** Decodes any format sharp reads (png, jpg, gif, webp, ...) into RGBA8. */
 const readImage = async (file: string): Promise<RgbaImage> => {
   // Decode from a buffer: sharp(path) leaves the handle in libvips' cache, which locks the file on Windows.
-  const { data, info } = await sharp(await readFile(file))
+  const pipeline = sharp(await readFile(file))
     .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-  return { width: info.width, height: info.height, data };
+    .raw();
+  try {
+    const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
+    return { width: info.width, height: info.height, data };
+  } catch (error) {
+    // libvips keeps the input buffer until the pipeline is destroyed; free it on the failure path.
+    pipeline.destroy();
+    throw error;
+  }
 };
 
 /** Encodes by file extension; lossy formats (jpg, webp) alter pixels on write. */
-const writeImage = (file: string, image: RgbaImage) => {
+const writeImage = async (file: string, image: RgbaImage): Promise<void> => {
   mkdirSync(dirname(file), { recursive: true });
-  return raw(image)
-    .toFormat(extname(file).slice(1) as keyof FormatEnum)
-    .toFile(file);
+  const pipeline = raw(image).toFormat(extname(file).slice(1) as keyof FormatEnum);
+  try {
+    await pipeline.toFile(file);
+  } catch (error) {
+    // A failed encode/write would otherwise hold the raw pixel buffer in libvips until GC.
+    pipeline.destroy();
+    throw error;
+  }
 };
 
 const toRgba = async (source: ImageSource): Promise<RgbaImage> => {
@@ -216,7 +227,10 @@ export function extendMatchers(config: ScreenshotConfig = {}): void {
         baseline = await toRgba(reference);
       }
       const label = file ? basename(file) : this.currentTestName!;
+      const stem = join(dir, file ? basename(file, extname(file)) : label.replace(/[^\w-]+/g, '_'));
       if (baseline.width !== actual.width || baseline.height !== actual.height) {
+        // A diff needs equal dimensions; write the actual image for inspection but never a size-inconsistent diff.
+        await writeImage(`${stem}.actual.png`, actual);
         return result(
           false,
           `${label}: size mismatch: baseline ${baseline.width}x${baseline.height}, actual ${actual.width}x${actual.height}`,
@@ -231,7 +245,6 @@ export function extendMatchers(config: ScreenshotConfig = {}): void {
         ...options.comparatorOptions,
         createDiff: true,
       });
-      const stem = join(dir, file ? basename(file, extname(file)) : label.replace(/[^\w-]+/g, '_'));
       const seeDiff = !pass && diff ? `; see ${stem}.diff.png` : '';
       if (!pass)
         await Promise.all([writeImage(`${stem}.actual.png`, actual), diff && writeImage(`${stem}.diff.png`, diff)]);

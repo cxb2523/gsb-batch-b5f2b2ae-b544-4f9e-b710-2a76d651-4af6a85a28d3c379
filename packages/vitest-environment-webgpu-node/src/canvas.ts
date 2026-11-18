@@ -66,20 +66,16 @@ export class HeadlessCanvasContext {
    * is reconfigured or the canvas is resized. Throws if `configure()` has not been called.
    */
   getCurrentTexture(): GPUTexture {
-    const config = this.#config;
-    if (!config) throw new Error('getCurrentTexture() called before configure()');
-    const { width, height } = this.canvas;
-    if (this.#texture && (this.#texture.width !== width || this.#texture.height !== height)) this.#drop();
-    this.#texture ??= config.device.createTexture({
-      size: [width, height],
-      format: config.format,
-      usage: (config.usage ?? RENDER_ATTACHMENT) | RENDER_ATTACHMENT | COPY_SRC,
-      viewFormats: config.viewFormats,
-    });
-    return this.#texture;
+    return this.#ensureTexture();
   }
 
-  /** Copies the current texture to the CPU. BGRA formats are swizzled to RGBA. */
+  /**
+   * Copies the current texture to the CPU at the canvas's current size. BGRA formats are swizzled to RGBA.
+   *
+   * Width and height are taken from the canvas, not the cached texture: if the canvas was resized after the last
+   * frame, the stale texture is destroyed and a new one is created before the copy, so the readback always matches
+   * `canvas.width`/`canvas.height`. The staging buffer is unmapped and destroyed on every path.
+   */
   async readPixels(): Promise<RgbaImage> {
     const config = this.#config;
     if (!config) throw new Error('readPixels() called before configure()');
@@ -89,8 +85,8 @@ export class HeadlessCanvasContext {
         `readPixels() does not support canvas format "${format}"; supported formats are rgba8unorm, rgba8unorm-srgb, bgra8unorm, and bgra8unorm-srgb`,
       );
     }
-    const texture = this.getCurrentTexture();
-    const { width, height } = texture;
+    const { width, height } = this.canvas;
+    const texture = this.#ensureTexture();
     const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
     const buffer = device.createBuffer({ size: bytesPerRow * height, usage: MAP_READ | COPY_DST });
     let mapped = false;
@@ -120,6 +116,24 @@ export class HeadlessCanvasContext {
   #drop(): void {
     this.#texture?.destroy();
     this.#texture = undefined;
+  }
+
+  /**
+   * Returns a texture matching the canvas's current size, destroying and recreating it after a resize.
+   * Centralizing this keeps `getCurrentTexture()` and `readPixels()` from ever handing back a stale texture.
+   */
+  #ensureTexture(): GPUTexture {
+    const config = this.#config;
+    if (!config) throw new Error('getCurrentTexture() called before configure()');
+    const { width, height } = this.canvas;
+    if (this.#texture && (this.#texture.width !== width || this.#texture.height !== height)) this.#drop();
+    this.#texture ??= config.device.createTexture({
+      size: [width, height],
+      format: config.format,
+      usage: (config.usage ?? RENDER_ATTACHMENT) | RENDER_ATTACHMENT | COPY_SRC,
+      viewFormats: config.viewFormats,
+    });
+    return this.#texture;
   }
 }
 
