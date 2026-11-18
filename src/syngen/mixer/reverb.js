@@ -7,31 +7,37 @@
  */
 syngen.mixer.reverb = (() => {
   const context = syngen.context(),
-    delay = context.createDelay(),
-    input = context.createGain(),
     output = syngen.mixer.createBus(),
     pubsub = syngen.tool.pubsub.create()
 
   let active = true,
-    convolver = context.createConvolver(),
+    convolver,
+    delay,
     highpass,
+    impulse = syngen.buffer.impulse({
+      buffer: syngen.buffer.whiteNoise({
+        channels: 2,
+        duration: 1,
+      }),
+      power: 4,
+    }),
+    input,
     lowpass
 
-  convolver.buffer = syngen.buffer.impulse({
-    buffer: syngen.buffer.whiteNoise({
-      channels: 2,
-      duration: 1,
-    }),
-    power: 4,
-  })
+  buildGraph()
 
-  delay.delayTime.value = 1/64
+  function buildGraph({
+    delayTime = 1/64,
+    highpassFrequency = syngen.const.minFrequency,
+    lowpassFrequency = syngen.const.maxFrequency,
+    preGain = 1,
+  } = {}) {
+    input = context.createGain()
+    input.gain.value = preGain
 
-  input.connect(delay)
-  createFilters()
-  convolver.connect(output)
+    delay = context.createDelay()
+    delay.delayTime.value = delayTime
 
-  function createFilters(highpassFrequency = syngen.const.minFrequency, lowpassFrequency = syngen.const.maxFrequency) {
     highpass = context.createBiquadFilter()
     highpass.type = 'highpass'
     highpass.frequency.value = highpassFrequency
@@ -40,17 +46,22 @@ syngen.mixer.reverb = (() => {
     lowpass.type = 'lowpass'
     lowpass.frequency.value = lowpassFrequency
 
+    convolver = context.createConvolver()
+    convolver.buffer = impulse
+
+    input.connect(delay)
     delay.connect(highpass)
     highpass.connect(lowpass)
     lowpass.connect(convolver)
+    convolver.connect(output)
   }
 
-  function destroyFilters() {
+  function destroyGraph() {
+    input.disconnect()
     delay.disconnect()
-    lowpass.disconnect()
-    lowpass = null
     highpass.disconnect()
-    highpass = null
+    lowpass.disconnect()
+    convolver.disconnect()
   }
 
   return pubsub.decorate({
@@ -69,6 +80,13 @@ syngen.mixer.reverb = (() => {
      * @namespace syngen.mixer.reverb.gainModel
      */
     gainModel: {},
+    /**
+     * Returns the input `GainNode`.
+     * Buses created before a {@link syngen.mixer.reverb.rebuildFilters|rebuild} must reconnect to this node.
+     * @memberof syngen.mixer.reverb
+     * @returns {GainNode}
+     */
+    input: () => input,
     /**
      * Returns whether the processing is active.
      * @memberof syngen.mixer.reverb
@@ -107,18 +125,40 @@ syngen.mixer.reverb = (() => {
     /**
      * Occasionally the filters can enter an unstable or bad state.
      * This provides a solution for replacing them with stable filters.
+     * The entire graph is rebuilt with its current state, so buses connected to a previous input must reconnect to the new {@link syngen.mixer.reverb.input|input}.
+     * @fires syngen.mixer.reverb#event:rebuild
      * @memberof syngen.mixer.reverb
      * @see syngen.mixer.rebuildFilters
      */
     rebuildFilters: function () {
-      const highpassFrequency = highpass.frequency.value,
-        lowpassFrequency = lowpass.frequency.value
+      const delayTime = delay.delayTime.value,
+        highpassFrequency = highpass.frequency.value,
+        lowpassFrequency = lowpass.frequency.value,
+        preGain = input.gain.value
 
-      destroyFilters()
-      createFilters(highpassFrequency, lowpassFrequency)
+      destroyGraph()
 
+      buildGraph({
+        delayTime,
+        highpassFrequency,
+        lowpassFrequency,
+        preGain,
+      })
+
+      if (!active) {
+        input.disconnect(delay)
+      }
+
+      this.param.delay = delay.delayTime
+      this.param.preGain = input.gain
       this.param.highpass.frequency = highpass.frequency
       this.param.lowpass.frequency = lowpass.frequency
+
+      /**
+       * Fired whenever the graph is rebuilt.
+       * @event syngen.mixer.reverb#event:rebuild
+       */
+      pubsub.emit('rebuild')
 
       return this
     },
@@ -162,15 +202,16 @@ syngen.mixer.reverb = (() => {
      * @param {BufferSource} buffer
      */
     setImpulse: function (buffer) {
-      input.disconnect()
+      impulse = buffer
+
+      // The previous convolver remains connected to the output so its tail fades out
+      lowpass.disconnect()
 
       convolver = context.createConvolver()
-      convolver.buffer = buffer
-      convolver.connect(output)
+      convolver.buffer = impulse
 
-      if (active) {
-        input.connect(delay)
-      }
+      lowpass.connect(convolver)
+      convolver.connect(output)
 
       return this
     },

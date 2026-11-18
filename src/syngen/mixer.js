@@ -128,7 +128,7 @@ syngen.mixer = (() => {
       const highpassFrequency = mainHighpass.frequency.value,
         lowpassFrequency = mainLowpass.frequency.value
 
-      this.auxiliary.reverb.rebuildFilters()
+      syngen.mixer.reverb.rebuildFilters()
 
       destroyFilters()
       createFilters(highpassFrequency, lowpassFrequency)

@@ -48,6 +48,9 @@ syngen.mixer.reverb.send.prototype = {
     this.onSendDeactivate = this.onSendDeactivate.bind(this)
     syngen.mixer.reverb.on('deactivate', this.onSendDeactivate)
 
+    this.onSendRebuild = this.onSendRebuild.bind(this)
+    syngen.mixer.reverb.on('rebuild', this.onSendRebuild)
+
     if (syngen.mixer.reverb.isActive()) {
       this.onSendActivate()
     } else {
@@ -70,6 +73,7 @@ syngen.mixer.reverb.send.prototype = {
   destroy: function () {
     syngen.mixer.reverb.off('activate', this.onSendActivate)
     syngen.mixer.reverb.off('deactivate', this.onSendDeactivate)
+    syngen.mixer.reverb.off('rebuild', this.onSendRebuild)
     this.send.disconnect()
     return this
   },
@@ -91,6 +95,8 @@ syngen.mixer.reverb.send.prototype = {
     this.update(this.relative)
     this.input.connect(this.delay)
     this.delay.connect(this.send)
+    this.send.disconnect()
+    this.send.connect(syngen.mixer.reverb.input())
     return this
   },
   /**
@@ -102,6 +108,23 @@ syngen.mixer.reverb.send.prototype = {
   onSendDeactivate: function () {
     this.input.disconnect()
     this.delay.disconnect()
+    return this
+  },
+  /**
+   * Handles whenever the auxiliary send rebuilds its graph.
+   * Reconnects to the new reverb input, unless processing is inactive.
+   * @instance
+   * @listens syngen.mixer.reverb#event:rebuild
+   * @private
+   */
+  onSendRebuild: function () {
+    if (!syngen.mixer.reverb.isActive()) {
+      return this
+    }
+
+    this.send.disconnect()
+    this.send.connect(syngen.mixer.reverb.input())
+
     return this
   },
   /**

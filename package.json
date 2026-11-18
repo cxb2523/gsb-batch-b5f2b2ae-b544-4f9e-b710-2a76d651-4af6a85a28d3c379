@@ -6,6 +6,9 @@
   "main": "dist/syngen.js",
   "bugs": "https://github.com/nicross/syngen/issues",
   "repository": "git://github.com/nicross/syngen.git",
+  "scripts": {
+    "test": "node test/run.js"
+  },
   "devDependencies": {
     "del": "^8.0.1",
     "gulp": "^5.0.1",
