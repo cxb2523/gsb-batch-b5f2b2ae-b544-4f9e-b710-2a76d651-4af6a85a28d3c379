@@ -139,6 +139,12 @@ export interface Voice {
   src: AudioBufferSourceNode;
   gain: GainNode;
   at: number;
+  /* Set once the voice has been hushed or has ended, so a second hush — the
+     previous gesture interrupted again before the first ramp finishes — skips
+     it. Stopping an AudioBufferSourceNode twice throws InvalidStateError, which
+     would abort the loop and leave the remaining voices of the old gesture
+     ringing over the new one. */
+  dead: boolean;
 }
 
 /* One noise buffer per context, shared by every voice. White noise through a
@@ -223,9 +229,10 @@ function fire(ctx: BaseAudioContext, bus: AudioNode, e: Event, live: Voice[]) {
   src.start(e.at, rand(0, 1.7), 0.12);
   src.stop(end + 0.006);
 
-  const voice = { src, gain, at: e.at };
+  const voice = { src, gain, at: e.at, dead: false };
   live.push(voice);
   src.onended = () => {
+    voice.dead = true;
     src.disconnect();
     high.disconnect();
     low.disconnect();
@@ -387,19 +394,38 @@ function lock(ctx: BaseAudioContext, bus: AudioNode, at: number, live: Voice[]) 
 }
 
 /* Interrupting a gesture mid-flight. Voices that haven't started yet are
-   simply told to stop at their own start time, so they never play; voices in
-   flight are held where they are and ramped out over a few milliseconds. No
-   instant value assignment anywhere, so no pop. */
+   told to stop at their own start time, so they never play; voices in flight
+   are held where they are and ramped out over a few milliseconds. No instant
+   value assignment anywhere, so no pop.
+
+   Safe to call again before the first call's ramps have run out — rapid
+   re-interrupts reach the same voices — and safe to call once the context has
+   begun closing. Already-dead voices are skipped: stopping a source twice
+   throws InvalidStateError, which would abort the loop and leave the rest of
+   the old gesture ringing over the new one. */
 export function hush(ctx: BaseAudioContext, live: Voice[]) {
+  if (ctx.state === "closed") return;
   const now = ctx.currentTime;
   for (const v of live) {
-    if (v.at > now) {
-      v.src.stop(v.at);
-    } else {
-      v.gain.gain.cancelScheduledValues(now);
-      v.gain.gain.setValueAtTime(v.gain.gain.value, now);
-      v.gain.gain.linearRampToValueAtTime(0, now + 0.03);
-      v.src.stop(now + 0.05);
+    if (v.dead) continue;
+    v.dead = true;
+    try {
+      if (v.at > now) {
+        /* Not due yet: cancel it before it ever makes a sound. */
+        v.src.stop(v.at);
+      } else {
+        v.gain.gain.cancelScheduledValues(now);
+        v.gain.gain.setValueAtTime(v.gain.gain.value, now);
+        v.gain.gain.linearRampToValueAtTime(0, now + 0.03);
+        v.src.stop(now + 0.05);
+      }
+    } catch {
+      /* A teardown racing this hush may already have stopped the source; its
+         gain is disconnected then, so it is silent either way. */
     }
   }
+  /* Every tracked voice has been told to stop and the onended callbacks will
+     drop their own entries. Clearing now means a teardown or a later hush can
+     never reach a stale voice through this list. */
+  live.length = 0;
 }

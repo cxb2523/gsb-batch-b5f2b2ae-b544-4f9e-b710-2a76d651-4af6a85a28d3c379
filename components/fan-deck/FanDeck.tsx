@@ -300,20 +300,61 @@ export function FanDeck() {
     return () => clearInterval(id);
   }, [driftRate]);
   const [swing, setSwing] = useState(TURN);
-  const beat = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /* One run id per open/close action. Every scheduled callback captures the id
+     it was created with and bails out when a newer action has started, so an
+     interrupted action can never move stage or swing or trigger another sound.
+     The three slots hold exactly that action's timers — starting a new action
+     clears all of them first, which leaves only the last action's timers alive. */
+  const run = useRef(0);
+  const timers = useRef<{
+    align: ReturnType<typeof setTimeout> | null;
+    turn: ReturnType<typeof setTimeout> | null;
+    end: ReturnType<typeof setTimeout> | null;
+  }>({ align: null, turn: null, end: null });
+  const mounted = useRef(true);
   const open = stage === "open";
 
+  function clearTimers() {
+    const slots = timers.current;
+    if (slots.align) clearTimeout(slots.align);
+    if (slots.turn) clearTimeout(slots.turn);
+    if (slots.end) clearTimeout(slots.end);
+    slots.align = null;
+    slots.turn = null;
+    slots.end = null;
+  }
+
   /* ── Sound ─────────────────────────────────────────────
-     The context is created on the first gesture that can legitimately make
-     sound and never before — browsers refuse audio ahead of a gesture, and a
-     page that loads shut has nothing to say anyway. One master gain is the
-     volume dial; `live` is every voice currently scheduled, so an interrupted
-     gesture can be hushed without a click. */
+     The context is created only inside a real gesture that can legitimately
+     make sound and never before — browsers refuse audio ahead of a gesture, and
+     a page that loads shut has nothing to say anyway. One master gain is the
+     volume dial, always built at the volume currently dialled; `live` is every
+     voice currently scheduled, so an interrupted gesture can be hushed without
+     a click. Toggling the sound switch off tears the whole graph down, so a
+     stale context or bus can never survive to be reused at an old volume. */
   const audio = useRef<{ ctx: AudioContext; bus: GainNode } | null>(null);
   const live = useRef<Voice[]>([]);
 
+  function tearDownAudio() {
+    /* Stop everything first — scheduled grains included — then release the
+       context and its bus. The next gesture rebuilds both from the current
+       dials, so an old volume or a hung context can't carry over. */
+    const current = audio.current;
+    if (!current) return;
+    hush(current.ctx, live.current);
+    current.bus.disconnect();
+    audio.current = null;
+    void current.ctx.close().catch(() => {
+      /* already closed: nothing left to release */
+    });
+  }
+
+  /* Builds (or resumes) the live graph. Returns null when there is nothing to
+     play with: the switch is off, the tab is hidden, or the component has
+     unmounted. Called only from gesture paths and their scheduled callbacks, so
+     the first sound still originates in a user gesture. */
   function speaker() {
-    if (!sound.on || document.hidden) return null;
+    if (!mounted.current || !sound.on || document.hidden) return null;
     if (!audio.current) {
       const ctx = new AudioContext();
       const bus = new GainNode(ctx, { gain: sound.volume });
@@ -346,6 +387,9 @@ export function FanDeck() {
     );
   }
 
+  /* Silence the previous action before a new one starts: grains not yet due
+     never play, grains in flight ramp out in thirty milliseconds. No instant
+     gain step, so no pop; nothing from the old action can sound afterwards. */
   function quiet() {
     if (audio.current) hush(audio.current.ctx, live.current);
   }
@@ -360,34 +404,55 @@ export function FanDeck() {
     };
   }, []);
 
+  /* Development only: lets the same scheduler be rendered into an
+     OfflineAudioContext from a test harness, so the sound can be measured
+     — peak level, click detection, timing — rather than guessed at. */
   useEffect(() => {
-    /* Development only: lets the same scheduler be rendered into an
-       OfflineAudioContext from a test harness, so the sound can be measured
-       — peak level, click detection, timing — rather than guessed at. */
     if (DEV) {
       (window as unknown as { __fanDeckSound?: unknown }).__fanDeckSound = {
         schedule,
         hush,
       };
     }
+  }, []);
+
+  /* The sound switch. Switching off stops anything still sounding and releases
+     the context and its bus; switching back builds them again at whatever the
+     volume dial now reads — nothing is reused — and the first actual sound
+     still waits for the next user gesture, which is the only place speaker()
+     is ever called from. */
+  useEffect(() => {
+    if (!sound.on) tearDownAudio();
+  }, [sound.on]);
+
+  /* Unmount: no timer from a dead component may advance stage or swing, and
+     the audio graph has to be closed rather than left running. */
+  useEffect(() => {
+    mounted.current = true;
     return () => {
-      if (beat.current) clearTimeout(beat.current);
-      void audio.current?.ctx.close();
+      mounted.current = false;
+      clearTimers();
+      tearDownAudio();
     };
   }, []);
 
   function fanOpen() {
-    if (beat.current) clearTimeout(beat.current);
+    /* A new action takes over: every timer from the previous one is dropped
+       before it can fire, and its scheduled paper is silenced. */
+    clearTimers();
     quiet();
+    const id = ++run.current;
     /* First the deck slides into the open position while the copy fades —
        still shut, still upright — so the swing that follows happens where the
        fan is going to be. */
     setStage("align");
-    beat.current = setTimeout(() => {
+    timers.current.align = setTimeout(() => {
+      if (run.current !== id) return;
       play("turn");
       setSwing(TURN);
       setStage("flat");
-      beat.current = setTimeout(() => {
+      timers.current.turn = setTimeout(() => {
+        if (run.current !== id) return;
         /* The riffle is scheduled here, at the moment the sweep actually
            starts, rather than at the click with a pre-delay — React's timer
            and the audio clock would drift apart across the turn. */
@@ -396,24 +461,32 @@ export function FanDeck() {
         setStage("open");
         /* Once the sweep has landed, shorten the swing so the dials feel
            direct rather than dragging a one-second transition behind them. */
-        beat.current = setTimeout(() => setSwing(SETTLE), SPREAD);
+        timers.current.end = setTimeout(() => {
+          if (run.current !== id) return;
+          setSwing(SETTLE);
+        }, SPREAD);
       }, TURN);
     }, ALIGN);
   }
 
   function fanShut() {
-    if (beat.current) clearTimeout(beat.current);
+    clearTimers();
     quiet();
+    const id = ++run.current;
     play("close");
     const sweep = SPREAD * CLOSE;
     const turn = TURN * CLOSE;
     setSwing(sweep);
     setStage("flat");
-    beat.current = setTimeout(() => {
+    timers.current.align = setTimeout(() => {
+      if (run.current !== id) return;
       setSwing(turn);
       setStage("align");
       /* Upright again; now slide home and let the copy back in. */
-      beat.current = setTimeout(() => setStage("shut"), turn);
+      timers.current.turn = setTimeout(() => {
+        if (run.current !== id) return;
+        setStage("shut");
+      }, turn);
     }, sweep);
   }
 
@@ -601,8 +674,11 @@ export function FanDeck() {
           /* pointerdown is already a user gesture, so the context can be built
              here — a few dozen milliseconds before the click lands — instead
              of inside the click, where its creation would delay the first
-             sound. */
-          onPointerDown={() => void speaker()}
+             sound. With the switch off this builds nothing, and the graph is
+             still created inside this gesture path, never on load. */
+          onPointerDown={() => {
+            speaker();
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
