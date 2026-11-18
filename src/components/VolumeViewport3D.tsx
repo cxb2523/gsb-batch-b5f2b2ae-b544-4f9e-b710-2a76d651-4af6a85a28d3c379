@@ -6,12 +6,13 @@ import {
   Ratio,
   RotateCcw,
 } from 'lucide-react';
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react';
+import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from '../i18n';
 import {
   createThreePreview,
   type ThreePreviewInstance,
 } from '../lib/volume/three-preview';
+import { PreviewMountController } from '../lib/volume/three-preview/mount-controller';
 import type { PreparedVolumeFor3D, VolumeCursor } from '../types';
 import { Button } from './Button';
 
@@ -70,76 +71,39 @@ export function VolumeViewport3D({
       return undefined;
     }
 
-    let cleanup: () => void = () => {};
-    let cancelled = false;
-    let mounted = false;
-    let frame = 0;
-    let retryTimer = 0;
-    let retryCount = 0;
-    let resizeObserver: ResizeObserver | null = null;
     setError(false);
     setPreviewReady(false);
 
-    const scheduleRetry = () => {
-      if (cancelled || mounted || retryCount >= 4) return;
-      retryCount += 1;
-      window.clearTimeout(retryTimer);
-      retryTimer = window.setTimeout(() => {
-        mount();
-        if (!mounted) scheduleRetry();
-      }, 120 * retryCount);
-    };
-
-    const mount = () => {
-      if (cancelled || mounted) return;
-      if (host.clientWidth < 32 || host.clientHeight < 32) return;
-      mounted = true;
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-
-      void createThreePreview(host, volume)
-        .then((instance) => {
-          if (cancelled) {
-            instance.dispose();
-            return;
-          }
-
-          instanceRef.current = instance;
+    // A fresh controller per effect run means retry counters and error
+    // states never carry over from a previous volume.
+    const controller = new PreviewMountController({
+      host,
+      volume,
+      createPreview: (targetHost, targetVolume, { signal }) =>
+        createThreePreview(targetHost, targetVolume, { signal }),
+      onStateChange: (state) => {
+        setPreviewReady(state === 'ready');
+        setError(state === 'error');
+      },
+      onInstance: (instance) => {
+        instanceRef.current = instance;
+        if (instance) {
+          // Apply the values current at mount completion rather than any
+          // captured at mount start; the dedicated props effects only re-run
+          // when their own dependency changes and would miss a remount.
           instance.focusCursor(cursorRef.current);
           instance.setPlanesVisible(planesVisibleRef.current);
-          cleanup = instance.dispose;
-          setPreviewReady(true);
-        })
-        .catch((_renderError: unknown) => {
-          if (cancelled) return;
-          mounted = false;
-          if (retryCount < 4) {
-            scheduleRetry();
-            return;
-          }
-          setError(true);
-          setPreviewReady(false);
-        });
-    };
-
-    frame = window.requestAnimationFrame(() => {
-      mount();
-      if (mounted || cancelled) return;
-
-      resizeObserver = new ResizeObserver(() => {
-        mount();
-      });
-      resizeObserver.observe(host);
-      scheduleRetry();
+        }
+      },
     });
+    controller.start();
 
     return () => {
-      cancelled = true;
-      window.cancelAnimationFrame(frame);
-      window.clearTimeout(retryTimer);
-      resizeObserver?.disconnect();
+      // Abort cancels the in-flight rAF, retry timer, ResizeObserver and
+      // matchMedia listener, aborts the async preview build, and disposes the
+      // live renderer and every GPU resource it owns.
+      controller.abort();
       instanceRef.current = null;
-      cleanup();
     };
   }, [volume]);
 

@@ -184,6 +184,23 @@ export function buildCursorPlanes(
     root.add(object);
   }
 
+  const geometries = [
+    xyGeometry,
+    xzGeometry,
+    yzGeometry,
+    xyEdges.geometry,
+    xzEdges.geometry,
+    yzEdges.geometry,
+    xIntersection.geometry,
+    yIntersection.geometry,
+    zIntersection.geometry,
+  ];
+  const allMaterials = [
+    ...materials,
+    ...lineMaterials,
+    ...intersectionMaterials,
+  ];
+
   const update = (target: Vector3) => {
     xyPlane.position.set(center.x, center.y, target.z);
     xzPlane.position.set(center.x, target.y, center.z);
@@ -196,21 +213,14 @@ export function buildCursorPlanes(
     zIntersection.position.set(target.x, target.y, center.z);
   };
 
+  let disposed = false;
   const dispose = () => {
-    xyGeometry.dispose();
-    xzGeometry.dispose();
-    yzGeometry.dispose();
-    xyEdges.geometry.dispose();
-    xzEdges.geometry.dispose();
-    yzEdges.geometry.dispose();
-    xIntersection.geometry.dispose();
-    yIntersection.geometry.dispose();
-    zIntersection.geometry.dispose();
-    for (const material of [
-      ...materials,
-      ...lineMaterials,
-      ...intersectionMaterials,
-    ]) {
+    if (disposed) return;
+    disposed = true;
+    for (const geometry of geometries) {
+      geometry.dispose();
+    }
+    for (const material of allMaterials) {
       material.dispose();
     }
   };

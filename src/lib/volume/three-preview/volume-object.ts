@@ -13,7 +13,6 @@ import type {
   VolumeShaderModule,
   VolumeShaderUniforms,
 } from '../types';
-
 export function buildTexture(
   three: ThreeModule,
   volume: PreparedVolumeFor3D,
@@ -111,4 +110,21 @@ export function buildVolumeMesh(
   );
 
   return new three.Mesh(geometry, material);
+}
+
+/**
+ * Releases every GPU resource owned by the volume object. Each helper is
+ * idempotent so a failed build can call the same disposal path as a clean
+ * unmount without double-disposing partially constructed resources.
+ */
+export function disposeVolumeResources(resources: {
+  texture?: Data3DTexture | null;
+  colormap?: DataTexture | null;
+  material?: Material | null;
+  mesh?: Mesh<BoxGeometry, Material> | null;
+}): void {
+  resources.mesh?.geometry.dispose();
+  resources.material?.dispose();
+  resources.texture?.dispose();
+  resources.colormap?.dispose();
 }
