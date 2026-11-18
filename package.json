@@ -2,5 +2,14 @@
   "name": "sleek-hub",
   "version": "0.1.0",
   "type": "module",
-  "main": "./src/index.ts"
+  "main": "./src/index.ts",
+  "scripts": {
+    "test": "node --test tests/simulation.test.ts",
+    "verify": "node scripts/verify.ts",
+    "demo:build": "node scripts/build-demo.mjs",
+    "demo": "node scripts/build-demo.mjs && node scripts/serve.mjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
 }

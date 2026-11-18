@@ -1,3 +1,561 @@
-// build f8ec6befcf
-// (auto) 3fc083
-export const greet = (n: string) => `hi ${n}`;
+// Bunny-hop simulation core: pure, deterministic and DOM-free.
+//
+// The simulation runs on a fixed 1/128 s tick. A render frame converts its
+// elapsed real time into an integer number of ticks and splits that frame's
+// mouse motion evenly across the ticks it drives, so a high-refresh machine
+// cannot turn or gain any faster than a low-refresh one.
+//
+// All vectors are plain {x, y, z} objects with +Y up. Movement is on the XZ
+// plane. `yaw` is in radians; 0 looks along +X, and a positive mouseDX turns
+// toward +Z.
+
+import type {
+  FrameInput,
+  FrameResult,
+  SimulationOptions,
+  SimulationState,
+  TickEvent,
+  Vec3,
+} from './types.ts';
+
+/** Physics ticks per second (fixed). */
+export const TICK_RATE = 128;
+/** Fixed physics step in seconds: 1/128. */
+export const TICK_SECONDS = 1 / TICK_RATE;
+/** Source-style horizontal wish-speed cap while airborne, in u/s. */
+export const AIR_WISH_SPEED_CAP = 30;
+/**
+ * Tolerant floor of the accumulator, in ticks. Floating-point sums of frame
+ * deltas must not lose a tick just because 60 frames of 1/60 miss 1 by an ulp.
+ */
+const ACCUMULATOR_EPSILON = 1e-9;
+
+interface ResolvedOptions {
+  tickRate: number;
+  gravity: number;
+  jumpHeight: number;
+  groundMaxSpeed: number;
+  groundAccelerate: number;
+  airAccelerate: number;
+  airWishSpeedCap: number;
+  friction: number;
+  stopSpeed: number;
+  mouseSensitivity: number;
+  autoHop: boolean;
+  maxFrameSeconds: number;
+  groundLevel: number;
+  spawn: Vec3;
+}
+
+function positive(name: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${name} must be a positive, finite number`);
+  }
+  return value;
+}
+
+function nonNegative(name: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative, finite number`);
+  }
+  return value;
+}
+
+function finite(name: string, value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`${name} must be finite`);
+  }
+  return value;
+}
+
+/** Accept any positive finite number, or Infinity for "no limit". */
+function positiveOrInfinite(name: string, value: number): number {
+  if (Number.isNaN(value) || value <= 0) {
+    throw new RangeError(`${name} must be positive (Infinity disables the limit)`);
+  }
+  return value;
+}
+
+function resolveOptions(options: SimulationOptions = {}): ResolvedOptions {
+  const tickRate = positive('tickRate', options.tickRate ?? TICK_RATE);
+  const groundLevel = finite('groundLevel', options.groundLevel ?? 0);
+  const spawn = options.spawn
+    ? { x: finite('spawn.x', options.spawn.x), y: finite('spawn.y', options.spawn.y), z: finite('spawn.z', options.spawn.z) }
+    : { x: 0, y: groundLevel, z: 0 };
+  return {
+    tickRate,
+    gravity: positive('gravity', options.gravity ?? 800),
+    jumpHeight: positive('jumpHeight', options.jumpHeight ?? 45),
+    groundMaxSpeed: positive('groundMaxSpeed', options.groundMaxSpeed ?? 250),
+    groundAccelerate: positive('groundAccelerate', options.groundAccelerate ?? 10),
+    airAccelerate: positive('airAccelerate', options.airAccelerate ?? 10),
+    airWishSpeedCap: positive('airWishSpeedCap', options.airWishSpeedCap ?? AIR_WISH_SPEED_CAP),
+    friction: nonNegative('friction', options.friction ?? 4),
+    stopSpeed: nonNegative('stopSpeed', options.stopSpeed ?? 100),
+    mouseSensitivity: nonNegative('mouseSensitivity', options.mouseSensitivity ?? 0.0022),
+    autoHop: options.autoHop ?? true,
+    maxFrameSeconds: positiveOrInfinite('maxFrameSeconds', options.maxFrameSeconds ?? Infinity),
+    groundLevel,
+    spawn,
+  };
+}
+
+function vec(x: number, y: number, z: number): Vec3 {
+  return { x, y, z };
+}
+
+/** Clamp an axis into [-1, 1] and zero out anything that is not a number. */
+function axis(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.max(-1, Math.min(1, value));
+}
+
+export class BunnyHopSim {
+  private readonly options: ResolvedOptions;
+  private readonly dt: number;
+
+  private x: number;
+  private y: number;
+  private z: number;
+  private vx = 0;
+  private vy = 0;
+  private vz = 0;
+  private yaw = 0;
+
+  private groundedState = true;
+  private pausedState = false;
+  private autoHopState: boolean;
+
+  private tickCountState = 0;
+  private jumpCountState = 0;
+  private landingCountState = 0;
+  private lastJumpTickState = -1;
+  private lastLandingTickState = -1;
+
+  private accumulatorState = 0;
+  private pendingMouseYawState = 0;
+  private lastFrameMouseDXState = 0;
+
+  /**
+   * Jump input is edge-triggered: holding it in the air never queues a jump.
+   * A press is latched until a physics tick consumes it, so a press that
+   * arrives on a zero-tick frame (very common above 128 Hz) is not lost.
+   */
+  private jumpWasDown = false;
+  private jumpPressLatched = false;
+
+  /**
+   * Set on resume. The first simulated tick after a pause ignores any jump
+   * edge, so whatever the key did while paused can never become a jump.
+   * Releasing and pressing the key again works normally.
+   */
+  private suppressJumpEdge = false;
+
+  constructor(options: SimulationOptions = {}) {
+    this.options = resolveOptions(options);
+    this.dt = 1 / this.options.tickRate;
+    this.autoHopState = this.options.autoHop;
+    this.x = this.options.spawn.x;
+    this.y = this.options.spawn.y;
+    this.z = this.options.spawn.z;
+    this.groundedState = this.y <= this.options.groundLevel;
+  }
+
+  // ---------------------------------------------------------------------
+  // Public read-only state
+  // ---------------------------------------------------------------------
+
+  get grounded(): boolean {
+    return this.groundedState;
+  }
+
+  get paused(): boolean {
+    return this.pausedState;
+  }
+
+  get speed(): number {
+    return Math.hypot(this.vx, this.vz);
+  }
+
+  get verticalSpeed(): number {
+    return this.vy;
+  }
+
+  get tickCount(): number {
+    return this.tickCountState;
+  }
+
+  /** Simulated seconds; excludes time spent paused. */
+  get simulatedTime(): number {
+    return this.tickCountState * this.dt;
+  }
+
+  get tickSeconds(): number {
+    return this.dt;
+  }
+
+  get position(): Vec3 {
+    return vec(this.x, this.y, this.z);
+  }
+
+  get velocity(): Vec3 {
+    return vec(this.vx, this.vy, this.vz);
+  }
+
+  get viewYaw(): number {
+    return this.yaw;
+  }
+
+  /** Snapshot of everything a HUD or a test may want to observe. */
+  getState(): SimulationState {
+    return {
+      position: vec(this.x, this.y, this.z),
+      velocity: vec(this.vx, this.vy, this.vz),
+      speed: this.speed,
+      verticalSpeed: this.vy,
+      yaw: this.yaw,
+      grounded: this.groundedState,
+      tickCount: this.tickCountState,
+      simulatedTime: this.tickCountState * this.dt,
+      jumpCount: this.jumpCountState,
+      landingCount: this.landingCountState,
+      lastJumpTick: this.lastJumpTickState,
+      lastLandingTick: this.lastLandingTickState,
+      accumulator: this.accumulatorState,
+      pendingMouseYaw: this.pendingMouseYawState,
+      paused: this.pausedState,
+      autoHop: this.autoHopState,
+      lastFrameMouseDX: this.lastFrameMouseDXState,
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // Control surface
+  // ---------------------------------------------------------------------
+
+  setAutoHop(enabled: boolean): void {
+    this.autoHopState = enabled;
+  }
+
+  /**
+   * Freeze simulation. The frame that paused does not get to bank its time:
+   * the accumulator is cleared so resuming never fast-forwards through the
+   * pause, and buffered mouse motion is dropped so the crosshair does not
+   * snap when play resumes.
+   */
+  pause(): void {
+    if (this.pausedState) return;
+    this.pausedState = true;
+    this.accumulatorState = 0;
+    this.pendingMouseYawState = 0;
+    this.lastFrameMouseDXState = 0;
+    // A press that arrived just before the pause must not survive it.
+    this.jumpPressLatched = false;
+  }
+
+  /** Resume without replaying any of the paused wall-clock time. */
+  resume(): void {
+    if (!this.pausedState) return;
+    this.pausedState = false;
+    // Whatever the jump key did during the pause must not become a jump.
+    this.suppressJumpEdge = true;
+  }
+
+  togglePause(): boolean {
+    if (this.pausedState) this.resume();
+    else this.pause();
+    return this.pausedState;
+  }
+
+  /** Reset position, velocity, counters and accumulator to the spawn state. */
+  restart(): void {
+    this.x = this.options.spawn.x;
+    this.y = this.options.spawn.y;
+    this.z = this.options.spawn.z;
+    this.vx = 0;
+    this.vy = 0;
+    this.vz = 0;
+    this.yaw = 0;
+    this.groundedState = this.y <= this.options.groundLevel;
+    this.tickCountState = 0;
+    this.jumpCountState = 0;
+    this.landingCountState = 0;
+    this.lastJumpTickState = -1;
+    this.lastLandingTickState = -1;
+    this.accumulatorState = 0;
+    this.pendingMouseYawState = 0;
+    this.lastFrameMouseDXState = 0;
+    this.jumpWasDown = false;
+    this.jumpPressLatched = false;
+    this.suppressJumpEdge = false;
+  }
+
+  // ---------------------------------------------------------------------
+  // Frame loop
+  // ---------------------------------------------------------------------
+
+  /**
+   * Advance the simulation by one rendered frame.
+   *
+   * `deltaSeconds` is real time since the previous frame. The frame runs
+   * `floor(accumulator / dt)` fixed ticks and shares this frame's mouse motion
+   * evenly between exactly those ticks. Mouse motion that belongs to the
+   * fractional remainder stays buffered for the ticks that will run later, so
+   * every tick everywhere receives the same amount of turning per second of
+   * simulated time. That is what makes 60 Hz and 240 Hz produce the same run.
+   */
+  frame(deltaSeconds: number, input: FrameInput = {}): FrameResult {
+    if (typeof deltaSeconds !== 'number' || !Number.isFinite(deltaSeconds)) {
+      throw new TypeError('frame(deltaSeconds) must be a finite number');
+    }
+    if (deltaSeconds < 0) {
+      throw new RangeError('frame(deltaSeconds) must not be negative');
+    }
+
+    const jumpDown = input.jump === true;
+
+    if (this.pausedState) {
+      // Input is frozen entirely while paused: no time, no mouse motion, and
+      // no jump edge. A key that was already down before the pause stays
+      // "down" across it, so resuming never turns a held key into a new press.
+      this.lastFrameMouseDXState = 0;
+      return { ticks: 0, events: [], state: this.getState() };
+    }
+
+    // Latch a press edge even when this frame earns no tick. Above 128 Hz
+    // most frames do not, and the key may already be up by the next frame;
+    // without the latch a quick tap would silently vanish.
+    if (jumpDown && !this.jumpWasDown) {
+      this.jumpPressLatched = true;
+    }
+    this.jumpWasDown = jumpDown;
+
+    // Anti-spiral clamp. If a frame is clamped, its mouse input is clamped by
+    // the same ratio so pointer motion still matches simulated real time.
+    let delta = deltaSeconds;
+    let mouseDX = Number.isFinite(input.mouseDX) ? (input.mouseDX as number) : 0;
+    if (delta > this.options.maxFrameSeconds) {
+      const ratio = this.options.maxFrameSeconds / delta;
+      mouseDX *= ratio;
+      delta = this.options.maxFrameSeconds;
+    }
+
+    this.accumulatorState += delta;
+    this.pendingMouseYawState += mouseDX * this.options.mouseSensitivity;
+    this.lastFrameMouseDXState = mouseDX;
+
+    let ticks = Math.floor(this.accumulatorState / this.dt + ACCUMULATOR_EPSILON);
+    if (ticks < 0) ticks = 0;
+    // Guard against a caller handing us something absurd: never spin forever.
+    if (!Number.isFinite(ticks)) {
+      ticks = 0;
+      this.accumulatorState = 0;
+      this.pendingMouseYawState = 0;
+    }
+
+    if (ticks === 0) {
+      // Mouse and time stay buffered, and the latched press survives, so a
+      // tap on a zero-tick frame still jumps on the very next tick.
+      return { ticks: 0, events: [], state: this.getState() };
+    }
+
+    const timeBefore = this.accumulatorState;
+    const consumed = ticks * this.dt;
+    // Split this frame's buffered mouse motion across the time the ticks
+    // actually consume. For a whole number of ticks this consumes all of it
+    // and the split is exactly even; a fractional remainder stays buffered.
+    const ratio = timeBefore > 0 ? Math.min(1, consumed / timeBefore) : 1;
+    const yawPerTick = (this.pendingMouseYawState * ratio) / ticks;
+    this.pendingMouseYawState *= 1 - ratio;
+
+    this.accumulatorState -= consumed;
+    if (Math.abs(this.accumulatorState) < 1e-9) this.accumulatorState = 0;
+
+    const forward = axis(input.forward);
+    const side = axis(input.side);
+    const events: TickEvent[] = [];
+    this.runTicks(ticks, yawPerTick, forward, side, events);
+
+    return { ticks, events, state: this.getState() };
+  }
+
+  /**
+   * Advance an exact number of fixed ticks with constant input, bypassing the
+   * accumulator. Tools and tests use this to drive the simulation at a known
+   * tick rate; `frame()` is the real-time entry point.
+   */
+  advanceTicks(count: number, input: FrameInput = {}): FrameResult {
+    if (!Number.isInteger(count) || count < 0) {
+      throw new RangeError('advanceTicks(count) must be a non-negative integer');
+    }
+    if (this.pausedState || count === 0) {
+      return { ticks: 0, events: [], state: this.getState() };
+    }
+    const jumpDown = input.jump === true;
+    if (jumpDown && !this.jumpWasDown) this.jumpPressLatched = true;
+    this.jumpWasDown = jumpDown;
+    const yawPerTick = (Number.isFinite(input.mouseDX) ? (input.mouseDX as number) : 0) *
+      this.options.mouseSensitivity / count;
+    const forward = axis(input.forward);
+    const side = axis(input.side);
+    const events: TickEvent[] = [];
+    this.runTicks(count, yawPerTick, forward, side, events);
+    return { ticks: count, events, state: this.getState() };
+  }
+
+  /**
+   * The single place that turns a run of ticks into physics. Jump presses are
+   * consumed on the first tick only; the resident `suppressJumpEdge` flag
+   * swallows that first edge after a resume.
+   */
+  private runTicks(
+    count: number,
+    yawPerTick: number,
+    forward: number,
+    side: number,
+    events: TickEvent[],
+  ): void {
+    for (let i = 0; i < count; i += 1) {
+      let jumpEdge = i === 0 && this.jumpPressLatched;
+      if (i === 0) this.jumpPressLatched = false;
+      if (this.suppressJumpEdge) {
+        // First tick after resume: whatever the key did while paused is not
+        // a press. A real release-and-repress next frame behaves normally.
+        jumpEdge = false;
+        this.suppressJumpEdge = false;
+      }
+      this.tick(yawPerTick, forward, side, jumpEdge, events);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // One fixed tick
+  // ---------------------------------------------------------------------
+
+  private wishDirection(forward: number, side: number): Vec3 {
+    if (forward === 0 && side === 0) return vec(0, 0, 0);
+    const sin = Math.sin(this.yaw);
+    const cos = Math.cos(this.yaw);
+    // forward = (cos, 0, sin); right = (-sin, 0, cos)
+    let wx = cos * forward - sin * side;
+    let wz = sin * forward + cos * side;
+    const len = Math.hypot(wx, wz);
+    if (len > 1) {
+      wx /= len;
+      wz /= len;
+    }
+    return vec(wx, 0, wz);
+  }
+
+  private tick(
+    yawPerTick: number,
+    forward: number,
+    side: number,
+    jumpEdge: boolean,
+    events: TickEvent[],
+  ): void {
+    this.tickCountState += 1;
+    const tick = this.tickCountState;
+    this.yaw += yawPerTick;
+
+    const wish = this.wishDirection(forward, side);
+    const wishSpeed = Math.hypot(wish.x, wish.z);
+    const wasGrounded = this.groundedState;
+
+    if (wasGrounded) {
+      this.applyFriction();
+      this.accelerate(wish, wishSpeed * this.options.groundMaxSpeed, this.options.groundAccelerate);
+      if (jumpEdge) {
+        this.jump(tick, false, events);
+      }
+    } else {
+      // Source-style air control. `wishdir` is unit length, and the wish
+      // speed — input magnitude scaled by the ground max speed — is capped
+      // at 30 u/s. The per-tick dot-product projection is what lets a
+      // sideways strafe add speed; the cap only bounds the target.
+      const unit = wishSpeed > 0 ? 1 / wishSpeed : 0;
+      const target = Math.min(wishSpeed * this.options.groundMaxSpeed, this.options.airWishSpeedCap);
+      this.accelerate(vec(wish.x * unit, 0, wish.z * unit), target, this.options.airAccelerate);
+    }
+
+    if (this.groundedState) {
+      this.y = this.options.groundLevel;
+      this.vy = 0;
+      this.x += this.vx * this.dt;
+      this.z += this.vz * this.dt;
+      return;
+    }
+
+    this.vy -= this.options.gravity * this.dt;
+    this.y += this.vy * this.dt;
+    this.x += this.vx * this.dt;
+    this.z += this.vz * this.dt;
+
+    if (this.y <= this.options.groundLevel && this.vy <= 0) {
+      this.y = this.options.groundLevel;
+      this.vy = 0;
+      this.groundedState = true;
+      this.landingCountState += 1;
+      this.lastLandingTickState = tick;
+      events.push({
+        type: 'land',
+        tick,
+        auto: false,
+        position: vec(this.x, this.y, this.z),
+        velocity: vec(this.vx, this.vy, this.vz),
+        speed: this.speed,
+      });
+
+      // Auto-hop fires on this landing tick and nowhere else. Because the
+      // landing test lives inside the fixed tick, a frame that spans several
+      // ticks cannot skip over it.
+      if (this.autoHopState) {
+        this.jump(tick, true, events);
+      }
+    }
+  }
+
+  private jump(tick: number, auto: boolean, events: TickEvent[]): void {
+    // Derive takeoff speed from the configured apex height: v = sqrt(2gh).
+    this.vy = Math.sqrt(2 * this.options.gravity * this.options.jumpHeight);
+    this.groundedState = false;
+    this.jumpCountState += 1;
+    this.lastJumpTickState = tick;
+    events.push({
+      type: 'jump',
+      tick,
+      auto,
+      position: vec(this.x, this.y, this.z),
+      velocity: vec(this.vx, this.vy, this.vz),
+      speed: this.speed,
+    });
+  }
+
+  private applyFriction(): void {
+    const speed = Math.hypot(this.vx, this.vz);
+    if (speed <= 0) return;
+    const control = speed < this.options.stopSpeed ? this.options.stopSpeed : speed;
+    const drop = control * this.options.friction * this.dt;
+    let newSpeed = speed - drop;
+    if (newSpeed < 0) newSpeed = 0;
+    const scale = newSpeed / speed;
+    this.vx *= scale;
+    this.vz *= scale;
+  }
+
+  private accelerate(wish: Vec3, wishSpeed: number, acceleration: number): void {
+    if (wishSpeed <= 0) return;
+    const current = this.vx * wish.x + this.vz * wish.z;
+    const add = wishSpeed - current;
+    if (add <= 0) return;
+    let accelSpeed = acceleration * wishSpeed * this.dt;
+    if (accelSpeed > add) accelSpeed = add;
+    this.vx += wish.x * accelSpeed;
+    this.vz += wish.z * accelSpeed;
+  }
+}
+
+/** Convenience factory so callers do not have to remember `new`. */
+export function createSimulation(options?: SimulationOptions): BunnyHopSim {
+  return new BunnyHopSim(options);
+}

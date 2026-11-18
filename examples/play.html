@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bunny Hop — playable demo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #stage { position: fixed; inset: 0; overflow: hidden; }
+  #floor {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 46%;
+    background:
+      linear-gradient(#0d1117 0%, #111827 8%, #161b22 100%),
+      repeating-linear-gradient(90deg, #1f2937 0 1px, transparent 1px 48px);
+    background-blend-mode: normal;
+    border-top: 2px solid #30363d;
+  }
+  #player {
+    position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+    border-radius: 50%; background: #2ea44f; box-shadow: 0 0 12px #2ea44f88;
+    will-change: transform;
+  }
+  #player.air { background: #58a6ff; box-shadow: 0 0 12px #58a6ff88; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; padding: 10px 12px; border-radius: 8px;
+    background: #161b22cc; border: 1px solid #30363d; backdrop-filter: blur(6px);
+    white-space: pre; pointer-events: none; min-width: 240px;
+  }
+  #hud b { color: #e6edf3; }
+  #help {
+    position: fixed; bottom: 12px; left: 12px; right: 12px; padding: 10px 12px;
+    border-radius: 8px; background: #161b22cc; border: 1px solid #30363d;
+    backdrop-filter: blur(6px);
+  }
+  kbd { background: #21262d; border: 1px solid #30363d; border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 4px; color: #e6edf3; }
+  #pause {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: #0d1117cc; font-size: 22px; letter-spacing: 0.16em;
+  }
+  #pause.on { display: grid; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="floor"></div>
+  <div id="player"></div>
+</div>
+<div id="hud"></div>
+<div id="pause">PAUSED</div>
+<div id="help">
+  <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &nbsp;·&nbsp;
+  <kbd>Space</kbd> / wheel jump &nbsp;·&nbsp; move the mouse to steer &nbsp;·&nbsp;
+  <kbd>Esc</kbd>/<kbd>P</kbd> pause &nbsp;·&nbsp; <kbd>R</kbd> restart &nbsp;·&nbsp;
+  <kbd>H</kbd> toggle auto-hop
+</div>
+
+<script type="module">
+  // Browsers cannot load TypeScript directly. `npm run demo:build` strips the
+  // types out of src/index.ts into this single ES module (see
+  // scripts/build-demo.mjs). Run that once, then open this page over http.
+  import { createSimulation } from './sim.js';
+
+  const sim = createSimulation({ autoHop: true, maxFrameSeconds: 0.25 });
+
+  const stage = document.getElementById('stage');
+  const playerEl = document.getElementById('player');
+  const hudEl = document.getElementById('hud');
+  const pauseEl = document.getElementById('pause');
+
+  const keys = new Set();
+  let mouseDX = 0;
+  let locked = false;
+  let wheelJump = false;
+
+  const fmt = (n, d = 1) => n.toFixed(d);
+
+  // World-space camera: keep the player centred, scroll the floor with them.
+  function render() {
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    const px = w * 0.32;
+    // Map 1 unit ≈ 2 px of world travel; the viewport is a window, not a chase cam.
+    const scale = 2;
+    const groundY = h * 0.54;
+
+    // Camera follows horizontal position; y is projected upward from the floor.
+    const screenX = px; // fixed horizontally, world scrolls the floor texture
+    const screenY = groundY - sim.position.y * scale;
+
+    playerEl.style.transform = `translate(${screenX}px, ${screenY}px)`;
+    playerEl.classList.toggle('air', !sim.grounded);
+
+    // Scroll the floor so horizontal speed reads visually.
+    const offset = -sim.position.x * scale;
+    const floor = document.getElementById('floor');
+    floor.style.backgroundPosition = `${offset}px 0, ${offset}px 0`;
+  }
+
+  function updateHud(fps) {
+    const s = sim.getState();
+    hudEl.textContent =
+      `grounded   ${s.grounded ? 'yes' : 'no '}\n` +
+      `speed      ${fmt(s.speed, 2)} u/s\n` +
+      `vertical   ${fmt(s.verticalSpeed, 2)} u/s\n` +
+      `position   ${fmt(s.position.x, 1)}, ${fmt(s.position.z, 1)}\n` +
+      `ticks      ${s.tickCount}  (${fmt(s.simulatedTime, 3)} s)\n` +
+      `jumps      ${s.jumpCount}   landings ${s.landingCount}\n` +
+      `auto-hop   ${s.autoHop ? 'on' : 'off'}\n` +
+      `render     ${fmt(fps, 0)} fps   ` +
+      `acc ${fmt(s.accumulator * 1000, 2)} ms`;
+  }
+
+  // --- input -------------------------------------------------------------
+  window.addEventListener('keydown', (ev) => {
+    if (ev.repeat) return;
+    keys.add(ev.code);
+    if (ev.code === 'Space') ev.preventDefault();
+    if (ev.code === 'Escape' || ev.code === 'KeyP') {
+      sim.togglePause();
+      pauseEl.classList.toggle('on', sim.paused);
+      if (!sim.paused && !locked) requestLock();
+    }
+    if (ev.code === 'KeyR') sim.restart();
+    if (ev.code === 'KeyH') sim.setAutoHop(!sim.getState().autoHop);
+  });
+  window.addEventListener('keyup', (ev) => keys.delete(ev.code));
+
+  window.addEventListener('pointermove', (ev) => {
+    if (!locked) return;
+    mouseDX += ev.movementX;
+  });
+
+  window.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    // A wheel notch is a jump press: hold it for one frame.
+    wheelJump = true;
+  }, { passive: false });
+
+  stage.addEventListener('click', () => {
+    if (!locked) requestLock();
+  });
+
+  function requestLock() {
+    stage.requestPointerLock?.();
+  }
+  document.addEventListener('pointerlockchange', () => {
+    const wasLocked = locked;
+    locked = document.pointerLockElement === stage;
+    // Losing the lock mid-run pauses instead of leaving the body drifting.
+    if (wasLocked && !locked && !sim.paused) {
+      sim.pause();
+      pauseEl.classList.add('on');
+    }
+  });
+
+  // --- loop --------------------------------------------------------------
+  let last = performance.now();
+  let smoothFps = 60;
+
+  function loop(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (!(dt >= 0)) dt = 0;
+
+    smoothFps += ((dt > 0 ? 1 / dt : smoothFps) - smoothFps) * 0.08;
+
+    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+    const side = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+    const jump = keys.has('Space') || wheelJump;
+    wheelJump = false;
+
+    const frameDX = mouseDX;
+    mouseDX = 0;
+
+    sim.frame(dt, { forward, side, jump, mouseDX: frameDX });
+
+    render();
+    updateHud(smoothFps);
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame((t) => {
+    last = t;
+    loop(t);
+  });
+</script>
+</body>
+</html>

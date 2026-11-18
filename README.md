@@ -23,6 +23,42 @@ Bhop Browser Game hands you the wheel of a free browser bunny-hop game on —,,,
 - **Network:** internet access to download the script
 - **Privileges:** standard user
 
+## Run the simulation
+
+The playable loop lives in `src/index.ts` as a pure, DOM-free class:
+
+```ts
+import { createSimulation } from './src/index.ts';
+
+const sim = createSimulation({ autoHop: true });
+
+// Once per rendered frame:
+sim.frame(deltaSeconds, {
+  forward: 0,        // W/S axis, [-1, 1]
+  side: 1,           // D/A axis, [-1, 1]
+  jump: spaceDown,   // held state; presses are edge-triggered
+  mouseDX: pixels,   // horizontal mouse motion this frame
+});
+
+sim.getState(); // { grounded, speed, tickCount, accumulator, ... }
+```
+
+```sh
+npm test          # node --test tests/simulation.test.ts
+npm run verify    # printed sample run + the three guarantees
+npm run demo      # bundle + serve http://localhost:3000/examples/play.html
+```
+
+The physics runs at a fixed 128 Hz (1/128 s per tick). Each frame turns its
+elapsed real time into whole ticks, and that frame's mouse motion is spread
+evenly across the ticks it drives, with any sub-tick remainder carried
+forward. A 240 Hz monitor therefore gets smoother pictures, not faster
+strafes. Auto-hop re-jumps only on the tick the body actually lands, since the
+landing test lives inside the fixed tick; a frame that spans many ticks cannot
+skip it, and holding jump in the air does nothing. Pause clears the
+accumulator so resuming never replays paused time, and restart zeroes
+velocity, position and the accumulator.
+
 ## Features
 
 **🎯 Honest Source, by hand.** The air-accel rule is the real one: your wish in the air is capped at 30 u/s, but the tick-by-tick gain isn't — so comes from angling your strafe sideways and sweeping the mouse in rhythm, hop after hop.,, assists. Just you, the keys, and the swing.

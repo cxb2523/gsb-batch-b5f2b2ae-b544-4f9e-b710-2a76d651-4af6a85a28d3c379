@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Bunny hop — browser self-test</title>
+<style>
+  body { background: #0d1117; color: #c9d1d9; font: 13px/1.5 ui-monospace, monospace; padding: 24px; }
+  .pass { color: #2ea44f; } .fail { color: #f85149; }
+  h1 { font-size: 15px; color: #e6edf3; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Browser self-test — examples/sim.js</h1>
+<pre id="out"></pre>
+<script type="module">
+  import { BunnyHopSim, TICK_RATE, createSimulation } from '../examples/sim.js';
+
+  const out = document.getElementById('out');
+  const lines = [];
+  let failed = 0;
+
+  function check(name, fn) {
+    try {
+      fn();
+      lines.push(`<span class="pass">PASS</span>  ${name}`);
+    } catch (error) {
+      failed += 1;
+      lines.push(`<span class="fail">FAIL</span>  ${name}\n        ${error.message}`);
+    }
+  }
+  function assert(cond, msg) { if (!cond) throw new Error(msg); }
+  function near(a, b, msg, eps = 1e-9) { assert(Math.abs(a - b) < eps, `${msg}: ${a} vs ${b}`); }
+
+  function run(fps, seconds, input) {
+    const sim = createSimulation({ autoHop: true });
+    const frames = Math.round(fps * seconds);
+    for (let i = 0; i < frames; i += 1) {
+      sim.frame(1 / fps, {
+        forward: input.forward,
+        side: input.side,
+        jump: i === 0,
+        mouseDX: (input.mousePxPerSecond ?? 0) / fps,
+      });
+    }
+    return sim;
+  }
+
+  check(`tick rate is ${TICK_RATE} Hz`, () => {
+    assert(new BunnyHopSim().tickSeconds === 1 / 128, 'tickSeconds');
+  });
+
+  let reference;
+  for (const fps of [30, 60, 64, 128, 144, 240, 360]) {
+    check(`${fps} Hz matches the 128 Hz timeline`, () => {
+      const sim = run(fps, 2, { forward: 1, side: 1, mousePxPerSecond: 160 });
+      const a = sim.getState();
+      if (!reference) { reference = a; return; }
+      assert(a.tickCount === reference.tickCount, `ticks ${a.tickCount} vs ${reference.tickCount}`);
+      assert(a.jumpCount === reference.jumpCount, 'jump count');
+      assert(a.landingCount === reference.landingCount, 'landing count');
+      near(a.speed, reference.speed, 'speed');
+      near(a.position.x, reference.position.x, 'x');
+      near(a.position.z, reference.position.z, 'z');
+      near(a.yaw, reference.yaw, 'yaw');
+    });
+  }
+
+  check('pause accumulates no time and resume never jumps', () => {
+    const sim = new BunnyHopSim({ autoHop: false });
+    sim.frame(1 / 128, { jump: true });
+    const ticks = sim.tickCount;
+    sim.pause();
+    for (let i = 0; i < 300; i += 1) sim.frame(1 / 60, { jump: true, mouseDX: 40 });
+    assert(sim.tickCount === ticks, 'ticks advanced while paused');
+    assert(sim.getState().accumulator === 0, 'accumulator grew while paused');
+    sim.resume();
+    const r = sim.frame(1 / 128, { jump: true });
+    assert(r.ticks === 1, `resume ran ${r.ticks} ticks`);
+    assert(!r.events.some((e) => e.type === 'jump'), 'jumped on resume');
+  });
+
+  check('restart zeroes position, velocity and accumulator', () => {
+    const sim = new BunnyHopSim();
+    for (let i = 0; i < 200; i += 1) sim.frame(1 / 128, { forward: 1, side: 1, mouseDX: 4, jump: i === 0 });
+    assert(sim.speed > 0, 'setup');
+    sim.restart();
+    const s = sim.getState();
+    assert(s.position.x === 0 && s.position.y === 0 && s.position.z === 0, 'position');
+    assert(s.velocity.x === 0 && s.velocity.y === 0 && s.velocity.z === 0, 'velocity');
+    assert(s.speed === 0, 'speed');
+    assert(s.tickCount === 0, 'tick count');
+    assert(s.accumulator === 0, 'accumulator');
+  });
+
+  check('auto-hop fires once on the landing tick', () => {
+    const sim = new BunnyHopSim({ autoHop: true });
+    let jumps = 0; let lands = 0;
+    for (let i = 0; i < 512; i += 1) {
+      for (const e of sim.frame(1 / 128, { jump: i === 0 }).events) {
+        if (e.type === 'jump') jumps += 1;
+        if (e.type === 'land') lands += 1;
+      }
+    }
+    assert(jumps === lands + 1, `jumps ${jumps} vs lands ${lands}`);
+  });
+
+  lines.push('');
+  lines.push(failed === 0 ? '<span class="pass">ALL CHECKS PASSED</span>' : `<span class="fail">${failed} CHECK(S) FAILED</span>`);
+  out.innerHTML = lines.join('\n');
+  document.title = failed === 0 ? 'PASS' : 'FAIL';
+  // Exposed so a headless runner can read the verdict.
+  window.__selftest = { failed, lines };
+</script>
+</body>
+</html>
