@@ -1,0 +1,4147 @@
+//! Local HTTP relay for the Community IPTV Player native app.
+//!
+//! Runs inside the Tauri process, bound to 127.0.0.1. It fetches the Xtream
+//! provider from the user's own (home) IP, adds CORS, and follows redirects —
+//! the three things the browser/cloud can't do. Exposes the SAME endpoints the
+//! web UI already calls (`/api/stream`, `/api/restream/...`), so the frontend is
+//! unchanged when it points at this server.
+//!
+//! - `/health`                        discovery probe
+//! - `/api/stream?url=`               byte relay for VOD / direct play
+//! - `/api/restream/index.m3u8?url=`  spawn bundled ffmpeg, return HLS manifest
+//! - `/api/restream/<session>/<seg>`  serve an HLS segment file
+//! - `/api/subsync`                   run an installed ffsubsync (POST)
+//! - `/api/subsync/reference`         reference speech for the frontend aligner
+//!
+//! The restream logic is a direct port of `api/restreamManager.ts`.
+
+use axum::{
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Path as AxumPath, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
+// Only the mobile embedded-asset fallback needs the request path.
+#[cfg(not(desktop))]
+use axum::http::Uri;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::net::{SocketAddr, UdpSocket};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
+
+use crate::subsync;
+
+/// User-Agent that makes Xtream providers serve the real stream (not a debug page).
+const PLAYER_UA: &str = "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 ExoPlayerLib/2.18.1";
+
+/// Idle sessions older than this (no manifest/segment fetch) are reaped.
+const SESSION_TTL: Duration = Duration::from_secs(120);
+
+/// Rolling window for the per-host request-rate count that appears in the
+/// flight-recorder logs as `(N reqs/10s)` — the fastest way to tell a genuine
+/// provider-side rate limit from a client-side burst (e.g. a non-fast-start MP4
+/// forcing the video element to bounce around the file hunting for its moov atom).
+const REQUEST_RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// How long to stop contacting a provider host after it answers 429.
+///
+/// A media element does not understand 429 — it just keeps asking for the
+/// bytes it needs, ~3x/second. Forwarding those to a panel that is already
+/// refusing keeps its per-IP limit permanently tripped, so playback can never
+/// recover. During the cool-down the relay answers locally and sends NOTHING
+/// upstream, which is what actually lets the limit reset.
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Never trust an absurd `Retry-After` from the provider — cap the stall.
+const RATE_LIMIT_COOLDOWN_MAX: Duration = Duration::from_secs(60);
+
+/// How long an aborted VOD request's provider connection stays parked for the
+/// next sequential range before being closed.
+///
+/// This is the heart of making the relay look like a TV app to the panel.
+/// WKWebView's media engine does NOT hold one connection open the way
+/// ExoPlayer/VLC do — it buffers a few MB, aborts the connection, and
+/// re-opens at the next byte, every 2-8s for the whole film. Each re-open
+/// used to be a fresh provider request (an aborted-mid-body connection can't
+/// be pooled), which is a sustained ~15-20 req/min the panel's frequency
+/// limiter eventually answers with block pages — during completely innocent
+/// sequential playback. Parking the connection and re-attaching the next
+/// range to it turns that churn into ONE long download upstream.
+const WARM_TTL: Duration = Duration::from_secs(15);
+
+/// How far AHEAD of a parked connection's position an attach may reach by
+/// reading-and-discarding from it. AVFoundation's startup dance jumps forward
+/// (~1MB observed) before settling into sequential reads; discarding a bounded
+/// gap from the live stream costs well under a second and saves a fresh
+/// provider connection at the moment the panel is most sensitive.
+const WARM_FORWARD_SKIP_MAX: u64 = 8 * 1024 * 1024;
+
+/// Rolling window of recently-streamed bytes kept per VOD stream, shared
+/// between the pump and bounded-read serving. Serves three jobs: (1) attach
+/// overlap — the follow-up range after an abort usually starts slightly
+/// BEFORE the park point (bytes lost in socket buffers); (2) AVFoundation's
+/// SECOND read cursor — trailing audio/interleave reads that advance with the
+/// playhead, each on a NEW range (uncacheable), which otherwise cost a fresh
+/// provider connection every few seconds; (3) end-of-file re-reads. Sized to
+/// cover an interleave trail well behind the buffering video cursor.
+const WARM_RING_MAX: usize = 64 * 1024 * 1024;
+
+/// Total budget for holding a client request across REPEATED cool-downs.
+/// A single 5s stall wasn't enough when a burst re-armed the breaker
+/// mid-hold: the request was then failed with a 429, which the media element
+/// treats as fatal ("Load failed") even though the limit cleared a second
+/// later. Riding it out up to this long converts that hard failure into a
+/// slightly slow response.
+const RATE_LIMIT_TOTAL_STALL: Duration = Duration::from_secs(15);
+
+/// Minimum spacing between FRESH media requests to one host. A seek makes
+/// AVFoundation stampede 3-4 concurrent range opens in the same instant;
+/// panels read that as abuse. Spacing them ~4/s changes nothing for the
+/// player (each fetch takes ~500ms anyway) but keeps the burst under the
+/// panel's trigger.
+const FRESH_SEND_SPACING: Duration = Duration::from_millis(250);
+
+/// Hard cap on how far the spacing tail may reach past "now". Reservations
+/// are made before sleeping and a cancelled request never gives its slot
+/// back, so without this cap a scrub-storm (arrive-and-abort faster than
+/// 4/s) would push the tail seconds into the future and the eventual winning
+/// request would sit in pure dead air. Bounding the tail bounds the worst
+/// case at one extra ~750ms, degrading spacing gracefully under storms
+/// instead of freezing playback.
+const FRESH_SEND_TAIL_CAP: Duration = Duration::from_millis(750);
+
+/// Bounded (moov/index) reads a seek re-issues are byte-identical every
+/// time. Cache small bounded responses per item so repeat seeks cost the
+/// provider nothing.
+const BOUNDED_CACHE_ENTRY_MAX: usize = 2 * 1024 * 1024;
+const BOUNDED_CACHE_TOTAL_MAX: usize = 64 * 1024 * 1024;
+
+/// Longest a client request is HELD while a cool-down runs, instead of being
+/// failed straight away.
+///
+/// Failing instantly is what made this worse: a media element retries an error
+/// immediately, so a 0ms rejection became a a thousand-per-second busy loop
+/// that wedged playback. Holding the request is the brake the network round
+/// trip used to provide for free, and it self-limits concurrency, because the
+/// element only keeps a handful of sockets open per host. Best of all, the
+/// wait usually outlives the cool-down, so the request is then tried for real
+/// and playback resumes on its own instead of surfacing an error.
+const RATE_LIMIT_MAX_STALL: Duration = Duration::from_secs(5);
+
+/// How long to wait for the provider to START answering (i.e. send response
+/// headers) before giving up.
+///
+/// The BODY stays deliberately unbounded — a stream legitimately runs for
+/// hours — but `send()` resolves as soon as headers arrive, so bounding it
+/// only catches "connected, then silence". That case is expensive: observed in
+/// the wild at 35s, during which the request holds one of the panel's very
+/// limited per-IP connection slots while transferring nothing, and the user
+/// stares at a spinner that already gave up.
+const UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Debug-mode log ring buffer: newest-N requests, both the relay's own
+/// outbound provider fetches and everything the frontend reports about its
+/// own `fetch()` calls. Bounded so a long debug session can't grow unbounded.
+const DEBUG_LOG_CAPACITY: usize = 500;
+
+/// Sync followers that haven't reported for this long are dropped from the
+/// roster. A TV in sync mode polls every few seconds, so 30s of silence means
+/// the browser was closed or navigated away — not that one poll ran late.
+const SYNC_FOLLOWER_TTL: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+/// One logged request, shown in the debug-mode log window — either something
+/// the relay itself fetched from a provider, or something the frontend's own
+/// `fetch()` reported about its call to the relay.
+#[derive(Clone, Serialize)]
+struct DebugLogEntry {
+    id: u64,
+    ts_ms: i64,
+    source: &'static str,
+    method: String,
+    url: String,
+    status: Option<u16>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+}
+
+/// Per-item cache of small bounded 206 responses (the moov/index probes a
+/// seek re-issues verbatim). Single item at a time, like the warm slot.
+struct BoundedCache {
+    url: String,
+    total: u64,
+    content_type: String,
+    map: HashMap<(u64, u64), Bytes>,
+    /// LRU order, most recent at the back.
+    order: VecDeque<(u64, u64)>,
+    bytes: usize,
+}
+
+impl BoundedCache {
+    fn new(url: String, total: u64, content_type: String) -> Self {
+        Self {
+            url,
+            total,
+            content_type,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, key: (u64, u64), data: Bytes) {
+        if data.len() > BOUNDED_CACHE_ENTRY_MAX || self.map.contains_key(&key) {
+            return;
+        }
+        self.bytes += data.len();
+        self.map.insert(key, data);
+        self.order.push_back(key);
+        while self.bytes > BOUNDED_CACHE_TOTAL_MAX {
+            if let Some(old) = self.order.pop_front() {
+                if let Some(evicted) = self.map.remove(&old) {
+                    self.bytes -= evicted.len();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn get(&mut self, key: (u64, u64)) -> Option<Bytes> {
+        let hit = self.map.get(&key)?.clone();
+        // Touch for LRU.
+        if let Some(idx) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(idx);
+            self.order.push_back(key);
+        }
+        Some(hit)
+    }
+}
+
+/// Cool-down after the Nth consecutive headers-timeout to one host. A hang is
+/// the panel throttling; pausing a flat 5s just produced another 12s hang
+/// (observed repeatedly). Back off exponentially instead: 5s, 10s, 20s, 40s,
+/// capped at 60s. Any real response resets the streak.
+fn timeout_cooldown(streak: u32) -> Duration {
+    let factor = 1u32 << streak.saturating_sub(1).min(4);
+    (RATE_LIMIT_COOLDOWN * factor).min(RATE_LIMIT_COOLDOWN_MAX)
+}
+
+/// A provider connection left alive after its client aborted. Its position is
+/// the shared ring's `pos` (the pump keeps them in lockstep by construction).
+struct WarmStream {
+    url: String,
+    resp: reqwest::Response,
+    total: u64,
+    content_type: String,
+    ring: Arc<Mutex<StreamRing>>,
+    parked_at: Instant,
+}
+
+/// Everything spawn_pump needs to stream a (possibly resumed) VOD body.
+struct PumpSeed {
+    url: String,
+    resp: reqwest::Response,
+    /// Snapshot of ring bytes [start, ring.pos) to replay before going live.
+    /// NOT re-pushed into the ring — they are already in it, which is what
+    /// makes a mid-replay abort unable to tear a hole in the window.
+    prefix: Vec<Bytes>,
+    start: u64,
+    total: u64,
+    content_type: String,
+    ring: Arc<Mutex<StreamRing>>,
+}
+
+/// One follower's latest self-reported playback state (see `SyncShared`).
+/// The report body is opaque JSON owned by the frontend; `at` is the relay's
+/// own clock, used only for pruning followers that stopped polling.
+struct SyncFollower {
+    report: serde_json::Value,
+    at: Instant,
+}
+
+/// Playback-sync channel between the master device (the app's own WebView)
+/// and follower devices (TV browsers on the LAN in sync mode).
+///
+/// The relay is a mailbox, not a participant: the master POSTs an opaque
+/// "now playing" command, followers poll it and POST their own state back.
+/// The frontend owns the JSON schema on both sides — the relay only stamps
+/// `seq`/`at` so followers can detect a NEW command (seq changed) without
+/// the relay understanding what the command says.
+#[derive(Default)]
+struct SyncShared {
+    /// Monotonic command sequence. 0 = no command ever posted.
+    seq: u64,
+    /// Latest master "now playing" command, opaque JSON owned by the frontend.
+    command: Option<serde_json::Value>,
+    /// Latest report per follower id (TV browsers in sync mode).
+    followers: HashMap<String, SyncFollower>,
+}
+
+#[derive(Clone)]
+pub struct RelayState {
+    /// reqwest client reused across VOD requests (redirects, connection pool).
+    http: reqwest::Client,
+    /// Path to the ffmpeg binary (bundled sidecar, or `ffmpeg` on PATH).
+    ffmpeg: Arc<PathBuf>,
+    /// Active restream sessions, keyed by session id (hash of source url).
+    sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    /// Per-session-id async locks, to serialize "start ffmpeg" for one URL
+    /// without blocking other sessions or segment reads.
+    starting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Recent request timestamps per host (VOD fetches and ffmpeg spawns alike),
+    /// used only to compute the `(N reqs/10s)` burst count in logs — see
+    /// `note_request`. One entry per distinct host ever seen; fine in practice
+    /// since a session only ever talks to a handful of provider hosts.
+    request_log: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    /// Spreads the stampede when several held requests are released together
+    /// at the end of a cool-down.
+    stall_seq: Arc<AtomicU64>,
+    /// Cached bounded 206 responses for the current item (see BoundedCache).
+    bounded_cache: Arc<Mutex<Option<BoundedCache>>>,
+    /// Consecutive headers-timeouts per host, for exponential backoff.
+    timeout_streak: Arc<Mutex<HashMap<String, u32>>>,
+    /// Last fresh-media-send instant per host, for FRESH_SEND_SPACING.
+    last_send: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The current VOD stream's shared ring (active OR parked), for serving
+    /// bounded reads from memory while the stream keeps flowing.
+    active_ring: Arc<Mutex<Option<ActiveRing>>>,
+    /// One parked upstream VOD connection (see WarmStream). A single slot on
+    /// purpose: the relay must never hold more than one idle provider socket.
+    warm: Arc<Mutex<Option<WarmStream>>>,
+    /// Per-host cool-down deadline, armed when a provider answers 429. While
+    /// set, requests to that host are refused locally instead of forwarded —
+    /// see `RATE_LIMIT_COOLDOWN`. One entry per distinct host ever limited.
+    rate_limited: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Debug-mode request log (see `DebugLogEntry`) — a bounded ring buffer
+    /// the frontend polls via `/api/debug/log` while its debug window is open.
+    debug_log: Arc<Mutex<VecDeque<DebugLogEntry>>>,
+    /// Monotonic id for debug-log entries, so the frontend can poll with
+    /// `?since=<id>` instead of re-fetching the whole buffer every time.
+    debug_seq: Arc<AtomicU64>,
+    /// NVENC (NVIDIA GPU H.264 encode) availability, probed once: 0=unknown,
+    /// 1=available, 2=unavailable. Lets heavy (4K/HEVC) transcodes run on the
+    /// GPU in real time instead of choking libx264 on the CPU.
+    nvenc: Arc<AtomicU8>,
+    /// Playback-sync mailbox (see `SyncShared`): the master WebView's latest
+    /// "now playing" command plus the roster of LAN follower reports, all
+    /// opaque JSON. Served by `/api/sync{,/command,/report}`.
+    sync: Arc<Mutex<SyncShared>>,
+    /// Directory for the durable playlist backup file (a stable on-disk copy of
+    /// the user's playlists, independent of the WebView storage profile).
+    backup_dir: Option<Arc<PathBuf>>,
+    /// App handle for the desktop window-control endpoint (None in tests).
+    #[cfg(desktop)]
+    app: Option<tauri::AppHandle>,
+    /// Active native Google Cast session, if any (see cast.rs). Desktop only —
+    /// mobile has no native Cast relay.
+    #[cfg(desktop)]
+    cast: Arc<Mutex<Option<crate::cast::CastHandle>>>,
+}
+
+impl RelayState {
+    fn new(ffmpeg: PathBuf, backup_dir: Option<PathBuf>, app: Option<tauri::AppHandle>) -> Self {
+        // `app` only feeds the desktop-only window-fullscreen endpoint.
+        #[cfg(not(desktop))]
+        let _ = &app;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            // Fail fast on dead/stalling upstream servers instead of hanging
+            // the WebView's fetch forever. Connect-only: streams stay open for
+            // hours, so no total/read timeout.
+            .connect_timeout(Duration::from_secs(8))
+            // Keep the idle connection pool tiny and short-lived. Observed via
+            // lsof: reqwest's defaults (unlimited idle, 90s keep-alive) left
+            // several ESTABLISHED sockets to the panel after drained fetches,
+            // and idle sockets can count against its per-IP connection limit.
+            // With warm retention + ring + cache making fresh requests rare,
+            // the pool saves little — one short-lived idle slot is plenty.
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build reqwest client");
+        Self {
+            http,
+            ffmpeg: Arc::new(ffmpeg),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            starting: Arc::new(Mutex::new(HashMap::new())),
+            request_log: Arc::new(Mutex::new(HashMap::new())),
+            bounded_cache: Arc::new(Mutex::new(None)),
+            timeout_streak: Arc::new(Mutex::new(HashMap::new())),
+            last_send: Arc::new(Mutex::new(HashMap::new())),
+            active_ring: Arc::new(Mutex::new(None)),
+            warm: Arc::new(Mutex::new(None)),
+            stall_seq: Arc::new(AtomicU64::new(0)),
+            rate_limited: Arc::new(Mutex::new(HashMap::new())),
+            debug_log: Arc::new(Mutex::new(VecDeque::new())),
+            debug_seq: Arc::new(AtomicU64::new(1)),
+            nvenc: Arc::new(AtomicU8::new(0)),
+            sync: Arc::new(Mutex::new(SyncShared::default())),
+            backup_dir: backup_dir.map(Arc::new),
+            #[cfg(desktop)]
+            app,
+            #[cfg(desktop)]
+            cast: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+struct Session {
+    output_dir: PathBuf,
+    child: Mutex<Child>,
+    last_access: AtomicI64,
+    /// Provider host this session's ffmpeg is reading from — logged when the
+    /// session stops, so `invalidate`/`reap_idle` can report which connection
+    /// just closed.
+    host: String,
+}
+
+impl Session {
+    fn manifest_path(&self) -> PathBuf {
+        self.output_dir.join("index.m3u8")
+    }
+    fn touch(&self) {
+        self.last_access.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Record one outbound request to `host` and return how many (including this
+/// one) landed within the last `REQUEST_RATE_WINDOW` — surfaced in logs as
+/// `(N reqs/10s)`. Only called at genuine outbound-to-provider events (a VOD
+/// byte fetch, or an ffmpeg spawn for live) — never for requests served from an
+/// already-open session, which don't touch the provider again.
+async fn note_request(state: &RelayState, host: &str) -> usize {
+    let mut log = state.request_log.lock().await;
+    let now = Instant::now();
+    let entry = log.entry(host.to_string()).or_insert_with(VecDeque::new);
+    entry.push_back(now);
+    while matches!(entry.front(), Some(t) if now.duration_since(*t) > REQUEST_RATE_WINDOW) {
+        entry.pop_front();
+    }
+    entry.len()
+}
+
+/// Parse a `Retry-After` delay in seconds, clamped to something sane.
+/// Only the delta-seconds form is honoured; the HTTP-date form is rare from
+/// these panels and a bad parse must never stall playback longer than the
+/// default. Returns None when absent or unparseable, so callers fall back to
+/// `RATE_LIMIT_COOLDOWN`.
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let secs: u64 = value?.trim().parse().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs).min(RATE_LIMIT_COOLDOWN_MAX))
+}
+
+/// Remaining cool-down for `host`, or None when it is free to be contacted.
+async fn rate_limit_remaining(state: &RelayState, host: &str) -> Option<Duration> {
+    let limited = state.rate_limited.lock().await;
+    limited
+        .get(host)
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+}
+
+/// Arm the cool-down for `host` after it answered 429.
+async fn note_rate_limited(state: &RelayState, host: &str, retry_after: Option<&str>) -> Duration {
+    let cooldown = parse_retry_after(retry_after).unwrap_or(RATE_LIMIT_COOLDOWN);
+    state
+        .rate_limited
+        .lock()
+        .await
+        .insert(host.to_string(), Instant::now() + cooldown);
+    cooldown
+}
+
+/// `bytes=S-` -> (S, None); `bytes=S-E` -> (S, Some(E)). Suffix, multi-part
+/// and malformed ranges return None and are sent upstream untouched.
+///
+/// Both shapes matter: WKWebView/AVFoundation mostly requests
+/// `bytes=S-<lastByte>` (bounded to end of file), NOT the open-ended form —
+/// treating only `bytes=S-` as sequential made warm retention never engage.
+fn parse_range(range: &str) -> Option<(u64, Option<u64>)> {
+    let rest = range.trim().strip_prefix("bytes=")?;
+    let (start, end) = rest.split_once('-')?;
+    if start.is_empty() {
+        return None; // suffix range `bytes=-500`
+    }
+    let start: u64 = start.parse().ok()?;
+    if end.is_empty() {
+        return Some((start, None));
+    }
+    let end: u64 = end.parse().ok()?; // multi-part `0-1, 5-` fails here
+    Some((start, Some(end)))
+}
+
+/// `bytes A-B/T` -> Some((A, B, T)). A `*` total returns None — without a
+/// real total the relay cannot synthesize Content-Range for a resumed stream.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let total: u64 = total.trim().parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some((start, end, total))
+}
+
+/// Rolling byte window [start, pos) of a VOD stream, shared between the pump
+/// (sole writer) and bounded-read serving (readers). Contiguity is the core
+/// invariant: chunks always cover exactly [start, pos), so anything inside
+/// that window can be served byte-exact from memory.
+struct StreamRing {
+    start: u64,
+    /// One past the last byte held — always equals the stream position.
+    pos: u64,
+    bytes: usize,
+    chunks: VecDeque<Bytes>,
+}
+
+impl StreamRing {
+    fn new(pos: u64) -> Self {
+        Self {
+            start: pos,
+            pos,
+            bytes: 0,
+            chunks: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, chunk: Bytes) {
+        self.pos += chunk.len() as u64;
+        self.bytes += chunk.len();
+        self.chunks.push_back(chunk);
+        while self.bytes > WARM_RING_MAX && self.chunks.len() > 1 {
+            if let Some(front) = self.chunks.pop_front() {
+                self.bytes -= front.len();
+                self.start += front.len() as u64;
+            }
+        }
+    }
+
+    /// A forward jump discarded a gap — everything held is now discontiguous
+    /// with the stream position, so drop it.
+    fn reset_to(&mut self, pos: u64) {
+        *self = Self::new(pos);
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        start <= end && start >= self.start && end < self.pos
+    }
+
+    /// Bytes for the CLOSED interval [start, end]; caller checked covers().
+    fn slice(&self, start: u64, end: u64) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        let mut off = self.start;
+        for chunk in &self.chunks {
+            let cend = off + chunk.len() as u64; // exclusive
+            if cend > start && off <= end {
+                let s = start.saturating_sub(off) as usize;
+                let e = ((end + 1).min(cend) - off) as usize;
+                out.push(chunk.slice(s..e));
+            }
+            off = cend;
+        }
+        out
+    }
+
+    /// Bytes [start, pos) — the attach-replay prefix. Empty when start >= pos.
+    fn suffix(&self, start: u64) -> Vec<Bytes> {
+        if start >= self.pos {
+            return Vec::new();
+        }
+        self.slice(start, self.pos - 1)
+    }
+}
+
+/// The current VOD stream's ring plus the metadata needed to synthesize
+/// responses from it, registered whether the stream is active or parked.
+struct ActiveRing {
+    url: String,
+    total: u64,
+    content_type: String,
+    ring: Arc<Mutex<StreamRing>>,
+}
+
+/// Stream `seed` to the client. If the client aborts mid-body (WebKit does,
+/// every few MB), the still-open provider connection is PARKED in
+/// `state.warm` for the follow-up range instead of dropped.
+fn spawn_pump(state: RelayState, seed: PumpSeed) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let PumpSeed {
+            url,
+            mut resp,
+            prefix,
+            start,
+            total,
+            content_type,
+            ring,
+        } = seed;
+        let mut aborted = false;
+
+        // Replay the ring snapshot. These bytes are ALREADY in the shared
+        // ring, so an abort here cannot leave a hole in the window.
+        for chunk in prefix {
+            if tx.send(Ok(chunk)).await.is_err() {
+                aborted = true;
+                break;
+            }
+        }
+
+        // Forward-skip: the attach point is ahead of the stream position —
+        // read and discard the gap (bounded by WARM_FORWARD_SKIP_MAX at attach
+        // time). The old window is discontiguous once we jump, so reset it.
+        let mut stream_pos = ring.lock().await.pos;
+        if !aborted && stream_pos < start {
+            ring.lock().await.reset_to(start);
+        }
+        while !aborted && stream_pos < start {
+            let chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    aborted = true;
+                    break;
+                }
+                c = resp.chunk() => c,
+            };
+            match chunk {
+                Ok(Some(chunk)) => {
+                    let clen = chunk.len() as u64;
+                    if stream_pos + clen <= start {
+                        stream_pos += clen;
+                        continue;
+                    }
+                    let keep = chunk.slice((start - stream_pos) as usize..);
+                    stream_pos += clen;
+                    ring.lock().await.push(keep.clone());
+                    if tx.send(Ok(keep)).await.is_err() {
+                        aborted = true;
+                    }
+                }
+                // EOF/error inside the gap: nothing was sent; the client sees
+                // a truncated body and simply re-requests fresh.
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        .await;
+                    return;
+                }
+            }
+        }
+        if !aborted {
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    // The client can vanish while we're blocked on the
+                    // provider; without this the abort would go unnoticed
+                    // until the next chunk arrived (possibly never), leaking
+                    // the task and missing the park entirely.
+                    _ = tx.closed() => {
+                        aborted = true;
+                        break;
+                    }
+                    c = resp.chunk() => c,
+                };
+                match chunk {
+                    Ok(Some(chunk)) => {
+                        stream_pos += chunk.len() as u64;
+                        ring.lock().await.push(chunk.clone());
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    // Fully drained — the connection finished its job.
+                    Ok(None) => return,
+                    Err(e) => {
+                        // Upstream broke mid-stream; nothing worth parking.
+                        let _ = tx
+                            .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+        if aborted && stream_pos < total {
+            log::info!("[stream] client aborted at {stream_pos}/{total} — parking upstream connection for reuse");
+            *state.warm.lock().await = Some(WarmStream {
+                url,
+                resp,
+                total,
+                content_type,
+                ring,
+                parked_at: Instant::now(),
+            });
+        }
+    });
+    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Serve bytes [start, total) from a parked connection already taken out of
+/// the slot. The caller has verified the offsets line up.
+async fn warm_attach(
+    state: &RelayState,
+    warm: WarmStream,
+    start: u64,
+    host: &str,
+    file: &str,
+) -> Option<Response> {
+    let WarmStream {
+        url,
+        resp,
+        total,
+        content_type,
+        ring,
+        ..
+    } = warm;
+    let prefix = ring.lock().await.suffix(start);
+    log::info!("[stream] warm-attach host={host} file={file} offset={start}/{total} — nothing sent upstream");
+    let ct = content_type.clone();
+    let body = spawn_pump(
+        state.clone(),
+        PumpSeed {
+            url,
+            resp,
+            prefix,
+            start,
+            total,
+            content_type,
+            ring,
+        },
+    );
+    Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, ct)
+        .header(header::CONTENT_LENGTH, (total - start).to_string())
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, total - 1, total),
+        )
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .body(body)
+        .ok()
+}
+
+// ---- VOD remux -----------------------------------------------------------
+//
+// WKWebView renders through AVFoundation, which has NO Matroska demuxer. A .mkv
+// carrying ordinary H.264 + AAC therefore fails before the first frame, while
+// the identical streams in an .mp4 play perfectly — proven with two clips that
+// differed only in container. Since the codecs already match what the engine
+// wants, the fix is a REMUX (`-c copy`), never a transcode: no re-encoding, so
+// the CPU cost is close to nothing and quality is untouched.
+//
+// The output is fragmented MP4 on ffmpeg's stdout. It is deliberately NOT fed to
+// a plain `<video src>`: a piped fMP4 carries `mvhd duration=0` and no `mehd`,
+// so the engine reports a non-finite duration, which would silently disable the
+// scrubber, credits detection and continue-watching. The player feeds it to
+// MediaSource instead and sets the duration from the header below.
+
+/// How long to wait for ffmpeg to reveal duration and keyframe offset before
+/// answering without them. Generous: this covers the provider's connect time.
+const REMUX_FACTS_TIMEOUT: Duration = Duration::from_secs(25);
+
+#[derive(Deserialize)]
+struct RemuxQuery {
+    url: String,
+    /// Seek target in seconds. `-ss` lands on the keyframe at or before it.
+    #[serde(default)]
+    t: Option<f64>,
+}
+
+/// `  Duration: 00:48:21.01, start: 0.000000, bitrate: 3095 kb/s` -> 2901.01
+fn parse_ffmpeg_duration(line: &str) -> Option<f64> {
+    let rest = line.trim().strip_prefix("Duration:")?;
+    let value = rest.split(',').next()?.trim();
+    let mut parts = value.split(':');
+    let hours: f64 = parts.next()?.trim().parse().ok()?;
+    let minutes: f64 = parts.next()?.trim().parse().ok()?;
+    let seconds: f64 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// `out_time_us=-5060313` -> -5.060313
+///
+/// With `-ss T -c copy` ffmpeg cannot cut at T; it starts at the keyframe K <= T
+/// and the fragmented output does not record that anywhere. The first progress
+/// line reports exactly K - T, which is the only way to know where the stream
+/// really begins — without it the scrubber and any subtitles would sit up to a
+/// whole GOP out of step.
+fn parse_progress_out_time(line: &str) -> Option<f64> {
+    let value = line.trim().strip_prefix("out_time_us=")?.trim();
+    if value == "N/A" {
+        return None;
+    }
+    Some(value.parse::<f64>().ok()? / 1_000_000.0)
+}
+
+fn build_remux_ffmpeg_args(source_url: &str, start_sec: f64) -> Vec<String> {
+    let referer = match url::Url::parse(source_url) {
+        Ok(u) => format!("{}://{}/", u.scheme(), u.host_str().unwrap_or_default()),
+        Err(_) => String::new(),
+    };
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        // `info` so the input dump (with its Duration line) reaches stderr.
+        "-loglevel".into(),
+        "info".into(),
+        "-user_agent".into(),
+        PLAYER_UA.into(),
+        "-headers".into(),
+        format!("Referer: {}\r\n", referer),
+        "-reconnect".into(),
+        "1".into(),
+        "-reconnect_on_network_error".into(),
+        "1".into(),
+        "-reconnect_delay_max".into(),
+        "5".into(),
+        // One HTTP connection reused across ranges instead of a new one per
+        // seek inside the file — the provider counts connections, not bytes.
+        "-multiple_requests".into(),
+        "1".into(),
+    ];
+    // NOTE: deliberately no `-fflags +genpts+igndts` here, unlike the live path.
+    // That exists to repair broken live-TS timestamps; on a well-formed
+    // Matroska it discards perfectly good container timing.
+    if start_sec > 0.0 {
+        args.push("-ss".into());
+        args.push(format!("{start_sec:.3}"));
+    }
+    // Slightly ahead of realtime: enough to build a buffer, not so fast that we
+    // pull a whole episode as quickly as the panel will serve it.
+    args.push("-readrate".into());
+    args.push("1.5".into());
+    args.push("-i".into());
+    args.push(source_url.into());
+    args.extend(
+        [
+            "-map",
+            "0:v:0",
+            // `?` = optional: a video-only file must still play.
+            "-map",
+            "0:a:0?",
+            // Video is always a stream copy — that is the expensive part and it
+            // is already what the engine wants.
+            "-c:v",
+            "copy",
+            // Audio is always re-encoded to AAC, deliberately. These containers
+            // routinely carry E-AC-3, AC-3 or DTS, none of which MediaSource
+            // can decode; copying them through produces a track the element
+            // chokes on (observed: an eac3 5.1 episode failed while an AAC one
+            // played). Deciding per-file would mean probing the provider first
+            // — an extra connection on an account that counts them — and an
+            // audio-only encode is a rounding error next to the video we skip.
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            // Downmix to stereo. A 5.1 source re-encoded as 6-channel AAC gave
+            // picture with NO sound in this WebView, and the decode failure then
+            // errored the element, closed the MediaSource and turned every
+            // later append into an InvalidStateError. Stereo always decodes,
+            // and the app outputs stereo anyway — it has no passthrough path.
+            "-ac",
+            "2",
+            "-movflags",
+            // delay_moov, NOT empty_moov. With empty_moov the header is written
+            // before the first packets are seen, so ffmpeg cannot express their
+            // starting offsets and drops them — "Track 1 starts with a nonzero
+            // dts -1024, while the moov already has been written". That -1024 is
+            // the AAC encoder's priming, and losing it slides the audio against
+            // the video. delay_moov holds the header back just long enough to
+            // record them, silencing both warnings, and the moov still lands in
+            // the first bytes so playback starts just as promptly.
+            "frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets",
+            "-f",
+            "mp4",
+            "pipe:1",
+            "-progress",
+            "pipe:2",
+            "-stats_period",
+            "0.05",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args
+}
+
+/// Stream a container the engine cannot open as fragmented MP4 it can.
+async fn remux(State(state): State<RelayState>, Query(q): Query<RemuxQuery>) -> Response {
+    let target = match parse_proxy_target(Some(q.url.as_str())) {
+        Ok(t) => t,
+        Err((status, message)) => return cors_text(status, message),
+    };
+    let start_sec = q.t.unwrap_or(0.0).max(0.0);
+    let host = host_of(target.as_str());
+    let file = target
+        .path_segments()
+        .and_then(|s| s.last())
+        .unwrap_or("?")
+        .to_string();
+
+    let args = build_remux_ffmpeg_args(target.as_str(), start_sec);
+    let mut cmd = Command::new(state.ffmpeg.as_ref());
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return cors_text(
+                StatusCode::BAD_GATEWAY,
+                format!("could not start ffmpeg ({}): {e}", state.ffmpeg.display()),
+            )
+        }
+    };
+
+    let burst = note_request(&state, &host).await;
+    log::info!("[remux] spawning ffmpeg host={host} file={file} t={start_sec:.3} ({burst} reqs/{}s)", REQUEST_RATE_WINDOW.as_secs());
+
+    // stderr carries both facts we need, plus a tail for diagnosing failures.
+    let (facts_tx, facts_rx) = tokio::sync::oneshot::channel::<(Option<f64>, Option<f64>)>();
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            let mut duration: Option<f64> = None;
+            let mut offset: Option<f64> = None;
+            let mut sent = Some(facts_tx);
+            while let Ok(Some(line)) = lines.next_line().await {
+                if duration.is_none() {
+                    duration = parse_ffmpeg_duration(&line);
+                }
+                if offset.is_none() {
+                    offset = parse_progress_out_time(&line);
+                    // The first progress line is the signal that output has
+                    // actually started — answer the client now.
+                    if offset.is_some() {
+                        if let Some(tx) = sent.take() {
+                            let _ = tx.send((duration, offset));
+                        }
+                    }
+                }
+                let mut t = tail.lock().await;
+                t.push_str(&line);
+                t.push('\n');
+                if t.len() > 4000 {
+                    let cut = t.len() - 4000;
+                    *t = t.split_off(cut);
+                }
+            }
+            // ffmpeg exited before producing output — unblock the handler.
+            if let Some(tx) = sent.take() {
+                let _ = tx.send((duration, offset));
+            }
+        });
+    }
+
+    // stdout -> bounded channel. The bound is the backpressure path: when the
+    // client stops reading, the channel fills, we stop draining, ffmpeg's pipe
+    // fills, and ffmpeg stops reading the provider.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let Some(mut stdout) = child.stdout.take() else {
+        return cors_text(StatusCode::BAD_GATEWAY, "ffmpeg produced no output pipe".into());
+    };
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        // `child` is moved in so ffmpeg lives exactly as long as the stream.
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+        let _ = child.kill().await;
+    });
+
+    let (duration, offset) = match tokio::time::timeout(REMUX_FACTS_TIMEOUT, facts_rx).await {
+        Ok(Ok(facts)) => facts,
+        _ => (None, None),
+    };
+    // K = where the stream really starts: the keyframe at or before the request.
+    //
+    // Clamped at zero. The AAC encoder's priming delay makes ffmpeg report a
+    // small negative out_time (-0.042s observed) even at t=0, and the player
+    // turns this into sourceBuffer.timestampOffset — where a negative value
+    // pushes frame timestamps below zero and MediaSource rejects the stream.
+    let actual_start = (start_sec + offset.unwrap_or(0.0)).max(0.0);
+    log::info!(
+        "[remux] streaming host={host} file={file} duration={} start={actual_start:.3} (asked {start_sec:.3})",
+        duration.map(|d| format!("{d:.3}")).unwrap_or_else(|| "?".into())
+    );
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            "X-Remux-Duration, X-Remux-Start",
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Remux-Start", format!("{actual_start:.6}"));
+    if let Some(d) = duration {
+        builder = builder.header("X-Remux-Duration", format!("{d:.6}"));
+    }
+    builder
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap_or_else(|_| cors_text(StatusCode::INTERNAL_SERVER_ERROR, "remux response".into()))
+}
+
+/// Provider host for a source url, used only for logging (never the full URL —
+/// credentials live in the query string).
+fn host_of(url_str: &str) -> String {
+    url::Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Record one request in the debug-mode log ring buffer. Cheap no-op cost
+/// when nobody has the debug window open — just an in-memory push.
+async fn push_debug_log(
+    state: &RelayState,
+    source: &'static str,
+    method: impl Into<String>,
+    url: impl Into<String>,
+    status: Option<u16>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+) {
+    let entry = DebugLogEntry {
+        id: state.debug_seq.fetch_add(1, Ordering::Relaxed),
+        ts_ms: now_ms(),
+        source,
+        method: method.into(),
+        url: url.into(),
+        status,
+        duration_ms,
+        error,
+    };
+    let mut log = state.debug_log.lock().await;
+    log.push_back(entry);
+    while log.len() > DEBUG_LOG_CAPACITY {
+        log.pop_front();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mobile fallback: serve the frontend build embedded in the binary
+// ---------------------------------------------------------------------------
+//
+// Mobile's WebView loads the UI via Tauri's own asset protocol, not this
+// server (see the `web_dir: None` branch in `router` below), so unlike desktop
+// there is no on-disk `dist/` to hand to `ServeDir` — Android's APK assets
+// aren't reachable as a plain filesystem path without an extra extraction
+// step. But another device pairing with this one as a backend (Settings →
+// Backend connection → paste this phone's LAN address) should land on a
+// working app at `/`, not a 404 — and once it does, its own relative
+// `/api/*` calls are naturally same-origin to this same relay, exactly like
+// desktop's own window loading from 127.0.0.1 (see `discoverRelay` in
+// relayDiscovery.ts). Embedding the build at compile time sidesteps the APK
+// asset problem entirely — no runtime extraction, nothing to go stale.
+
+#[cfg(not(desktop))]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../dist"]
+struct WebAssets;
+
+#[cfg(not(desktop))]
+fn asset_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "webmanifest" => "application/manifest+json",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(not(desktop))]
+async fn serve_embedded_asset(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let (served_path, file) = match WebAssets::get(path) {
+        Some(file) => (path, file),
+        // SPA fallback: `/`, and any client-side route, gets index.html —
+        // mirrors ServeDir::fallback(ServeFile::new(index)) on desktop.
+        None => match WebAssets::get("index.html") {
+            Some(file) => ("index.html", file),
+            None => return cors_text(StatusCode::NOT_FOUND, "Frontend build missing".to_string()),
+        },
+    };
+    // Vite content-hashes every asset filename except index.html itself.
+    let cache_control = if served_path == "index.html" {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, asset_mime(served_path)),
+            (header::CACHE_CONTROL, cache_control),
+        ],
+        file.data.into_owned(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// Build the relay router. `web_dir` is the built frontend (dist) so the Tauri
+/// window can load http://127.0.0.1:PORT and the app's *relative* /api calls are
+/// same-origin (mode A: server + UI). Pass `None` for headless mode B.
+/// `ffmpeg` is the path to the ffmpeg binary used for the live restream.
+/// `backup_dir` is where the durable playlist backup file is stored.
+pub fn router(
+    web_dir: Option<PathBuf>,
+    ffmpeg: PathBuf,
+    backup_dir: Option<PathBuf>,
+    app: Option<tauri::AppHandle>,
+) -> Router {
+    let state = RelayState::new(ffmpeg, backup_dir, app);
+
+    // Spawn the idle-session reaper (mirrors restreamManager's setInterval).
+    {
+        let sessions = state.sessions.clone();
+        let warm = state.warm.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                reap_idle(&sessions).await;
+                // Close a parked provider connection nobody came back for.
+                let mut slot = warm.lock().await;
+                if matches!(slot.as_ref(), Some(w) if w.parked_at.elapsed() > WARM_TTL) {
+                    log::info!("[stream] parked connection expired — closing");
+                    *slot = None;
+                }
+            }
+        });
+    }
+
+    let app = Router::new()
+        .route("/health", get(health))
+        // A newer app instance asks this (older) one to exit so it can bind the
+        // port and serve ITS OWN frontend. Without this, an old instance living
+        // in the tray keeps owning the port after an upgrade and serves its
+        // stale UI to every new window. Loopback-only.
+        .route("/api/takeover", post(takeover))
+        .route("/api/server-info", get(server_info))
+        // Debug-mode log window: GET polls for new entries, POST reports a
+        // frontend fetch, DELETE clears the buffer (its "Clear" button).
+        // Loopback-only — the buffer records what the app is fetching.
+        .route(
+            "/api/debug/log",
+            get(debug_log_get)
+                .post(debug_log_post)
+                .delete(debug_log_clear),
+        )
+        // In-app updater: download the release APK and hand it to the Android
+        // package installer (Android only; no-op error elsewhere).
+        .route(
+            "/api/update/install",
+            post(update_install)
+                .route_layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
+        .route("/api/stream", get(stream))
+        .route("/api/remux", get(remux))
+        .route("/api/restream/index.m3u8", get(restream_manifest))
+        .route("/api/restream/stop", post(restream_stop))
+        .route("/api/restream/:session/:file", get(restream_segment))
+        // Durable playlist backup (a file on disk, independent of WebView storage).
+        // Allow a large body — playlists with thousands of items can be many MB.
+        .route(
+            "/api/backup",
+            get(backup_get)
+                .put(backup_put)
+                .route_layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
+        // Playback sync: the master WebView posts a "now playing" command
+        // (loopback-only), TV browsers on the LAN poll it and report their own
+        // state back. Bodies are tiny JSON — the default body limit is plenty.
+        .route("/api/sync", get(sync_get))
+        .route("/api/sync/command", post(sync_command_post))
+        .route("/api/sync/report", post(sync_report_post))
+        // Automatic subtitle sync. POST hands the whole job to an installed
+        // ffsubsync; the GET returns only the reference speech signal so the
+        // frontend can finish with its own port of the aligner when there is
+        // no ffsubsync here. Both loopback-only: they spawn ffmpeg against a
+        // provider URL and can run for minutes, so a LAN peer reaching this
+        // relay gets the in-browser engine instead.
+        //
+        // The body carries a whole subtitle file — a few MB for a long film
+        // with per-character timing — so it needs a limit above the default.
+        .route(
+            "/api/subsync",
+            post(subsync_post).route_layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/subsync/reference", get(subsync_reference));
+
+    // Native window fullscreen — desktop only. macOS WKWebView can't use the
+    // element Fullscreen API (enabling it breaks video rendering), so the
+    // frontend pairs CSS fullscreen with this native call. Mobile uses the
+    // element Fullscreen API directly.
+    #[cfg(desktop)]
+    let app = app.route("/api/window/fullscreen", post(window_fullscreen));
+
+    // Native Google Cast (discovery, session, transport, status). Desktop speaks
+    // the Cast protocol itself via rust_cast (chrome.cast doesn't exist in
+    // WKWebView); Android proxies these to a Kotlin Cast SDK plugin (the plain
+    // System WebView has no chrome.cast either). Both present the same JSON
+    // contract, so the useChromecast relay backend works on either.
+    #[cfg(any(desktop, target_os = "android"))]
+    let app = app
+        .route("/api/cast/devices", get(cast_devices))
+        .route("/api/cast/start", post(cast_start))
+        .route("/api/cast/cmd", post(cast_cmd))
+        .route("/api/cast/status", get(cast_status));
+
+    let app = app.with_state(state);
+
+    let app = if let Some(dir) = web_dir {
+        // Serve the SPA; unknown paths fall back to index.html for client routing.
+        let index = dir.join("index.html");
+        app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+    } else {
+        #[cfg(not(desktop))]
+        {
+            app.fallback(serve_embedded_asset)
+        }
+        #[cfg(desktop)]
+        {
+            app
+        }
+    };
+
+    // Permissive CORS so the deployed HTTPS site can call this loopback relay
+    // cross-origin, including preflight (OPTIONS) for Range requests. Loopback
+    // is exempt from mixed-content blocking, so https://site → http://127.0.0.1
+    // is allowed. This handles preflight; handlers no longer set ACAO manually.
+    //
+    // `no-store` (only where a handler didn't set Cache-Control itself) keeps
+    // the WebView from ever reusing a cached copy of the app shell/assets after
+    // an update — stale JS was the source of "installed the fix but still see
+    // the old behavior".
+    app.layer(CorsLayer::permissive()).layer(
+        tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// /api/window/fullscreen — native window fullscreen for the bundled window
+// ---------------------------------------------------------------------------
+
+#[cfg(desktop)]
+#[derive(Deserialize)]
+struct FullscreenQuery {
+    /// Desired state; omitted = toggle.
+    on: Option<bool>,
+}
+
+#[cfg(desktop)]
+async fn window_fullscreen(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<FullscreenQuery>,
+) -> Response {
+    use tauri::Manager;
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let Some(app) = state.app.as_ref() else {
+        return cors_text(StatusCode::SERVICE_UNAVAILABLE, "No app handle".to_string());
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return cors_text(StatusCode::NOT_FOUND, "No main window".to_string());
+    };
+    let current = window.is_fullscreen().unwrap_or(false);
+    let target = q.on.unwrap_or(!current);
+    if let Err(e) = window.set_fullscreen(target) {
+        return cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        format!(r#"{{"fullscreen":{target}}}"#),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /api/cast/* — native Google Cast (discovery, session, transport, status)
+// ---------------------------------------------------------------------------
+
+#[cfg(desktop)]
+async fn cast_devices(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let devices =
+        tokio::task::spawn_blocking(|| crate::cast::discover(Duration::from_millis(2500)))
+            .await
+            .unwrap_or_default();
+    log::info!("[cast] discovery found {} device(s)", devices.len());
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&devices).unwrap_or_else(|_| "[]".to_string()),
+    )
+        .into_response()
+}
+
+#[cfg(desktop)]
+#[derive(Deserialize)]
+struct CastStartBody {
+    host: String,
+    port: Option<u16>,
+    name: Option<String>,
+    url: String,
+    content_type: String,
+    title: Option<String>,
+    live: Option<bool>,
+}
+
+#[cfg(desktop)]
+async fn cast_start(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(body): axum::Json<CastStartBody>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let live = body.live.unwrap_or(false);
+    let make_load = || crate::cast::CastCmd::Load {
+        url: body.url.clone(),
+        content_type: body.content_type.clone(),
+        title: body.title.clone(),
+        live,
+    };
+
+    let mut guard = state.cast.lock().await;
+    // Reuse a live session to the same device (item switch while casting).
+    if let Some(handle) = guard.as_ref() {
+        let (active, same_host) = {
+            let snap = handle.snapshot.lock().unwrap();
+            (snap.active, snap.host == body.host)
+        };
+        if active && same_host && handle.tx.send(make_load()).is_ok() {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        // Fall through: replacing the handle drops its sender, which makes the
+        // old worker stop the device app and exit.
+    }
+
+    let handle = crate::cast::start_session(
+        body.host.clone(),
+        body.port.unwrap_or(8009),
+        body.name
+            .clone()
+            .unwrap_or_else(|| "Chromecast".to_string()),
+    );
+    let _ = handle.tx.send(make_load());
+    *guard = Some(handle);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(desktop)]
+#[derive(Deserialize)]
+struct CastCmdQuery {
+    op: String,
+    t: Option<f32>,
+    level: Option<f32>,
+    muted: Option<bool>,
+}
+
+#[cfg(desktop)]
+async fn cast_cmd(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<CastCmdQuery>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let mut guard = state.cast.lock().await;
+    let Some(handle) = guard.as_ref() else {
+        return cors_text(StatusCode::NOT_FOUND, "No cast session".to_string());
+    };
+    let cmd = match q.op.as_str() {
+        "play" => crate::cast::CastCmd::Play,
+        "pause" => crate::cast::CastCmd::Pause,
+        "seek" => crate::cast::CastCmd::Seek(q.t.unwrap_or(0.0)),
+        "volume" => crate::cast::CastCmd::Volume(q.level.unwrap_or(1.0)),
+        "mute" => crate::cast::CastCmd::Mute(q.muted.unwrap_or(true)),
+        "stop" => {
+            let _ = handle.tx.send(crate::cast::CastCmd::Disconnect);
+            *guard = None;
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        _ => return cors_text(StatusCode::BAD_REQUEST, "Unknown op".to_string()),
+    };
+    let _ = handle.tx.send(cmd);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(desktop)]
+async fn cast_status(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let snapshot = state
+        .cast
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.snapshot.lock().unwrap().clone());
+    let body = match snapshot {
+        Some(snap) => serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()),
+        None => r#"{"active":false}"#.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+// --- Android native Cast: proxy /api/cast/* to the Kotlin CastPlugin ---------
+//
+// The native cast stack can't run in-process from Rust on Android (no rust_cast
+// / OpenSSL), so a small Kotlin plugin (CastPlugin.kt) drives the Google Cast
+// SDK. Its handle is captured at startup by `cast_plugin()`; the routes below
+// present the exact JSON contract of the desktop handlers above.
+
+#[cfg(target_os = "android")]
+static CAST: std::sync::OnceLock<tauri::plugin::PluginHandle<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
+/// Registers the Kotlin `CastPlugin` and stashes its handle. Add to the Tauri
+/// builder on Android.
+#[cfg(target_os = "android")]
+pub fn cast_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::<tauri::Wry, ()>::new("cast")
+        .setup(|_app, api| {
+            let handle = api.register_android_plugin("com.communityiptv.player", "CastPlugin")?;
+            let _ = CAST.set(handle);
+            Ok(())
+        })
+        .build()
+}
+
+#[cfg(target_os = "android")]
+async fn cast_call(command: &str, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+    let handle = CAST
+        .get()
+        .ok_or_else(|| "cast plugin not registered".to_string())?;
+    handle
+        .run_mobile_plugin_async::<serde_json::Value>(command, payload)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "android")]
+async fn cast_devices(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let devices = match cast_call("devices", serde_json::json!({})).await {
+        Ok(v) => v
+            .get("devices")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+        Err(e) => {
+            log::warn!("[cast] devices: {e}");
+            serde_json::json!([])
+        }
+    };
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        devices.to_string(),
+    )
+        .into_response()
+}
+
+#[cfg(target_os = "android")]
+async fn cast_start(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    match cast_call("start", body).await {
+        Ok(v)
+            if v.get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(v) => cors_text(
+            StatusCode::BAD_GATEWAY,
+            v.get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Cast failed")
+                .to_string(),
+        ),
+        Err(e) => cors_text(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn cast_cmd(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let payload = serde_json::json!({
+        "op": q.get("op").cloned().unwrap_or_default(),
+        "t": q.get("t").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+        "level": q.get("level").and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0),
+        "muted": q.get("muted").map(|s| s == "true").unwrap_or(false),
+    });
+    match cast_call("cmd", payload).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => cors_text(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn cast_status(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let body = match cast_call("status", serde_json::json!({})).await {
+        Ok(v) => v.to_string(),
+        Err(_) => r#"{"active":false}"#.to_string(),
+    };
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /api/takeover — hand the port to a newer app instance
+// ---------------------------------------------------------------------------
+
+async fn takeover(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    log::info!("[relay] takeover requested by a new instance — shutting down");
+    // `std::process::exit` skips destructors, so ffmpeg children would be
+    // orphaned; kill the restream sessions explicitly first.
+    {
+        let sessions = state.sessions.lock().await;
+        for session in sessions.values() {
+            let _ = session.child.lock().await.start_kill();
+        }
+    }
+    // Respond first, then exit shortly after so the reply reaches the caller.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::process::exit(0);
+    });
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /health
+// ---------------------------------------------------------------------------
+
+async fn health() -> Response {
+    let body = format!(
+        r#"{{"app":"ctv-relay","version":"{}"}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /api/backup — durable playlist backup (survives WebView storage resets)
+// ---------------------------------------------------------------------------
+
+fn backup_path(state: &RelayState) -> Option<PathBuf> {
+    state
+        .backup_dir
+        .as_ref()
+        .map(|dir| dir.join("playlist-backup.json"))
+}
+
+async fn backup_get(State(state): State<RelayState>) -> Response {
+    let Some(path) = backup_path(&state) else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        Err(_) => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+async fn backup_put(State(state): State<RelayState>, body: axum::body::Bytes) -> Response {
+    let (Some(dir), Some(path)) = (state.backup_dir.as_ref(), backup_path(&state)) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "No backup directory").into_response();
+    };
+    if let Err(e) = tokio::fs::create_dir_all(dir.as_ref()).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    // Write to a temp file then rename, so a crash mid-write can't corrupt the
+    // existing backup.
+    let tmp = dir.join("playlist-backup.json.tmp");
+    if let Err(e) = tokio::fs::write(&tmp, &body).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    match tokio::fs::rename(&tmp, &path).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /api/sync — playback sync between the app (master) and LAN TVs (followers)
+// ---------------------------------------------------------------------------
+//
+// The app's own WebView is the master: it publishes an opaque "now playing"
+// command, and TV browsers in sync mode poll it and mirror playback. The relay
+// only ferries JSON between them — the frontend owns the schema entirely, so
+// the contract here is just "seq changed ⇒ new command".
+
+/// Drop followers that stopped polling. Runs in both read paths so a master
+/// that only ever GETs `/api/sync` still sees a live roster, not the ghosts
+/// of every TV that ever connected.
+fn prune_followers(sync: &mut SyncShared) {
+    sync.followers
+        .retain(|_, f| f.at.elapsed() <= SYNC_FOLLOWER_TTL);
+}
+
+/// Shared "parse body as a JSON object" step for the two POST endpoints. The
+/// relay treats the contents as opaque, but it must at least be an object —
+/// the handlers inject bookkeeping fields (`seq`, `at`) into it.
+fn parse_json_object(body: &Bytes) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// GET /api/sync — current command + follower roster.
+///
+/// Deliberately open to the LAN (no loopback gate): a follower TV must be able
+/// to read the command to obey it, and the payload is only "what's playing" —
+/// nothing here grants control (that's `/api/sync/command`, which is gated).
+async fn sync_get(State(state): State<RelayState>) -> Response {
+    let mut sync = state.sync.lock().await;
+    prune_followers(&mut sync);
+    let followers: Vec<serde_json::Value> =
+        sync.followers.values().map(|f| f.report.clone()).collect();
+    let body = serde_json::json!({
+        "seq": sync.seq,
+        "command": sync.command,
+        "followers": followers,
+    });
+    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+/// POST /api/sync/command — the master publishes a "now playing" command.
+///
+/// Loopback-only, same reasoning as `/api/debug/log`: the relay binds 0.0.0.0
+/// with no authentication BY DESIGN (a TV browser can't do auth handshakes),
+/// so the only thing separating "may drive everyone's playback" from "may
+/// merely follow it" is the network position of the caller. Only the device
+/// that owns the relay — the app's own WebView, always a loopback peer — gets
+/// to be master.
+async fn sync_command_post(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let Some(mut command) = parse_json_object(&body) else {
+        return cors_text(
+            StatusCode::BAD_REQUEST,
+            "Body must be a JSON object".to_string(),
+        );
+    };
+    let mut sync = state.sync.lock().await;
+    sync.seq += 1;
+    // Stamp the command so a follower can tell NEW (seq advanced) from
+    // "still the same one", and how stale it is, without the relay knowing
+    // anything else about it.
+    if let Some(obj) = command.as_object_mut() {
+        obj.insert("seq".to_string(), serde_json::json!(sync.seq));
+        obj.insert("at".to_string(), serde_json::json!(now_ms()));
+    }
+    sync.command = Some(command);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "seq": sync.seq }).to_string(),
+    )
+        .into_response()
+}
+
+/// POST /api/sync/report — a follower reports its own playback state.
+///
+/// Open to the LAN for the same reason `/api/sync` is: followers ARE the LAN
+/// peers. A report only overwrites that follower's own roster slot (keyed by
+/// its self-chosen id) — it can't touch the command or other followers. The
+/// response carries the current command so a follower learns about new
+/// commands in the same round-trip and never needs a second poll.
+async fn sync_report_post(State(state): State<RelayState>, body: Bytes) -> Response {
+    let Some(mut report) = parse_json_object(&body) else {
+        return cors_text(
+            StatusCode::BAD_REQUEST,
+            "Body must be a JSON object".to_string(),
+        );
+    };
+    let id = match report.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            return cors_text(
+                StatusCode::BAD_REQUEST,
+                "Body must contain a non-empty string \"id\"".to_string(),
+            )
+        }
+    };
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert("at".to_string(), serde_json::json!(now_ms()));
+    }
+    let mut sync = state.sync.lock().await;
+    // Prune here too — reports arrive constantly while any TV is in sync
+    // mode, so the roster stays fresh even for a master that only GETs.
+    prune_followers(&mut sync);
+    sync.followers.insert(
+        id,
+        SyncFollower {
+            report,
+            at: Instant::now(),
+        },
+    );
+    let body = serde_json::json!({
+        "seq": sync.seq,
+        "command": sync.command,
+    });
+    ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+#[derive(Serialize)]
+struct ServerInfo {
+    app: &'static str,
+    version: &'static str,
+    port: u16,
+    origins: Vec<String>,
+    /// True for debug builds (`tauri … build --debug` / `dev`). The frontend
+    /// only runs the auto-updater when this is false (customer release builds).
+    debug: bool,
+}
+
+async fn server_info() -> Response {
+    let port = std::env::var("CTV_RELAY_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(11471);
+    let mut origins = vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ];
+
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
+                    let origin = format!("http://{}:{port}", addr.ip());
+                    if !origins.contains(&origin) {
+                        origins.push(origin);
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&ServerInfo {
+            app: "ctv-relay",
+            version: env!("CARGO_PKG_VERSION"),
+            port,
+            origins,
+            debug: cfg!(debug_assertions),
+        })
+        .unwrap_or_else(|_| "{}".to_string()),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /api/debug/log — debug-mode request log (relay-side + frontend-reported)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DebugLogQuery {
+    /// Only entries with id > since — lets the debug window poll deltas
+    /// instead of re-fetching the whole buffer every tick.
+    since: Option<u64>,
+}
+
+async fn debug_log_get(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<DebugLogQuery>,
+) -> Response {
+    // Loopback-only: the relay binds 0.0.0.0 behind permissive CORS, so without
+    // this any LAN device — or any web page the user has open — could read the
+    // request log.
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let since = q.since.unwrap_or(0);
+    let log = state.debug_log.lock().await;
+    let items: Vec<&DebugLogEntry> = log.iter().filter(|e| e.id > since).collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()),
+    )
+        .into_response()
+}
+
+async fn debug_log_clear(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    state.debug_log.lock().await.clear();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// What the frontend's fetch-wrapper reports about its own request to the
+/// relay — no `id`/`ts_ms`/`source`, those are assigned server-side.
+#[derive(Deserialize)]
+struct DebugLogSubmission {
+    method: String,
+    url: String,
+    status: Option<u16>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+}
+
+async fn debug_log_post(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(body): axum::Json<DebugLogSubmission>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    push_debug_log(
+        &state,
+        "frontend",
+        body.method,
+        body.url,
+        body.status,
+        body.duration_ms,
+        body.error,
+    )
+    .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /api/update/install — download the release APK and open the system installer
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct InstallQuery {
+    url: Option<String>,
+}
+
+async fn update_install(
+    State(state): State<RelayState>,
+    Query(q): Query<InstallQuery>,
+) -> Response {
+    let url = match q.url.as_deref() {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => {
+            return cors_text(
+                StatusCode::BAD_REQUEST,
+                "Missing url query parameter".to_string(),
+            )
+        }
+    };
+    // Only ever install our own signed GitHub release assets.
+    let host_ok = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .map(|h| h == "github.com" || h.ends_with(".githubusercontent.com"))
+        .unwrap_or(false);
+    if !host_ok {
+        return cors_text(
+            StatusCode::FORBIDDEN,
+            "Only GitHub release URLs are allowed".to_string(),
+        );
+    }
+
+    // Download into the app cache dir (TMPDIR on Android → covered by the
+    // FileProvider's cache-path, so it can be shared with the installer).
+    let apk_path = std::env::temp_dir().join("ctv-update.apk");
+    let bytes = match state
+        .http
+        .get(&url)
+        .header(header::USER_AGENT, "CommunityIPTVPlayer")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return cors_text(StatusCode::BAD_GATEWAY, format!("Download failed: {e}")),
+        },
+        Ok(resp) => {
+            return cors_text(
+                StatusCode::BAD_GATEWAY,
+                format!("Download HTTP {}", resp.status()),
+            );
+        }
+        Err(e) => return cors_text(StatusCode::BAD_GATEWAY, format!("Download failed: {e}")),
+    };
+    if let Err(e) = tokio::fs::write(&apk_path, &bytes).await {
+        return cors_text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not save APK: {e}"),
+        );
+    }
+    log::info!(
+        "[update] downloaded {} bytes to {}",
+        bytes.len(),
+        apk_path.display()
+    );
+
+    match launch_installer(&apk_path).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            log::error!("[update] installer failed: {e}");
+            cors_text(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    }
+}
+
+// The system context/Activity needed to launch the installer isn't reachable
+// from the relay's own threads (Tauri v2 doesn't populate `ndk_context`), so we
+// hand the APK path to a tiny Kotlin plugin that has the Activity and can build
+// the FileProvider URI + ACTION_VIEW intent. The plugin handle is captured once
+// at startup via `installer_plugin()` and stored here.
+#[cfg(target_os = "android")]
+static INSTALLER: std::sync::OnceLock<tauri::plugin::PluginHandle<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
+/// Registers the Kotlin `InstallerPlugin` and stashes its handle for later use
+/// by [`update_install`]. Add this to the Tauri builder on Android.
+#[cfg(target_os = "android")]
+pub fn installer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::<tauri::Wry, ()>::new("installer")
+        .setup(|_app, api| {
+            let handle =
+                api.register_android_plugin("com.communityiptv.player", "InstallerPlugin")?;
+            let _ = INSTALLER.set(handle);
+            Ok(())
+        })
+        .build()
+}
+
+/// Hand the downloaded APK to Android's package installer via the Kotlin plugin.
+#[cfg(target_os = "android")]
+async fn launch_installer(apk_path: &std::path::Path) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct InstallPayload {
+        path: String,
+    }
+    let handle = INSTALLER
+        .get()
+        .ok_or_else(|| "installer plugin not registered".to_string())?;
+    handle
+        .run_mobile_plugin_async::<serde_json::Value>(
+            "install",
+            InstallPayload {
+                path: apk_path.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("installer plugin: {e}"))
+}
+
+#[cfg(not(target_os = "android"))]
+async fn launch_installer(_apk_path: &std::path::Path) -> Result<(), String> {
+    Err("In-app install is only available on Android".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// /api/stream — byte relay (VOD / direct play)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct UrlQuery {
+    url: Option<String>,
+}
+
+/// Longest provider block-page body we will read before giving up on it. These
+/// pages are a few hundred bytes; anything larger is not an explanation.
+const BLOCK_PAGE_READ_MAX: usize = 16 * 1024;
+
+/// Longest snippet of provider prose we forward to the UI.
+const BLOCK_PAGE_TEXT_MAX: usize = 400;
+
+/// Turn a provider's HTML block page into the sentence it was trying to say.
+///
+/// XUI/Xtream panels answer an over-limit or expired-token request with a
+/// styled HTML page — "Your account has reached the maximum connections",
+/// "Token expired", a Cloudflare challenge — and until now the relay threw
+/// that body away and substituted a guess. The guess is often wrong, and it is
+/// always less useful than the panel's own words, which is the single most
+/// diagnostic thing in the whole failure.
+///
+/// Deliberately crude: strip script/style, drop tags, decode the handful of
+/// entities these pages actually use, collapse whitespace. Returns None when
+/// nothing readable survives, so the caller keeps its generic wording.
+fn html_page_text(raw: &[u8]) -> Option<String> {
+    let source = String::from_utf8_lossy(&raw[..raw.len().min(BLOCK_PAGE_READ_MAX)]);
+    let lower = source.to_ascii_lowercase();
+
+    // Drop <script>/<style> bodies wholesale — they are never the message and
+    // a minified blob would otherwise swamp the snippet.
+    let mut stripped = String::with_capacity(source.len());
+    let mut at = 0usize;
+    while at < source.len() {
+        let next = ["<script", "<style"]
+            .iter()
+            .filter_map(|tag| lower[at..].find(tag).map(|i| (at + i, *tag)))
+            .min_by_key(|(i, _)| *i);
+        match next {
+            Some((start, tag)) => {
+                stripped.push_str(&source[at..start]);
+                let close = if tag == "<script" { "</script" } else { "</style" };
+                at = match lower[start..].find(close) {
+                    Some(i) => start + i,
+                    None => source.len(),
+                };
+            }
+            None => {
+                stripped.push_str(&source[at..]);
+                break;
+            }
+        }
+    }
+
+    // Tags out, one space in their place so words either side stay separate.
+    let mut text = String::with_capacity(stripped.len());
+    let mut in_tag = false;
+    for ch in stripped.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        // Last: decoding &amp; first would corrupt an encoded "&amp;lt;".
+        .replace("&amp;", "&");
+
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(if collapsed.chars().count() > BLOCK_PAGE_TEXT_MAX {
+        let cut: String = collapsed.chars().take(BLOCK_PAGE_TEXT_MAX).collect();
+        format!("{cut}…")
+    } else {
+        collapsed
+    })
+}
+
+async fn stream(
+    State(state): State<RelayState>,
+    headers: HeaderMap,
+    Query(q): Query<UrlQuery>,
+) -> Response {
+    let target = match parse_proxy_target(q.url.as_deref()) {
+        Ok(t) => t,
+        Err((status, msg)) => return cors_text(status, msg),
+    };
+
+    let referer = format!(
+        "{}://{}/",
+        target.scheme(),
+        target.host_str().unwrap_or_default()
+    );
+    let mut req = state
+        .http
+        .get(target.clone())
+        .header(header::USER_AGENT, PLAYER_UA)
+        .header(header::ACCEPT, "*/*")
+        .header(header::REFERER, referer);
+    if let Some(range) = headers.get(header::RANGE) {
+        req = req.header(header::RANGE, range);
+    }
+
+    // Flight recorder: host + file id only (never the full URL — credentials
+    // live in the path). This is what tells us why a stream failed in the wild.
+    let host = target.host_str().unwrap_or("?").to_string();
+    let file = target
+        .path_segments()
+        .and_then(|s| s.last())
+        .unwrap_or("?")
+        .to_string();
+    let path_lower = target.path().to_ascii_lowercase();
+    let vod_media = [
+        ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mp3", ".aac", ".flac",
+    ]
+    .iter()
+    .any(|ext| path_lower.ends_with(ext));
+
+    // Try the parked connection first — a warm attach costs the provider
+    // NOTHING, so it is allowed even mid-cool-down, which is exactly when it
+    // matters most: sequential playback keeps flowing while the limit resets.
+    let client_range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range);
+    if vod_media {
+        // Serve from the stream's shared ring first — bounded reads that
+        // trail the playhead (AVFoundation's second read cursor) land here
+        // every few seconds during normal playback, and each one served from
+        // memory is a provider request that never happens. Works whether the
+        // stream is actively pumping or parked.
+        if let Some((start, Some(end))) = client_range {
+            let hit = {
+                let slot = state.active_ring.lock().await;
+                match slot.as_ref() {
+                    Some(ar) if ar.url == target.as_str() => {
+                        let r = ar.ring.lock().await;
+                        if r.covers(start, end) {
+                            Some((r.slice(start, end), ar.total, ar.content_type.clone()))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((chunks, total, ct)) = hit {
+                log::info!(
+                    "[stream] ring-serve host={host} file={file} bytes={start}-{end} — nothing sent upstream"
+                );
+                let mut buf = Vec::with_capacity((end - start + 1) as usize);
+                for c in chunks {
+                    buf.extend_from_slice(&c);
+                }
+                if let Ok(resp) = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, ct)
+                    .header(header::CONTENT_LENGTH, buf.len().to_string())
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{total}"),
+                    )
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CACHE_CONTROL, "private, max-age=3600")
+                    .body(Body::from(buf))
+                {
+                    return resp;
+                }
+            }
+        }
+
+        // Sequential requests try the parked connection next.
+        //
+        // The decision retries for up to ~150ms when a stream for this very
+        // item was just active: WebKit fires the follow-up range in the same
+        // instant it aborts the previous one, so the pump often hasn't parked
+        // yet on the first look. Without the grace, the follow-up goes fresh,
+        // the old connection then parks stale on top, and the relay briefly
+        // holds two provider sockets — the race an adversarial review called
+        // out and this exact sequence was later observed in live logs.
+        let same_item_hint = matches!(
+            state.active_ring.lock().await.as_ref(),
+            Some(ar) if ar.url == target.as_str()
+        );
+        let mut taken = None;
+        for attempt in 0..=6 {
+            taken = {
+                let mut slot = state.warm.lock().await;
+                match (slot.as_ref(), client_range) {
+                    (None, _) => None,
+                    (Some(w), _)
+                        if w.url != target.as_str() || w.parked_at.elapsed() > WARM_TTL =>
+                    {
+                        // Item switch or expiry: close it before opening anything new.
+                        log::info!("[stream] dropped parked connection (stale) host={host}");
+                        *slot = None;
+                        None
+                    }
+                    (Some(w), Some((start, end))) => {
+                        // "Sequential" = runs to end-of-file: the open-ended form
+                        // OR bounded exactly to the last byte, which is what
+                        // AVFoundation actually sends.
+                        let sequential = end.is_none() || end == Some(w.total - 1);
+                        let (ring_start, ring_pos) = {
+                            let r = w.ring.lock().await;
+                            (r.start, r.pos)
+                        };
+                        if sequential
+                            && start >= ring_start
+                            && start < w.total
+                            && start <= ring_pos + WARM_FORWARD_SKIP_MAX
+                        {
+                            slot.take()
+                        } else if sequential {
+                            // A real seek: the parked stream is at the wrong offset.
+                            log::info!("[stream] dropped parked connection (seek) host={host}");
+                            *slot = None;
+                            None
+                        } else {
+                            // Bounded mid-file read outside the ring: serve it
+                            // fresh but KEEP the parked stream — these interleave
+                            // with sequential reads, and killing the park for each
+                            // one would make retention useless.
+                            None
+                        }
+                    }
+                    (Some(_), None) => {
+                        // Full-file GET replaces the stream entirely.
+                        *slot = None;
+                        None
+                    }
+                }
+            };
+            if taken.is_some() || !same_item_hint {
+                break;
+            }
+            if attempt < 6 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        if let Some(w) = taken {
+            if let Some((start, _)) = client_range {
+                if let Some(resp) = warm_attach(&state, w, start, &host, &file).await {
+                    return resp;
+                }
+            }
+        }
+    }
+
+    // Repeat bounded reads (moov/index probes) are byte-identical across
+    // seeks — serve them from the per-item cache instead of the provider.
+    // This is what turns the 2nd..Nth seek from a request burst into ~one
+    // request.
+    if vod_media {
+        if let Some((start, Some(end))) = client_range {
+            let cached = {
+                let mut slot = state.bounded_cache.lock().await;
+                match slot.as_mut() {
+                    Some(c) if c.url == target.as_str() => c
+                        .get((start, end))
+                        .map(|b| (b, c.total, c.content_type.clone())),
+                    _ => None,
+                }
+            };
+            if let Some((bytes, total, ct)) = cached {
+                log::info!(
+                    "[stream] cache-serve host={host} file={file} bytes={start}-{end} — nothing sent upstream"
+                );
+                if let Ok(resp) = Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, ct)
+                    .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                    .header(
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{total}"),
+                    )
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CACHE_CONTROL, "private, max-age=3600")
+                    .body(Body::from(bytes))
+                {
+                    return resp;
+                }
+            }
+        }
+    }
+
+    // Live playback replaces VOD entirely — release any parked VOD socket
+    // BEFORE the direct-ts stream opens its own provider connection, or the
+    // two would briefly count together against the panel's (often single-slot)
+    // per-IP limit.
+    if path_lower.ends_with(".ts") && state.warm.lock().await.take().is_some() {
+        log::info!("[stream] dropped parked connection (live playback starting) host={host}");
+    }
+
+    // Circuit breaker: this host recently answered 429, so do NOT add to its
+    // load. Answer locally — the whole point is that nothing goes upstream
+    // while the provider's per-IP limit is trying to reset.
+    if rate_limit_remaining(&state, &host).await.is_some() {
+        // Hold the request rather than rejecting it instantly, looping across
+        // RE-ARMS: a burst can re-trip the breaker while we wait, and failing
+        // then hands the media element a 429 it treats as fatal ("Load
+        // failed") one second before the limit clears. The jitter keeps the
+        // piled-up requests from stampeding out in the same millisecond.
+        let waited = Instant::now();
+        let deadline = waited + RATE_LIMIT_TOTAL_STALL;
+        while let Some(remaining) = rate_limit_remaining(&state, &host).await {
+            // A cool-down that cannot possibly expire within the stall budget
+            // (the exponential timeout backoffs reach 60s) is not worth
+            // holding for: stalling ~10s and THEN failing is the worst of
+            // both. Fail fast instead so the player can show its error and
+            // retry on its own schedule.
+            if Instant::now() + remaining > deadline {
+                break;
+            }
+            let jitter = Duration::from_millis(
+                (state.stall_seq.fetch_add(1, Ordering::Relaxed) % 400) as u64,
+            );
+            let nap = remaining.min(RATE_LIMIT_MAX_STALL) + jitter;
+            log::warn!(
+                "[stream] host={host} file={file} rate-limited, holding request ({}s left)",
+                remaining.as_secs() + 1
+            );
+            tokio::time::sleep(nap).await;
+        }
+
+        // Usually free by now, so fall through and actually try it: the
+        // client gets video instead of an error and never notices the pause.
+        if let Some(still) = rate_limit_remaining(&state, &host).await {
+            push_debug_log(
+                &state,
+                "relay",
+                "GET",
+                format!("{host}/{file}"),
+                Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                Some(waited.elapsed().as_millis() as u64),
+                Some(format!(
+                    "held {}ms, still cooling down {}s — not sent upstream",
+                    waited.elapsed().as_millis(),
+                    still.as_secs() + 1
+                )),
+            )
+            .await;
+            return cors_text(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "The provider is rate-limiting this connection. Pausing requests for {}s so it can recover.",
+                    still.as_secs() + 1
+                ),
+            );
+        }
+    }
+
+    // Space out fresh media sends per host — a seek fires 3-4 concurrent
+    // opens in the same instant, which reads as abuse to the panel.
+    if vod_media || path_lower.ends_with(".ts") {
+        let wait = {
+            let mut last = state.last_send.lock().await;
+            let now = Instant::now();
+            let earliest = last
+                .get(&host)
+                .map(|prev| *prev + FRESH_SEND_SPACING)
+                .filter(|t| *t > now)
+                .unwrap_or(now)
+                .min(now + FRESH_SEND_TAIL_CAP);
+            last.insert(host.clone(), earliest);
+            earliest.saturating_duration_since(now)
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    let started = Instant::now();
+    let burst = note_request(&state, &host).await;
+
+    let upstream = match tokio::time::timeout(UPSTREAM_HEADERS_TIMEOUT, req.send()).await {
+        Err(_) => {
+            // Connected but never answered. Dropping the future here closes the
+            // socket, which is the whole point: hand the slot back instead of
+            // holding it hostage. A hang IS the panel throttling us — and a
+            // flat 5s pause just produced another 12s hang in practice, so
+            // consecutive timeouts back off exponentially instead.
+            let streak = {
+                let mut streaks = state.timeout_streak.lock().await;
+                let n = streaks.entry(host.clone()).or_insert(0);
+                *n += 1;
+                *n
+            };
+            let cooldown = timeout_cooldown(streak);
+            state
+                .rate_limited
+                .lock()
+                .await
+                .insert(host.clone(), Instant::now() + cooldown);
+            log::warn!(
+                "[stream] timeout streak {streak} for host={host} — backing off {}s",
+                cooldown.as_secs()
+            );
+            log::warn!(
+                "[stream] TIMEOUT host={host} file={file} — no response headers in {}s ({burst} reqs/{}s)",
+                UPSTREAM_HEADERS_TIMEOUT.as_secs(),
+                REQUEST_RATE_WINDOW.as_secs()
+            );
+            push_debug_log(
+                &state,
+                "relay",
+                "GET",
+                format!("{host}/{file}"),
+                Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+                Some(started.elapsed().as_millis() as u64),
+                Some(format!(
+                    "no response in {}s",
+                    UPSTREAM_HEADERS_TIMEOUT.as_secs()
+                )),
+            )
+            .await;
+            return cors_text(
+                StatusCode::GATEWAY_TIMEOUT,
+                "The provider accepted the connection but never responded. It is likely overloaded — try again shortly.".to_string(),
+            );
+        }
+        Ok(Ok(r)) => {
+            // The provider answered — whatever the status, it is not hung.
+            state.timeout_streak.lock().await.remove(&host);
+            r
+        }
+        Ok(Err(e)) => {
+            log::warn!(
+                "[stream] FAIL host={host} file={file} after {}ms ({burst} reqs/{}s): {e}",
+                started.elapsed().as_millis(),
+                REQUEST_RATE_WINDOW.as_secs()
+            );
+            push_debug_log(
+                &state,
+                "relay",
+                "GET",
+                format!("{host}/{file}"),
+                None,
+                Some(started.elapsed().as_millis() as u64),
+                Some(e.to_string()),
+            )
+            .await;
+            return cors_text(
+                StatusCode::BAD_GATEWAY,
+                format!("Relay could not reach the provider: {e}"),
+            );
+        }
+    };
+
+    let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let range_dbg = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    log::info!(
+        "[stream] {} host={host} file={file} range={range_dbg} type={content_type:?} len={:?} in {}ms ({burst} reqs/{}s)",
+        status.as_u16(),
+        upstream
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-"),
+        started.elapsed().as_millis(),
+        REQUEST_RATE_WINDOW.as_secs()
+    );
+    push_debug_log(
+        &state,
+        "relay",
+        "GET",
+        format!("{host}/{file}"),
+        Some(status.as_u16()),
+        Some(started.elapsed().as_millis() as u64),
+        None,
+    )
+    .await;
+
+    // The provider is refusing on volume. Arm the cool-down so the media
+    // element's relentless re-asks stop reaching it — without this, a single
+    // 429 turns into a self-sustaining storm (~3 req/s) that keeps the limit
+    // tripped and playback never recovers.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = upstream
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok());
+        let cooldown = note_rate_limited(&state, &host, retry_after).await;
+        log::warn!(
+            "[stream] 429 from host={host} file={file} — pausing upstream requests for {}s",
+            cooldown.as_secs()
+        );
+        return cors_text(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "The provider is rate-limiting this connection. Pausing requests for {}s so it can recover.",
+                cooldown.as_secs()
+            ),
+        );
+    }
+
+    // XUI-style panels answer a media URL with an HTML block page when the
+    // per-IP connection/rate limit trips. Piping that into <video> yields an
+    // opaque decode error; return a clear, retryable 502 instead.
+    if (vod_media || path_lower.ends_with(".ts")) && content_type.contains("text/html") {
+        // Same signal as a 429, just dressed up as a 200: XUI panels serve a
+        // block page when the account is over its connection limit. Arm the
+        // same cool-down, or the media element's retries keep the limit
+        // pinned exactly as they did for the explicit 429 case.
+        let cooldown = note_rate_limited(&state, &host, None).await;
+        // Read the page. It is the provider telling us, in words, why it
+        // refused — "maximum connections reached", "token expired", a
+        // Cloudflare challenge — and substituting our own guess for it is how
+        // a specific, actionable failure became "something went wrong".
+        let provider_said = match upstream.bytes().await {
+            Ok(body) => html_page_text(&body),
+            Err(_) => None,
+        };
+        log::warn!(
+            "[stream] provider sent HTML for media host={host} file={file} status={} — pausing upstream requests for {}s — page said: {}",
+            status.as_u16(),
+            cooldown.as_secs(),
+            provider_said.as_deref().unwrap_or("(nothing readable)")
+        );
+        // Overwrite the "200 OK" already recorded above, which reads as
+        // success in the debug window and hides the real cause.
+        push_debug_log(
+            &state,
+            "relay",
+            "GET",
+            format!("{host}/{file}"),
+            Some(StatusCode::BAD_GATEWAY.as_u16()),
+            Some(started.elapsed().as_millis() as u64),
+            Some(match provider_said.as_deref() {
+                Some(text) => format!("provider HTML block page (HTTP {}): {text}", status.as_u16()),
+                None => format!(
+                    "provider sent an HTML block page, not video — pausing {}s",
+                    cooldown.as_secs()
+                ),
+            }),
+        )
+        .await;
+        return cors_text(
+            StatusCode::BAD_GATEWAY,
+            match provider_said.as_deref() {
+                Some(text) => format!(
+                    "The provider answered with a web page instead of video (HTTP {}). It said: “{text}”",
+                    status.as_u16()
+                ),
+                None => "Provider returned an HTML page instead of video (likely a temporary connection limit). Try again shortly.".to_string(),
+            },
+        );
+    }
+
+    let mut builder = Response::builder().status(status);
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::ACCEPT_RANGES,
+        header::CONTENT_RANGE,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(v) = upstream.headers().get(&name) {
+            builder = builder.header(name, v);
+        }
+    }
+    // Let the WebView cache VOD range responses (the global no-store layer only
+    // fills in when a handler sets nothing). Without this, every seek/probe
+    // re-opens a provider connection — rapid bursts trip XUI connection limits
+    // and the panel starts serving HTML block pages instead of video. Live
+    // segments (.ts) and API JSON stay uncached.
+    if vod_media && upstream.headers().get(header::CACHE_CONTROL).is_none() {
+        builder = builder.header(header::CACHE_CONTROL, "private, max-age=3600");
+    }
+
+    // Warm retention: pump open-ended VOD 206 bodies ourselves so a client
+    // abort parks the provider connection for the next sequential range
+    // instead of tearing it down (see WARM_TTL for why that matters).
+    if vod_media && status == StatusCode::PARTIAL_CONTENT {
+        let range_info = upstream
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range);
+        // Bounded mid-file read: buffer it (they're small) and cache it —
+        // seeks re-issue these byte-identical, and serving the repeats from
+        // memory is what keeps later seeks down to ~one provider request.
+        if let Some((a, b, total)) = range_info
+            .filter(|(a, b, t)| b + 1 != *t && b >= a && (b - a) < BOUNDED_CACHE_ENTRY_MAX as u64)
+        {
+            return match upstream.bytes().await {
+                Ok(data) if data.len() as u64 == b - a + 1 => {
+                    {
+                        let mut slot = state.bounded_cache.lock().await;
+                        match slot.as_mut() {
+                            Some(c) if c.url == target.as_str() => c.insert((a, b), data.clone()),
+                            _ => {
+                                // New item (or first bounded read): start a
+                                // fresh cache for it.
+                                let mut c = BoundedCache::new(
+                                    target.as_str().to_string(),
+                                    total,
+                                    content_type.clone(),
+                                );
+                                c.insert((a, b), data.clone());
+                                *slot = Some(c);
+                            }
+                        }
+                    }
+                    match builder.body(Body::from(data)) {
+                        Ok(resp) => resp,
+                        Err(e) => cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    }
+                }
+                // Short read or upstream error: the copied Content-Length no
+                // longer matches, so a clean retryable error beats a
+                // truncated 206.
+                Ok(_) | Err(_) => cors_text(
+                    StatusCode::BAD_GATEWAY,
+                    "Provider closed the connection mid-response. Try again shortly.".to_string(),
+                ),
+            };
+        }
+
+        // Only park streams that run to end-of-file.
+        if let Some((range_start, range_end, total)) = range_info.filter(|(_, e, t)| e + 1 == *t) {
+            let _ = range_end;
+            // Fresh sequential stream: new shared ring, registered so bounded
+            // reads can be served from it while this stream flows.
+            let ring = Arc::new(Mutex::new(StreamRing::new(range_start)));
+            *state.active_ring.lock().await = Some(ActiveRing {
+                url: target.as_str().to_string(),
+                total,
+                content_type: content_type.clone(),
+                ring: ring.clone(),
+            });
+            let body = spawn_pump(
+                state.clone(),
+                PumpSeed {
+                    url: target.as_str().to_string(),
+                    resp: upstream,
+                    prefix: Vec::new(),
+                    start: range_start,
+                    total,
+                    content_type: content_type.clone(),
+                    ring,
+                },
+            );
+            return match builder.body(body) {
+                Ok(resp) => resp,
+                Err(e) => cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+        }
+    }
+
+    match builder.body(Body::from_stream(upstream.bytes_stream())) {
+        Ok(resp) => resp,
+        Err(e) => cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /api/restream — live TV via ffmpeg → HLS
+// ---------------------------------------------------------------------------
+
+/// `POST /api/restream/stop` — tear down a live restream on demand.
+///
+/// Without this, nothing could ever stop an ffmpeg: the only teardown was the
+/// 120s idle reaper (`SESSION_TTL`) and the implicit kill when a DIFFERENT
+/// channel started. So closing the player, switching to VOD, or hls.js giving
+/// up and the app falling back to `direct-ts` all left ffmpeg pulling the
+/// provider for up to two more minutes with nobody watching — and on a
+/// one-slot account, the next thing the user did was refused.
+///
+/// `url` names the source to stop; omitting it stops every live session, which
+/// is what page-unload wants ("I am gone, release everything"). Idempotent, and
+/// a stop for something already gone is a success, so callers can fire it
+/// without first checking whether anything is running.
+async fn restream_stop(State(state): State<RelayState>, Query(q): Query<UrlQuery>) -> Response {
+    let stopped = match q.url.as_deref() {
+        Some(raw) => {
+            let target = match parse_proxy_target(Some(raw)) {
+                Ok(t) => t,
+                Err((status, msg)) => return cors_text(status, msg),
+            };
+            let id = session_id(target.as_str());
+            let existed = state.sessions.lock().await.contains_key(&id);
+            invalidate(&state, &id).await;
+            usize::from(existed)
+        }
+        None => {
+            let ids: Vec<String> = state.sessions.lock().await.keys().cloned().collect();
+            for id in &ids {
+                invalidate(&state, id).await;
+            }
+            ids.len()
+        }
+    };
+    log::info!("[restream] stop requested — {stopped} session(s) ended");
+    cors_text(StatusCode::OK, format!("stopped {stopped}"))
+}
+
+async fn restream_manifest(State(state): State<RelayState>, Query(q): Query<UrlQuery>) -> Response {
+    let target = match parse_proxy_target(q.url.as_deref()) {
+        Ok(t) => t,
+        Err((status, msg)) => return cors_text(status, msg),
+    };
+    // Live restream replaces VOD — release any parked VOD socket before
+    // ffmpeg opens its provider connection (see the same clear in stream()).
+    if state.warm.lock().await.take().is_some() {
+        log::info!("[restream] dropped parked VOD connection (live restream starting)");
+    }
+    // Live source must be an Xtream MPEG-TS (.ts) URL; never re-introduce .m3u8.
+    let path = target.path().to_lowercase();
+    if !path.ends_with(".ts") {
+        return cors_text(
+            StatusCode::BAD_REQUEST,
+            "Restream source must be an Xtream MPEG-TS (.ts) URL".to_string(),
+        );
+    }
+    let source = target.to_string();
+
+    // Try once; on failure invalidate and retry (mirrors restreamHandler.ts).
+    let mut last_err = String::from("Restream manifest failed");
+    for attempt in 0..2u8 {
+        match get_or_start(&state, &source, attempt > 0).await {
+            Ok(session) => match read_manifest(&session).await {
+                Ok(manifest) => {
+                    session.touch();
+                    let rewritten = rewrite_manifest(&manifest, &session_id(&source));
+                    return (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                            (header::CACHE_CONTROL, "no-store"),
+                        ],
+                        rewritten,
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    last_err = e;
+                    invalidate(&state, &session_id(&source)).await;
+                }
+            },
+            Err(e) => {
+                last_err = e;
+                invalidate(&state, &session_id(&source)).await;
+            }
+        }
+    }
+    log::warn!(
+        "[restream] FAIL host={} : {}",
+        target.host_str().unwrap_or("?"),
+        last_err.chars().take(300).collect::<String>()
+    );
+    cors_text(StatusCode::BAD_GATEWAY, last_err)
+}
+
+async fn restream_segment(
+    State(state): State<RelayState>,
+    AxumPath((session_id, file)): AxumPath<(String, String)>,
+) -> Response {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(&session_id) {
+            Some(s) => s.clone(),
+            None => {
+                return cors_text(
+                    StatusCode::NOT_FOUND,
+                    "Restream session not found or expired".to_string(),
+                )
+            }
+        }
+    };
+    // Reject if ffmpeg already exited.
+    if session
+        .child
+        .lock()
+        .await
+        .try_wait()
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return cors_text(
+            StatusCode::NOT_FOUND,
+            "Restream session not found or expired".to_string(),
+        );
+    }
+    session.touch();
+
+    match read_segment(&session, &file).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "video/mp2t"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => cors_text(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg session management (port of restreamManager.ts)
+// ---------------------------------------------------------------------------
+
+fn session_id(source_url: &str) -> String {
+    let mut h = DefaultHasher::new();
+    source_url.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn output_dir_for(id: &str) -> PathBuf {
+    std::env::temp_dir().join("iptv-restream").join(id)
+}
+
+/// What ffmpeg should do with each stream. Copying is cheap but only works when
+/// the codec is already browser-decodable (H.264 video / AAC|MP3 audio). HEVC,
+/// MPEG-2, AC-3, etc. must be transcoded to play in a WebView/MSE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EncodeMode {
+    video_copy: bool,
+    audio_copy: bool,
+}
+
+impl EncodeMode {
+    const COPY: Self = Self {
+        video_copy: true,
+        audio_copy: true,
+    };
+    const TRANSCODE: Self = Self {
+        video_copy: false,
+        audio_copy: false,
+    };
+}
+
+/// Outcome of starting ffmpeg: a healthy session, a request to restart with a
+/// corrected encode mode (the source codec wasn't browser-native), or a failure.
+enum StartError {
+    Restart(EncodeMode),
+    Failed(String),
+}
+
+fn start_error_message(err: StartError) -> String {
+    match err {
+        StartError::Failed(msg) => msg,
+        StartError::Restart(_) => "ffmpeg restart requested".to_string(),
+    }
+}
+
+#[derive(Clone, Default)]
+struct DetectedCodecs {
+    video: Option<String>,
+    audio: Option<String>,
+}
+
+/// Browsers (MSE) decode H.264 reliably; HEVC/H.265, MPEG-2, VP9, AV1 do not.
+fn video_browser_friendly(codec: &str) -> bool {
+    codec.eq_ignore_ascii_case("h264")
+}
+
+/// AAC and MP3 are broadly decodable in MSE; AC-3/E-AC-3/MP2/DTS are not.
+fn audio_browser_friendly(codec: &str) -> bool {
+    matches!(codec.to_ascii_lowercase().as_str(), "aac" | "mp3")
+}
+
+/// Pull the codec name from an ffmpeg input-dump line, e.g.
+/// `Stream #0:0: Video: hevc (Main 10) ...` -> (is_video=true, "hevc").
+fn parse_stream_codec(line: &str) -> Option<(bool, String)> {
+    for (is_video, marker) in [(true, "Video: "), (false, "Audio: ")] {
+        if let Some(i) = line.find(marker) {
+            let codec = line[i + marker.len()..]
+                .split([' ', ',', '('])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !codec.is_empty() {
+                return Some((is_video, codec));
+            }
+        }
+    }
+    None
+}
+
+fn build_ffmpeg_args(
+    source_url: &str,
+    output_dir: &PathBuf,
+    mode: EncodeMode,
+    use_nvenc: bool,
+) -> Vec<String> {
+    let manifest = output_dir.join("index.m3u8");
+    let segment_pattern = output_dir.join("seg_%03d.ts");
+    let referer = match url::Url::parse(source_url) {
+        Ok(u) => format!("{}://{}/", u.scheme(), u.host_str().unwrap_or_default()),
+        Err(_) => String::new(),
+    };
+
+    // `-loglevel info` so ffmpeg prints the input stream dump (the "Video: hevc"
+    // line) we parse to decide copy-vs-transcode — no separate probe connection.
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "info".into(),
+        "-user_agent".into(),
+        PLAYER_UA.into(),
+        "-headers".into(),
+        format!("Referer: {}\r\n", referer),
+        "-reconnect".into(),
+        "1".into(),
+        "-reconnect_streamed".into(),
+        "1".into(),
+        "-reconnect_delay_max".into(),
+        "5".into(),
+        "-fflags".into(),
+        "+genpts+igndts".into(),
+        "-i".into(),
+        source_url.into(),
+    ];
+
+    // Common to both encoders: force an IDR keyframe every 2s (aligned with
+    // hls_time) so EVERY HLS segment starts on a keyframe. Without this the
+    // source GOP (often 5–10s) leaves most segments starting mid-GOP, which
+    // decodes as gray macroblock garbage until the next keyframe (the periodic
+    // glitch). Convert to 8-bit yuv420p so 10-bit HEVC (Main10) sources don't
+    // yield output the browser can't decode (and which H.264 NVENC can't make).
+    if mode.video_copy {
+        args.extend(["-c:v", "copy"].iter().map(|s| s.to_string()));
+    } else if use_nvenc {
+        // GPU (NVENC): cap at 1080p; ~2x real-time even for 4K/50fps HEVC, where
+        // libx264 falls behind (~0.7x) and the stream buffers.
+        args.extend(
+            [
+                "-vf",
+                "scale=min(1920\\,iw):-2,format=yuv420p",
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-tune",
+                "ll",
+                "-b:v",
+                "6M",
+                "-maxrate",
+                "8M",
+                "-bufsize",
+                "12M",
+                "-forced-idr",
+                "1",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*2)",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    } else {
+        // CPU (libx264): cap at 720p so software encode can keep up in real time.
+        args.extend(
+            [
+                "-vf",
+                "scale=min(1280\\,iw):-2,format=yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*2)",
+                "-sc_threshold",
+                "0",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+    }
+
+    if mode.audio_copy {
+        args.extend(["-c:a", "copy"].iter().map(|s| s.to_string()));
+    } else {
+        args.extend(
+            ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+    }
+
+    args.extend(
+        [
+            "-f",
+            "hls",
+            "-hls_time",
+            "2",
+            "-hls_list_size",
+            "15",
+            "-hls_flags",
+            "append_list+omit_endlist+program_date_time",
+            "-hls_segment_filename",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args.push(segment_pattern.to_string_lossy().replace('\\', "/"));
+    args.push(manifest.to_string_lossy().replace('\\', "/"));
+
+    args
+}
+
+/// NVENC availability, probed once and cached. Lets heavy 4K/HEVC transcodes run
+/// on the GPU in real time (libx264 on CPU can't keep up with 4K/50fps).
+async fn nvenc_available(state: &RelayState) -> bool {
+    match state.nvenc.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let ok = probe_nvenc(state.ffmpeg.as_ref()).await;
+    state.nvenc.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    if ok {
+        log::info!("[Restream] NVENC available — GPU transcode for heavy sources");
+    } else {
+        log::info!("[Restream] NVENC unavailable — using libx264 (CPU) transcode");
+    }
+    ok
+}
+
+/// Encode one tiny frame with h264_nvenc to confirm the GPU encoder initializes.
+async fn probe_nvenc(ffmpeg: &PathBuf) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "nullsrc=s=320x240",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    matches!(cmd.status().await, Ok(s) if s.success())
+}
+
+/// Get a healthy session for the source url, or start ffmpeg (copy, then
+/// transcode fallback). Serialized per session id so concurrent manifest hits
+/// for the same URL don't spawn duplicate ffmpeg processes.
+async fn get_or_start(
+    state: &RelayState,
+    source_url: &str,
+    force_restart: bool,
+) -> Result<Arc<Session>, String> {
+    let id = session_id(source_url);
+
+    let id_lock = {
+        let mut starting = state.starting.lock().await;
+        starting.entry(id.clone()).or_default().clone()
+    };
+    let _guard = id_lock.lock().await;
+
+    if force_restart {
+        invalidate(state, &id).await;
+    }
+
+    // Reuse a healthy existing session.
+    {
+        let existing = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&id).cloned()
+        };
+        if let Some(existing) = existing {
+            if is_healthy(&existing).await {
+                existing.touch();
+                // Switching back to a still-running channel: drop the others.
+                stop_other_sessions(state, &id).await;
+                return Ok(existing);
+            }
+        }
+    }
+    // Drop any unhealthy session before starting fresh — and stop every OTHER
+    // session BEFORE spawning, not after.
+    //
+    // ffmpeg holds a provider connection for as long as it lives, so starting
+    // the new channel first left the previous channel's ffmpeg pulling the
+    // provider across the whole startup: normally 2-5s, but up to ~40s when the
+    // copy attempt burns its deadline and falls through to transcode. On an
+    // account with one connection slot, that overlap IS the failure — the panel
+    // answers the second request with a block page ("maximum connections",
+    // "token expired") instead of video, and nobody was watching the old stream
+    // anyway. Order is the entire fix; the same reasoning is why remuxSource.ts
+    // aborts its previous fetch before opening the next one.
+    invalidate(state, &id).await;
+    stop_other_sessions(state, &id).await;
+
+    // First attempt: copy (cheap) while detecting the source codecs from
+    // ffmpeg's input dump. If the source isn't browser-native (e.g. HEVC video),
+    // restart with the right transcode mode. If copy fails outright, fall back to
+    // a full transcode.
+    let session = match run_ffmpeg_session(state, source_url, &id, EncodeMode::COPY, true).await {
+        Ok(s) => s,
+        Err(StartError::Restart(mode)) => {
+            log::info!("[Restream] source not browser-native; re-encoding ({mode:?})");
+            run_ffmpeg_session(state, source_url, &id, mode, false)
+                .await
+                .map_err(start_error_message)?
+        }
+        Err(StartError::Failed(copy_err)) => {
+            log::warn!("[Restream] stream copy failed, retrying with transcode: {copy_err}");
+            run_ffmpeg_session(state, source_url, &id, EncodeMode::TRANSCODE, false)
+                .await
+                .map_err(start_error_message)?
+        }
+    };
+    Ok(session)
+}
+
+/// Kill and remove every restream session except `keep_id` (single active live
+/// stream). Called when a channel starts/switches.
+async fn stop_other_sessions(state: &RelayState, keep_id: &str) {
+    let others: Vec<String> = {
+        let sessions = state.sessions.lock().await;
+        sessions.keys().filter(|k| *k != keep_id).cloned().collect()
+    };
+    for id in others {
+        invalidate(state, &id).await;
+    }
+}
+
+async fn run_ffmpeg_session(
+    state: &RelayState,
+    source_url: &str,
+    id: &str,
+    mode: EncodeMode,
+    detect: bool,
+) -> Result<Arc<Session>, StartError> {
+    let output_dir = output_dir_for(id);
+    let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|e| StartError::Failed(format!("could not create restream dir: {e}")))?;
+
+    // Use the GPU (NVENC) for video transcodes when available — essential for
+    // 4K/HEVC sources that overwhelm libx264 on the CPU.
+    let use_nvenc = if mode.video_copy {
+        false
+    } else {
+        nvenc_available(state).await
+    };
+    let args = build_ffmpeg_args(source_url, &output_dir, mode, use_nvenc);
+    let mut cmd = Command::new(state.ffmpeg.as_ref());
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        // Kill ffmpeg if the Session (and its Child) is dropped without an
+        // explicit kill — e.g. on app shutdown — so no orphan keeps streaming.
+        .kill_on_drop(true);
+    // Windows: don't pop up a console window for the ffmpeg child process.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        StartError::Failed(format!(
+            "could not start ffmpeg ({}): {e}",
+            state.ffmpeg.display()
+        ))
+    })?;
+
+    let host = host_of(source_url);
+    let burst = note_request(state, &host).await;
+    log::info!(
+        "[restream] spawning ffmpeg host={host} mode={mode:?} nvenc={use_nvenc} ({burst} reqs/{}s)",
+        REQUEST_RATE_WINDOW.as_secs()
+    );
+    push_debug_log(state, "relay", "FFMPEG", host.clone(), None, None, None).await;
+
+    // Drain stderr: keep a tail for error messages AND parse the input dump to
+    // learn the source codecs (for the copy-vs-transcode decision).
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let codecs = Arc::new(Mutex::new(DetectedCodecs::default()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        let codecs = codecs.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some((is_video, codec)) = parse_stream_codec(&line) {
+                    let mut c = codecs.lock().await;
+                    if is_video {
+                        if c.video.is_none() {
+                            c.video = Some(codec);
+                        }
+                    } else if c.audio.is_none() {
+                        c.audio = Some(codec);
+                    }
+                }
+                let mut t = tail.lock().await;
+                t.push_str(&line);
+                t.push('\n');
+                if t.len() > 4000 {
+                    let cut = t.len() - 4000;
+                    *t = t.split_off(cut);
+                }
+            }
+        });
+    }
+
+    let manifest_path = output_dir.join("index.m3u8");
+    let timeout = if !mode.video_copy {
+        Duration::from_millis(25_000)
+    } else if !mode.audio_copy {
+        Duration::from_millis(20_000)
+    } else {
+        Duration::from_millis(15_000)
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut video_seen_at: Option<tokio::time::Instant> = None;
+
+    loop {
+        // ffmpeg exited before producing a manifest → real failure.
+        if let Ok(Some(_)) = child.try_wait() {
+            let _ = tokio::fs::remove_dir_all(&output_dir).await;
+            let tail = stderr_tail.lock().await.trim().to_string();
+            let msg = if tail.is_empty() {
+                "ffmpeg exited before producing an HLS manifest".to_string()
+            } else {
+                tail
+            };
+            return Err(StartError::Failed(msg));
+        }
+
+        // On the initial copy/detect attempt, decide copy-vs-transcode from the
+        // codecs ffmpeg reported. Only accept the copy output once the codecs are
+        // confirmed browser-native.
+        let mut codecs_ok = !detect;
+        if detect {
+            let detected = codecs.lock().await.clone();
+            if let Some(video) = detected.video.as_deref() {
+                if video_seen_at.is_none() {
+                    video_seen_at = Some(tokio::time::Instant::now());
+                }
+                if !video_browser_friendly(video) {
+                    // Video must be re-encoded; copy audio only if it's friendly.
+                    let audio_copy = detected
+                        .audio
+                        .as_deref()
+                        .map(audio_browser_friendly)
+                        .unwrap_or(false);
+                    let _ = child.start_kill();
+                    let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                    return Err(StartError::Restart(EncodeMode {
+                        video_copy: false,
+                        audio_copy,
+                    }));
+                }
+                if let Some(audio) = detected.audio.as_deref() {
+                    if !audio_browser_friendly(audio) {
+                        // Video is fine; only the audio needs re-encoding.
+                        let _ = child.start_kill();
+                        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+                        return Err(StartError::Restart(EncodeMode {
+                            video_copy: true,
+                            audio_copy: false,
+                        }));
+                    }
+                }
+                // Video friendly; treat audio as decided once it's reported, or
+                // after a short settle (covers audio-less channels).
+                let audio_decided = detected.audio.is_some()
+                    || video_seen_at
+                        .map(|t| t.elapsed() > Duration::from_millis(800))
+                        .unwrap_or(false);
+                codecs_ok = audio_decided;
+            }
+        }
+
+        if codecs_ok {
+            if let Ok(content) = tokio::fs::read_to_string(&manifest_path).await {
+                if content.contains("#EXTM3U") {
+                    let session = Arc::new(Session {
+                        output_dir,
+                        child: Mutex::new(child),
+                        last_access: AtomicI64::new(now_ms()),
+                        host: host.clone(),
+                    });
+                    state
+                        .sessions
+                        .lock()
+                        .await
+                        .insert(id.to_string(), session.clone());
+                    return Ok(session);
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.start_kill();
+            let _ = tokio::fs::remove_dir_all(&output_dir).await;
+            let tail = stderr_tail.lock().await.trim().to_string();
+            let msg = if tail.is_empty() {
+                "Timed out waiting for ffmpeg HLS manifest".to_string()
+            } else {
+                tail
+            };
+            return Err(StartError::Failed(msg));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+async fn is_healthy(session: &Arc<Session>) -> bool {
+    let exited = session
+        .child
+        .lock()
+        .await
+        .try_wait()
+        .ok()
+        .flatten()
+        .is_some();
+    !exited
+        && tokio::fs::try_exists(session.manifest_path())
+            .await
+            .unwrap_or(false)
+}
+
+async fn invalidate(state: &RelayState, id: &str) {
+    let removed = state.sessions.lock().await.remove(id);
+    if let Some(session) = removed {
+        log::info!("[restream] stopping session host={} id={id}", session.host);
+        let _ = session.child.lock().await.start_kill();
+        let _ = tokio::fs::remove_dir_all(&session.output_dir).await;
+    }
+}
+
+/// How long to wait for a segment we are willing to publish.
+///
+/// This used to be 5s and to accept the playlist the instant it contained
+/// `#EXTM3U` — which meant handing hls.js a one-entry list naming seg_000, the
+/// one segment with an audio-only head (see `FIRST_SEGMENT`). Waiting for
+/// seg_001 costs at most one source GOP, and the GOP is exactly what the old
+/// 5s budget could not cover: the copy path's own comment puts them at 5-10s.
+/// The frontend allows 35s for a restream to start (RESTREAM_STARTUP_TIMEOUT_MS
+/// in VideoPlayer.tsx), so this stays well inside the budget it must not
+/// exceed — a timeout here costs a whole extra provider dial via the retry
+/// ladder in restream_manifest.
+const MANIFEST_READY_TIMEOUT: Duration = Duration::from_millis(15_000);
+
+async fn read_manifest(session: &Arc<Session>) -> Result<String, String> {
+    let path = session.manifest_path();
+    let deadline = tokio::time::Instant::now() + MANIFEST_READY_TIMEOUT;
+    loop {
+        if session
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Err("ffmpeg restream stopped unexpectedly".to_string());
+        }
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            // Not just "the file exists": it must name a segment that survives
+            // rewrite_manifest, or we would publish an empty playlist.
+            if content.contains("#EXTM3U") && publishable_segment_count(&content) > 0 {
+                return Ok(content);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Restream manifest not ready".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
+async fn read_segment(session: &Arc<Session>, file_name: &str) -> Result<Vec<u8>, String> {
+    // Only allow a bare file name within the session's output dir.
+    let safe = std::path::Path::new(file_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "Invalid segment path".to_string())?;
+    let segment_path = session.output_dir.join(&safe);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(8_000);
+    loop {
+        if session
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Err("ffmpeg restream stopped unexpectedly".to_string());
+        }
+        match tokio::fs::read(&segment_path).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("Restream segment not ready: {safe}"));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
+/// Rewrite bare segment file names in the HLS manifest to relay URLs:
+/// `seg_000.ts` -> `/api/restream/<sessionId>/seg_000.ts`.
+/// The one segment that can legitimately contain no picture.
+///
+/// `-c:v copy` cannot cut on `-hls_time`; it can only split on the SOURCE's
+/// keyframes, so a live join lands mid-GOP. ffmpeg then drops the leading
+/// non-key video frames (`copyinkf` is off by default) but keeps every audio
+/// frame, and segment 0 opens with an audio-only head as long as the source
+/// GOP. Measured against the relay's own argv on a mid-GOP join:
+///
+/// ```text
+/// seg_000.ts  first audio pts = 1.400000
+/// seg_000.ts  first video pts = 8.567167 (keyframe)   -> 7.17s of audio, no video
+/// seg_001.ts  first audio pts = 18.489900
+/// seg_001.ts  first video pts = 18.567167 (keyframe)  -> 77ms apart, clean
+/// ```
+///
+/// Every later segment starts on a keyframe. Only seg_000 is ever bad, and it
+/// is bad by construction rather than by accident.
+const FIRST_SEGMENT: &str = "seg_000.ts";
+
+/// Per-segment tags, which belong to the URI that follows them and must be
+/// dropped with it. Everything else at the top of the playlist is a header.
+const SEGMENT_TAGS: [&str; 4] = [
+    "#EXTINF",
+    "#EXT-X-PROGRAM-DATE-TIME",
+    "#EXT-X-DISCONTINUITY",
+    "#EXT-X-BYTERANGE",
+];
+
+/// Segments in `content` that we are willing to publish (i.e. excluding the
+/// audio-only-headed seg_000). `read_manifest` waits for this to be non-zero.
+fn publishable_segment_count(content: &str) -> usize {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| l.split('?').next().unwrap_or(l) != FIRST_SEGMENT)
+        .count()
+}
+
+/// Point the playlist at our own segment route, and withhold seg_000.
+///
+/// Dropping it is the whole fix for "audio plays, screen stays black, then the
+/// player reloads itself and works". hls.js was handed a one-entry playlist
+/// naming the one segment with an audio-only head, so it had nothing else to
+/// start from; the frame watchdog then gave up at ~6s, roughly a second before
+/// the first real frame would have arrived, and the reload only succeeded
+/// because by then the session was warm and the playlist had clean segments.
+///
+/// `#EXT-X-MEDIA-SEQUENCE` is bumped to match, or hls.js's sequence accounting
+/// drifts by one across reloads. Once the sliding window has moved past
+/// seg_000 this is a no-op.
+fn rewrite_manifest(content: &str, session_id: &str) -> String {
+    let drop_first = content
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.starts_with('#') && l.split('?').next().unwrap_or(l) == FIRST_SEGMENT);
+
+    let mut out: Vec<String> = Vec::new();
+    // Tags seen since the last URI — emitted with it, or discarded with it.
+    let mut pending: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            if SEGMENT_TAGS.iter().any(|t| trimmed.starts_with(t)) {
+                pending.push(line.to_string());
+            } else if drop_first && trimmed.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
+                let n: u64 = trimmed
+                    .trim_start_matches("#EXT-X-MEDIA-SEQUENCE:")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                out.push(format!("#EXT-X-MEDIA-SEQUENCE:{}", n + 1));
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+
+        let file_name = trimmed.split('?').next().unwrap_or(trimmed);
+        if drop_first && file_name == FIRST_SEGMENT {
+            pending.clear();
+            continue;
+        }
+        out.append(&mut pending);
+        if trimmed.contains("://") {
+            out.push(line.to_string());
+        } else {
+            out.push(format!("/api/restream/{session_id}/{file_name}"));
+        }
+    }
+    // A trailing tag with no URI yet (ffmpeg writing mid-segment) is kept, so
+    // the playlist we publish stays a faithful prefix of the real one.
+    out.append(&mut pending);
+    out.join("\n")
+}
+
+async fn reap_idle(sessions: &Arc<Mutex<HashMap<String, Arc<Session>>>>) {
+    let now = now_ms();
+    let mut to_remove: Vec<String> = Vec::new();
+    {
+        let map = sessions.lock().await;
+        for (id, session) in map.iter() {
+            if now - session.last_access.load(Ordering::Relaxed) > SESSION_TTL.as_millis() as i64 {
+                to_remove.push(id.clone());
+            }
+        }
+    }
+    for id in to_remove {
+        let removed = sessions.lock().await.remove(&id);
+        if let Some(session) = removed {
+            log::info!("[restream] idle timeout host={} id={id}", session.host);
+            let _ = session.child.lock().await.start_kill();
+            let _ = tokio::fs::remove_dir_all(&session.output_dir).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /api/subsync — automatic subtitle synchronization
+// ---------------------------------------------------------------------------
+
+/// Hand the job to an installed ffsubsync.
+///
+/// Answers 501 with `{"available":false}` when there is no ffsubsync on this
+/// machine, which the frontend reads as "use the reference endpoint instead".
+/// A 502 means ffsubsync ran and failed on the merits — the frontend surfaces
+/// that as-is rather than quietly re-running the same data through its own
+/// aligner and reporting a different reason.
+async fn subsync_post(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(request): axum::Json<subsync::SyncRequest>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let target = match parse_proxy_target(Some(request.url.as_str())) {
+        Ok(target) => target,
+        Err((status, message)) => return cors_text(status, message),
+    };
+    let host = host_of(target.as_str());
+    let burst = note_request(&state, &host).await;
+    log::info!(
+        "[subsync] aligning {} cues against host={host} ({burst} reqs/{}s)",
+        request.cues.len(),
+        REQUEST_RATE_WINDOW.as_secs()
+    );
+
+    match subsync::run_ffsubsync(state.ffmpeg.as_ref(), target.as_str(), &request).await {
+        Ok(result) => match serde_json::to_string(&result) {
+            Ok(body) => (
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(e) => cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        },
+        Err(subsync::SyncError::NotInstalled) => (
+            StatusCode::NOT_IMPLEMENTED,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{\"available\":false}".to_string(),
+        )
+            .into_response(),
+        Err(subsync::SyncError::Failed(message)) => {
+            log::warn!("[subsync] ffsubsync failed: {message}");
+            cors_text(StatusCode::BAD_GATEWAY, message)
+        }
+        Err(subsync::SyncError::Internal(message)) => {
+            log::error!("[subsync] {message}");
+            cors_text(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+    }
+}
+
+/// Decode the reference audio and return only the 100 Hz speech signal.
+///
+/// One byte per 10 ms — roughly 1 MB for a three-hour film, against the many
+/// gigabytes the browser would otherwise have to pull through itself. The
+/// frontend aligns against this with the same code it uses in web-only mode.
+async fn subsync_reference(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<subsync::ReferenceQuery>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return cors_text(StatusCode::FORBIDDEN, "loopback only".to_string());
+    }
+    let target = match parse_proxy_target(Some(q.url.as_str())) {
+        Ok(target) => target,
+        Err((status, message)) => return cors_text(status, message),
+    };
+    let host = host_of(target.as_str());
+    let burst = note_request(&state, &host).await;
+    log::info!(
+        "[subsync] extracting reference speech host={host} ({burst} reqs/{}s)",
+        REQUEST_RATE_WINDOW.as_secs()
+    );
+
+    match subsync::extract_reference_speech(
+        state.ffmpeg.as_ref(),
+        target.as_str(),
+        q.start.unwrap_or(0.0).max(0.0),
+        q.max,
+    )
+    .await
+    {
+        Ok(speech) => {
+            log::info!(
+                "[subsync] reference speech: {:.0}s ({} speech samples)",
+                speech.samples.len() as f64 / subsync::SAMPLE_RATE as f64,
+                speech.samples.iter().filter(|v| **v > 0).count()
+            );
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    "X-Subsync-Sample-Rate, X-Subsync-Seconds",
+                );
+            for (name, value) in subsync::reference_headers(&speech) {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(Body::from(speech.samples))
+                .unwrap_or_else(|e| cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+        Err(subsync::SyncError::Failed(message)) => cors_text(StatusCode::BAD_GATEWAY, message),
+        Err(e) => cors_text(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn cors_text(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// Parse + validate the `url` query param (port of proxyShared.ts parseProxyTarget).
+fn parse_proxy_target(raw: Option<&str>) -> Result<url::Url, (StatusCode, String)> {
+    let raw = match raw {
+        Some(r) if !r.is_empty() => r,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Missing url query parameter".to_string(),
+            ))
+        }
+    };
+    let target = url::Url::parse(raw)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid target url".to_string()))?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Unsupported target protocol".to_string(),
+        ));
+    }
+    if is_blocked_host(target.host_str()) {
+        return Err((StatusCode::FORBIDDEN, "Target host is blocked".to_string()));
+    }
+    Ok(target)
+}
+
+/// Block loopback / private / link-local hosts so the relay can't be aimed at
+/// the machine itself or the LAN (port of proxyShared.ts isBlockedHost).
+fn is_blocked_host(host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let h = host.to_lowercase();
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
+        return true;
+    }
+    if h == "::1" {
+        return true;
+    }
+    if h.starts_with("fc") || h.starts_with("fd") {
+        return true;
+    }
+    let octets: Vec<u8> = h.split('.').filter_map(|p| p.parse::<u8>().ok()).collect();
+    if octets.len() == 4 && h.split('.').count() == 4 {
+        let (a, b) = (octets[0], octets[1]);
+        if a == 10 || a == 127 || a == 0 {
+            return true;
+        }
+        if a == 169 && b == 254 {
+            return true;
+        }
+        if a == 172 && (16..=31).contains(&b) {
+            return true;
+        }
+        if a == 192 && b == 168 {
+            return true;
+        }
+        if a >= 224 {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_absent_or_unparseable_falls_back_to_default() {
+        // None => caller uses RATE_LIMIT_COOLDOWN.
+        assert_eq!(parse_retry_after(None), None);
+        // HTTP-date form is deliberately not honoured; must not stall forever.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(Some("soon")), None);
+        assert_eq!(parse_retry_after(Some("-5")), None);
+    }
+
+    #[test]
+    fn retry_after_honours_a_sane_delay() {
+        assert_eq!(parse_retry_after(Some("5")), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parse_retry_after(Some("  30 ")),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn retry_after_zero_is_ignored_so_we_still_back_off() {
+        // A provider answering "retry immediately" while rate-limiting would
+        // otherwise reproduce the exact storm this guard exists to stop.
+        assert_eq!(parse_retry_after(Some("0")), None);
+    }
+
+    fn test_state() -> RelayState {
+        RelayState::new(PathBuf::from("ffmpeg"), None, None)
+    }
+
+    #[tokio::test]
+    async fn breaker_arms_expires_and_is_per_host() {
+        let state = test_state();
+        assert!(rate_limit_remaining(&state, "a.example").await.is_none());
+
+        let cooldown = note_rate_limited(&state, "a.example", Some("1")).await;
+        assert_eq!(cooldown, Duration::from_secs(1));
+        assert!(
+            rate_limit_remaining(&state, "a.example").await.is_some(),
+            "host must be cooling down right after a 429"
+        );
+        assert!(
+            rate_limit_remaining(&state, "b.example").await.is_none(),
+            "a limit on one provider must not block a different one"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            rate_limit_remaining(&state, "a.example").await.is_none(),
+            "cool-down must expire on its own so playback can resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_without_retry_after_uses_the_default_cooldown() {
+        let state = test_state();
+        assert_eq!(
+            note_rate_limited(&state, "c.example", None).await,
+            RATE_LIMIT_COOLDOWN
+        );
+        let remaining = rate_limit_remaining(&state, "c.example")
+            .await
+            .expect("armed");
+        assert!(remaining <= RATE_LIMIT_COOLDOWN && remaining > Duration::from_secs(0));
+    }
+
+    /// Verbatim from a real relay run against a mid-GOP live join — the one
+    /// whose seg_000 carried 7.17s of audio with no picture.
+    const REAL_MANIFEST: &str = "#EXTM3U\n\
+#EXT-X-VERSION:3\n\
+#EXT-X-TARGETDURATION:10\n\
+#EXT-X-MEDIA-SEQUENCE:0\n\
+#EXT-X-DISCONTINUITY\n\
+#EXTINF:10.000000,\n\
+#EXT-X-PROGRAM-DATE-TIME:2026-08-26T02:01:24.931+0300\n\
+seg_000.ts\n\
+#EXTINF:10.000000,\n\
+#EXT-X-PROGRAM-DATE-TIME:2026-08-26T02:01:34.931+0300\n\
+seg_001.ts\n\
+#EXTINF:10.000000,\n\
+#EXT-X-PROGRAM-DATE-TIME:2026-08-26T02:01:44.931+0300\n\
+seg_002.ts\n";
+
+    #[test]
+    fn manifest_drops_the_audio_only_first_segment_and_its_tags() {
+        let out = rewrite_manifest(REAL_MANIFEST, "abc123");
+        assert!(!out.contains("seg_000.ts"), "{out}");
+        assert!(out.contains("/api/restream/abc123/seg_001.ts"), "{out}");
+        assert!(out.contains("/api/restream/abc123/seg_002.ts"), "{out}");
+        // seg_000's own tags must go with it, or the remaining segments inherit
+        // a duration and a wall-clock time that are not theirs.
+        assert_eq!(out.matches("#EXTINF").count(), 2, "{out}");
+        assert_eq!(out.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 2, "{out}");
+        assert!(!out.contains("02:01:24.931"), "{out}");
+        assert!(!out.contains("#EXT-X-DISCONTINUITY"), "{out}");
+        // Dropping a segment without bumping this drifts hls.js's sequence
+        // accounting by one on every reload.
+        assert!(out.contains("#EXT-X-MEDIA-SEQUENCE:1"), "{out}");
+        // Headers are untouched.
+        assert!(out.starts_with("#EXTM3U"), "{out}");
+        assert!(out.contains("#EXT-X-TARGETDURATION:10"), "{out}");
+    }
+
+    #[test]
+    fn manifest_is_untouched_once_the_window_slides_past_seg_000() {
+        let later = "#EXTM3U\n\
+#EXT-X-VERSION:3\n\
+#EXT-X-TARGETDURATION:10\n\
+#EXT-X-MEDIA-SEQUENCE:7\n\
+#EXTINF:10.000000,\n\
+seg_007.ts\n\
+#EXTINF:10.000000,\n\
+seg_008.ts\n";
+        let out = rewrite_manifest(later, "abc123");
+        assert!(out.contains("#EXT-X-MEDIA-SEQUENCE:7"), "{out}");
+        assert!(out.contains("/api/restream/abc123/seg_007.ts"), "{out}");
+        assert_eq!(out.matches("#EXTINF").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn absolute_segment_urls_are_left_alone() {
+        let m = "#EXTM3U\n#EXTINF:2.0,\nhttps://cdn.example/seg_009.ts\n";
+        assert!(rewrite_manifest(m, "abc123").contains("https://cdn.example/seg_009.ts"));
+    }
+
+    #[test]
+    fn publishable_count_ignores_the_first_segment() {
+        // A playlist holding ONLY seg_000 has nothing worth publishing yet —
+        // this is what read_manifest waits on instead of returning a one-entry
+        // list that names the audio-only segment.
+        let only_first = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:10.000000,\nseg_000.ts\n";
+        assert_eq!(publishable_segment_count(only_first), 0);
+        assert_eq!(publishable_segment_count(REAL_MANIFEST), 2);
+    }
+
+    #[test]
+    fn html_block_page_yields_the_providers_own_words() {
+        // Shape of a real XUI over-limit page: styling and script around one
+        // sentence that is the only thing worth showing the user.
+        let page = br#"<html><head><style>.a{color:red}</style>
+            <script>var x = 1 < 2;</script></head>
+            <body><div class="msg">Your account has reached the
+            maximum &amp; allowed connections</div></body></html>"#;
+        assert_eq!(
+            html_page_text(page).as_deref(),
+            Some("Your account has reached the maximum & allowed connections"),
+        );
+    }
+
+    #[test]
+    fn html_block_page_without_prose_falls_back_to_none() {
+        assert_eq!(html_page_text(b"<html><body><br/></body></html>"), None);
+        assert_eq!(html_page_text(b""), None);
+    }
+
+    #[test]
+    fn html_block_page_text_is_bounded() {
+        let long = format!("<p>{}</p>", "word ".repeat(500));
+        let text = html_page_text(long.as_bytes()).expect("prose");
+        assert!(text.chars().count() <= BLOCK_PAGE_TEXT_MAX + 1, "{}", text.chars().count());
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn range_parsing() {
+        assert_eq!(parse_range("bytes=0-"), Some((0, None)));
+        assert_eq!(parse_range("bytes=851968-"), Some((851968, None)));
+        // AVFoundation's usual shape: bounded to the file's last byte.
+        assert_eq!(
+            parse_range("bytes=851968-1056877142"),
+            Some((851968, Some(1056877142)))
+        );
+        assert_eq!(parse_range("bytes=0-1"), Some((0, Some(1))));
+        // Suffix and multi-part ranges must go upstream untouched.
+        assert_eq!(parse_range("bytes=-500"), None);
+        assert_eq!(parse_range("bytes=0-1, 100-"), None);
+        assert_eq!(parse_range("chunks=0-"), None);
+    }
+
+    #[test]
+    fn content_range_parsing() {
+        assert_eq!(
+            parse_content_range("bytes 0-959616198/959616199"),
+            Some((0, 959616198, 959616199))
+        );
+        assert_eq!(
+            parse_content_range("bytes 851968-959616198/959616199"),
+            Some((851968, 959616198, 959616199))
+        );
+        // Unknown total: cannot synthesize resumed-stream headers later.
+        assert_eq!(parse_content_range("bytes 0-100/*"), None);
+        assert_eq!(parse_content_range("garbage"), None);
+    }
+
+    #[test]
+    fn ffmpeg_duration_parsing() {
+        assert_eq!(
+            parse_ffmpeg_duration("  Duration: 00:48:21.01, start: 0.000000, bitrate: 3095 kb/s"),
+            Some(2901.01)
+        );
+        assert_eq!(parse_ffmpeg_duration("  Duration: 01:00:00.00, start: 0"), Some(3600.0));
+        // Live sources report N/A — must not be mistaken for zero.
+        assert_eq!(parse_ffmpeg_duration("  Duration: N/A, bitrate: N/A"), None);
+        assert_eq!(parse_ffmpeg_duration("Stream #0:0: Video: h264"), None);
+    }
+
+    #[test]
+    fn progress_out_time_gives_the_keyframe_offset() {
+        // `-ss 305` landing on a keyframe at 299.94 reports exactly K - T.
+        let offset = parse_progress_out_time("out_time_us=-5060313").unwrap();
+        assert!((offset - -5.060313).abs() < 1e-9);
+        assert!((305.0 + offset - 299.939687).abs() < 1e-6);
+        // Sequential start: no snap.
+        assert_eq!(parse_progress_out_time("out_time_us=0"), Some(0.0));
+        assert_eq!(parse_progress_out_time("out_time_us=N/A"), None);
+        assert_eq!(parse_progress_out_time("frame=42"), None);
+    }
+
+    #[test]
+    fn remux_args_copy_and_never_transcode() {
+        let args = build_remux_ffmpeg_args("http://example.com/a.mkv", 0.0);
+        let joined = args.join(" ");
+        assert!(joined.contains("-c:v copy"), "video must never be re-encoded: {joined}");
+        // Audio is the one thing we do encode — see the note on the args.
+        assert!(joined.contains("-c:a aac"), "audio must be normalised: {joined}");
+        assert!(joined.contains("-ac 2"), "audio must be stereo: {joined}");
+        assert!(joined.contains("frag_keyframe+delay_moov"), "empty_moov drops the start offsets and desyncs audio: {joined}");
+        assert!(!joined.contains("empty_moov"));
+        assert!(joined.contains("-progress pipe:2"));
+        // The live path's timestamp repair would discard good Matroska timing.
+        assert!(!joined.contains("genpts"));
+        // No -ss when starting from the beginning.
+        assert!(!args.iter().any(|a| a == "-ss"));
+
+        let seeked = build_remux_ffmpeg_args("http://example.com/a.mkv", 305.0);
+        let i = seeked.iter().position(|a| a == "-ss").expect("-ss present");
+        assert_eq!(seeked[i + 1], "305.000");
+        // -ss must precede -i to seek by keyframe index rather than decoding.
+        let input = seeked.iter().position(|a| a == "-i").unwrap();
+        assert!(i < input, "-ss must come before -i");
+    }
+
+    #[test]
+    fn stream_ring_covers_slices_and_suffixes() {
+        let mut r = StreamRing::new(100);
+        r.push(Bytes::from_static(b"aaaa")); // [100, 104)
+        r.push(Bytes::from_static(b"bbbb")); // [104, 108)
+        assert_eq!((r.start, r.pos), (100, 108));
+
+        let flat = |v: Vec<Bytes>| {
+            v.into_iter().fold(Vec::new(), |mut acc, b| {
+                acc.extend_from_slice(&b);
+                acc
+            })
+        };
+        assert!(r.covers(100, 107) && r.covers(104, 104));
+        assert!(!r.covers(99, 100) && !r.covers(107, 108) && !r.covers(105, 104));
+        assert_eq!(flat(r.slice(100, 107)), b"aaaabbbb");
+        assert_eq!(flat(r.slice(102, 105)), b"aabb");
+        assert_eq!(flat(r.suffix(100)), b"aaaabbbb");
+        assert_eq!(flat(r.suffix(106)), b"bb");
+        assert_eq!(flat(r.suffix(108)), b"");
+
+        // A forward jump makes the window discontiguous — reset drops it.
+        r.reset_to(500);
+        assert_eq!((r.start, r.pos, r.bytes), (500, 500, 0));
+        assert!(!r.covers(100, 101));
+    }
+
+    #[test]
+    fn stream_ring_evicts_from_the_front_keeping_contiguity() {
+        let mut r = StreamRing::new(0);
+        let chunk = Bytes::from(vec![7u8; WARM_RING_MAX / 4]);
+        for _ in 0..6 {
+            r.push(chunk.clone());
+        }
+        assert!(r.bytes <= WARM_RING_MAX);
+        // Window slid forward but stayed contiguous: [start, pos) with
+        // pos = 6 chunks streamed.
+        assert_eq!(r.pos, 6 * (WARM_RING_MAX as u64 / 4));
+        assert_eq!(r.start, r.pos - r.bytes as u64);
+        assert!(r.covers(r.start, r.pos - 1));
+        assert!(!r.covers(r.start - 1, r.start));
+    }
+
+    #[test]
+    fn timeout_backoff_doubles_and_caps() {
+        assert_eq!(timeout_cooldown(1), Duration::from_secs(5));
+        assert_eq!(timeout_cooldown(2), Duration::from_secs(10));
+        assert_eq!(timeout_cooldown(3), Duration::from_secs(20));
+        assert_eq!(timeout_cooldown(4), Duration::from_secs(40));
+        // Capped: 5 * 16 = 80 -> 60, and it must stay there forever.
+        assert_eq!(timeout_cooldown(5), Duration::from_secs(60));
+        assert_eq!(timeout_cooldown(50), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn bounded_cache_stores_gets_and_rejects_oversize() {
+        let mut c = BoundedCache::new("u".into(), 1000, "video/mp4".into());
+        c.insert((0, 3), Bytes::from_static(b"abcd"));
+        assert_eq!(c.get((0, 3)), Some(Bytes::from_static(b"abcd")));
+        assert_eq!(c.get((0, 4)), None, "only exact range matches hit");
+
+        // Double insert of the same key must not double the accounting.
+        c.insert((0, 3), Bytes::from_static(b"abcd"));
+        assert_eq!(c.bytes, 4);
+
+        // An entry over the per-entry cap is refused outright.
+        let big = Bytes::from(vec![0u8; BOUNDED_CACHE_ENTRY_MAX + 1]);
+        c.insert((10, 10 + big.len() as u64 - 1), big);
+        assert_eq!(c.map.len(), 1);
+    }
+
+    #[test]
+    fn bounded_cache_evicts_least_recently_used() {
+        let mut c = BoundedCache::new("u".into(), u64::MAX, "video/mp4".into());
+        let chunk = |n: u8| Bytes::from(vec![n; BOUNDED_CACHE_ENTRY_MAX]);
+        let entries = (BOUNDED_CACHE_TOTAL_MAX / BOUNDED_CACHE_ENTRY_MAX) as u64; // fits exactly
+        for i in 0..entries {
+            c.insert((i, i), chunk(i as u8));
+        }
+        assert!(c.bytes <= BOUNDED_CACHE_TOTAL_MAX);
+        // Touch the oldest so it becomes most-recent, then overflow by one.
+        assert!(c.get((0, 0)).is_some());
+        c.insert((entries, entries), chunk(0));
+        assert!(c.bytes <= BOUNDED_CACHE_TOTAL_MAX);
+        assert!(c.get((0, 0)).is_some(), "recently-touched entry survives");
+        assert!(c.get((1, 1)).is_none(), "the actual LRU entry was evicted");
+    }
+
+    #[test]
+    fn retry_after_is_capped() {
+        // An absurd value must not park playback for hours.
+        assert_eq!(
+            parse_retry_after(Some("86400")),
+            Some(RATE_LIMIT_COOLDOWN_MAX)
+        );
+    }
+}

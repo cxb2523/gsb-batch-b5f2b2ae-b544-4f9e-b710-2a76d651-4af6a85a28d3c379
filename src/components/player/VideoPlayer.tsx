@@ -1,0 +1,2446 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import clsx from "clsx";
+import Hls from "hls.js";
+import mpegts from "mpegts.js";
+import type { CreditsFeedbackRecord } from "../../types/credits";
+import type { EpisodeItem, PlaylistItem } from "../../types/models";
+import type { VideoFitMode } from "../../types/player";
+import { useChromecast } from "../../hooks/useChromecast";
+import { CastDevicePicker } from "./CastDevicePicker";
+import { useCreditsDetection } from "../../hooks/useCreditsDetection";
+import { useSubtitles } from "../../hooks/useSubtitles";
+import { offsetForMatch } from "../../utils/subtitles";
+import { attachRemuxSource, type RemuxSource } from "../../utils/remuxSource";
+import { buildRemuxUrl } from "../../utils/xtreamStreamUrl";
+import { EXTENSION_MIME, guessVideoMime, isSubtitleFile, isVideoFile } from "../../utils/localMedia";
+import { DEFAULT_CREDITS_CONFIG } from "../../utils/creditsDetection";
+import {
+  creditsContentId,
+  creditsGroupId,
+  getLearnedMarkers,
+  parseMarkersFromItem,
+  recordCreditsFeedback,
+} from "../../utils/creditsMarkers";
+import { downloadMediaFile, isHlsUrl } from "../../utils/downloadStream";
+import { categoryForSection, writeHttpsCapability } from "../../utils/httpsCapability";
+import { servedByLocalRelay } from "../../utils/relayDiscovery";
+import { isRelayUrl, toRelayUrl } from "../../utils/secureUrl";
+import { formatDuration } from "../../utils/time";
+import {
+  diagnosticFailureCode,
+  formatPlaybackReport,
+  headlineReason,
+  playbackErrorMessage,
+  type PlaybackMode,
+} from "../../utils/playbackDiagnostics";
+import { buildLivePlaybackAttempts, stopRestream, toXtreamTsUrl } from "../../utils/xtreamStreamUrl";
+import { CreditsDebugPanel } from "./CreditsDebugPanel";
+import { CreditsOverlay } from "./CreditsOverlay";
+import { PlayerNavBar } from "./PlayerNavBar";
+import { PlayerOverlay } from "./PlayerOverlay";
+import { SubtitleSyncPanel } from "./SubtitleSyncPanel";
+import { canSyncSubtitles, syncSubtitles } from "../../utils/subtitleSync";
+import type { SubtitleSyncPhase, SubtitleSyncResult } from "../../types/subtitleSync";
+
+interface VideoPlayerProps {
+  item: PlaylistItem | null;
+  autoplay: boolean;
+  volume: number;
+  muted: boolean;
+  volumePercentMode: boolean;
+  onVolume: (volume: number) => void;
+  onMuted: (muted: boolean) => void;
+  onError: (message: string | null) => void;
+  onPlayingState: (isPlaying: boolean) => void;
+  onProgress: (positionSec: number, durationSec: number) => void;
+  onEnded: () => void;
+  resumeFrom: number;
+  playbackBlocked?: boolean;
+  onPlaybackBlockedAction?: () => void;
+  /** Next episode in the series (null for non-series or the last episode). */
+  nextEpisode?: EpisodeItem | null;
+  onPlayNextEpisode?: () => void;
+  /** Play a video file the user dropped on the player, outside any playlist. */
+  onPlayLocalFile?: (file: File) => void;
+  /**
+   * The File behind a locally-played item, when there is one.
+   *
+   * Its blob: URL is enough to PLAY the video, but not to analyse it: automatic
+   * subtitle sync has to decode the audio, and only the File itself can be read
+   * lazily rather than pulled into memory whole.
+   */
+  localFile?: File | null;
+  /** Intrinsic size and length of the loaded media, once known. */
+  onMediaInfo?: (info: { width: number; height: number; durationSec: number | null }) => void;
+  /** Suggest the next episode once the end credits are detected. */
+  creditsDetection?: boolean;
+  /** With the suggestion up, auto-advance after a cancellable countdown. */
+  creditsAutoNext?: boolean;
+  /** How the video maps onto its box — mirrors the fit modes common players expose. */
+  videoFitMode?: VideoFitMode;
+  onVideoFitModeChange?: (mode: VideoFitMode) => void;
+  className?: string;
+}
+
+const VIDEO_ZOOM_MIN = 1;
+const VIDEO_ZOOM_MAX = 5;
+const VIDEO_ZOOM_STEP = 0.1;
+const clampVideoZoom = (value: number): number =>
+  Math.min(VIDEO_ZOOM_MAX, Math.max(VIDEO_ZOOM_MIN, Math.round(value * 100) / 100));
+
+const CONTROLS_HIDE_MS = 2400;
+/** Cancellable auto-advance delay once credits are detected (opt-in setting). */
+const CREDITS_COUNTDOWN_SEC = 10;
+const SOURCE_STARTUP_TIMEOUT_MS = 12000;
+const MPEGTS_STARTUP_TIMEOUT_MS = 25000;
+// ffmpeg needs time to spawn and produce the first HLS segments.
+const RESTREAM_STARTUP_TIMEOUT_MS = 35000;
+
+const isTransportStreamUrl = (url: string): boolean => {
+  const lower = url.toLowerCase();
+  return /\.ts(\?|$)/i.test(url) || /[?&]output=ts(?:&|$)/i.test(url) || lower.includes("output=ts");
+};
+
+const shouldUseHlsEngine = (url: string): boolean => {
+  if (!Hls.isSupported()) return false;
+  const lower = url.toLowerCase();
+  return isHlsUrl(url) || lower.includes("output=m3u8") || lower.includes("format=m3u8");
+};
+
+const canUseMpegTsEngine = (): boolean => mpegts.isSupported() && Boolean(mpegts.getFeatureList().mseLivePlayback);
+
+/**
+ * Containers the engine can genuinely open on its own.
+ *
+ * This list used to include mkv, avi, mpg and mpeg, which is the false positive
+ * that hid the bug: WKWebView has no demuxer for any of them, so they were
+ * handed straight to <video> and failed before the first frame. Proven with two
+ * clips differing only in container — the mp4 played, the mkv did not.
+ */
+const isKnownNativeVideoUrl = (url: string): boolean =>
+  /\.(mp4|m4v|webm|mov)(\?|$)/i.test(url.toLowerCase());
+
+/** Containers that need a server-side stream copy into fMP4 first. */
+const needsRemux = (url: string): boolean =>
+  /\.(mkv|avi|wmv|flv|mpg|mpeg|m2ts)(\?|$)/i.test(url.toLowerCase());
+
+
+
+const resolvePlaybackMode = (url: string, section: PlaylistItem["section"]): PlaybackMode => {
+  if (section === "live") return "hls";
+  if (shouldUseHlsEngine(url)) return "hls";
+  if (isTransportStreamUrl(url) && canUseMpegTsEngine()) return "mpegts";
+  // After live/HLS/TS so those paths are untouched, and before the native
+  // check so mp4/m4v/mov/webm keep the zero-cost byte path with all of the
+  // relay's warm-stream, ring and cache machinery behind it.
+  if (needsRemux(url) && typeof MediaSource !== "undefined") return "remux";
+  if (isKnownNativeVideoUrl(url)) return "native";
+  return "native";
+};
+
+const modeLabel = (mode: PlaybackMode): string =>
+  mode === "hls" ? "hls.js" : mode === "mpegts" ? "mpegts.js" : mode === "remux" ? "remux-mse" : "native-video";
+
+/** hls.js tuning for live TV — prioritize smooth playback over minimum latency. */
+const createLiveHls = (): Hls =>
+  new Hls({
+    enableWorker: true,
+    lowLatencyMode: false,
+    backBufferLength: 60,
+    maxBufferLength: 60,
+    maxMaxBufferLength: 120,
+    // Stay a few segments behind the live edge so the buffer does not run dry.
+    liveSyncDurationCount: 4,
+    liveMaxLatencyDurationCount: 12,
+    maxLiveSyncPlaybackRate: 1.15,
+    liveDurationInfinity: true,
+    manifestLoadingTimeOut: 20_000,
+    manifestLoadingMaxRetry: 6,
+    levelLoadingTimeOut: 20_000,
+    fragLoadingTimeOut: 30_000,
+    fragLoadingMaxRetry: 8,
+  });
+
+/** mpegts.js tuning for direct live MPEG-TS (.ts) playback from the provider. */
+const createLiveMpegTs = (url: string): ReturnType<typeof mpegts.createPlayer> =>
+  mpegts.createPlayer(
+    { type: "mpegts", url, isLive: true, cors: true, withCredentials: false },
+    {
+      isLive: true,
+      enableStashBuffer: false,
+      stashInitialSize: 128 * 1024,
+      lazyLoad: false,
+      liveBufferLatencyChasing: true,
+    },
+  );
+
+const mediaErrorName = (code?: number): string => {
+  switch (code) {
+    case MediaError.MEDIA_ERR_ABORTED:
+      return "MEDIA_ERR_ABORTED";
+    case MediaError.MEDIA_ERR_NETWORK:
+      return "MEDIA_ERR_NETWORK";
+    case MediaError.MEDIA_ERR_DECODE:
+      return "MEDIA_ERR_DECODE";
+    case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
+      return "MEDIA_ERR_SRC_NOT_SUPPORTED";
+    default:
+      return "UNKNOWN_MEDIA_ERROR";
+  }
+};
+
+const isAbortLikeError = (error: unknown): boolean =>
+  (error instanceof DOMException && error.name === "AbortError") ||
+  (error instanceof Error && /abort/i.test(error.name));
+
+const isCrossOriginStream = (url: string): boolean => {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin !== window.location.origin;
+  } catch {
+    return false;
+  }
+};
+
+const hasMpegTsSyncByte = (bytes: Uint8Array): boolean => {
+  // A real transport stream has 0x47 at the START of each 188-byte packet.
+  // Requiring two aligned sync bytes avoids classifying any payload that
+  // merely CONTAINS a 0x47 (e.g. an MP4 header) as MPEG-TS.
+  if (bytes.length < 189) return bytes.length > 0 && bytes[0] === 0x47;
+  for (let offset = 0; offset < Math.min(bytes.length - 188, 188); offset += 1) {
+    if (bytes[offset] === 0x47 && bytes[offset + 188] === 0x47) return true;
+  }
+  return false;
+};
+
+type StreamPayloadKind = "hls-manifest" | "mpegts" | "html" | "unknown" | "empty";
+
+const classifyStreamPayload = (contentType: string, bytes: Uint8Array): StreamPayloadKind => {
+  if (bytes.length === 0) return "empty";
+  if (contentType.includes("text/html") || bytes[0] === 0x3c /* < */) return "html";
+  const textStart = new TextDecoder().decode(bytes.slice(0, Math.min(bytes.length, 32))).trimStart();
+  if (textStart.startsWith("#EXTM3U") || textStart.startsWith("#EXT")) return "hls-manifest";
+  if (contentType.includes("mpegurl") || contentType.includes("x-mpegurl")) return "hls-manifest";
+  if (hasMpegTsSyncByte(bytes) || contentType.includes("mp2t")) return "mpegts";
+  return "unknown";
+};
+
+const formatBodyPreview = (bytes: Uint8Array): { text: string; hex: string } => {
+  const slice = bytes.slice(0, 256);
+  const decoded = new TextDecoder(undefined, { fatal: false }).decode(slice);
+  const text = Array.from(decoded, (char) => {
+    const code = char.charCodeAt(0);
+    return (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31)) ? " " : char;
+  })
+    .join("")
+    .trim()
+    .slice(0, 200);
+  const hex = Array.from(slice.slice(0, 48))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join(" ");
+  return { text, hex };
+};
+
+const describePayloadKind = (kind: StreamPayloadKind): string => {
+  switch (kind) {
+    case "hls-manifest":
+      return "Valid HLS manifest (#EXTM3U)";
+    case "mpegts":
+      return "MPEG-TS binary (0x47 sync byte)";
+    case "html":
+      return "HTML page (not video) — often Cloudflare or provider error page";
+    case "empty":
+      return "Empty response body";
+    default:
+      return "Unknown binary/text — not recognized as HLS or MPEG-TS";
+  }
+};
+
+/**
+ * Name the container when the engine simply cannot open it.
+ *
+ * WKWebView plays H.264/AAC happily but has no Matroska demuxer at all, so a
+ * perfectly ordinary .mkv fails before a single frame — and every diagnostic
+ * downstream of that just reports "something went wrong". Verified with two
+ * clips that differed ONLY in container: the MP4 played, the MKV did not.
+ * Advisory only: we ask the engine rather than assume, and we never use this to
+ * block playback, because canPlayType is conservative and guesses "no" on
+ * things that sometimes work.
+ */
+const unsupportedContainerMessage = (url: string): string | null => {
+  if (typeof document === "undefined") return null;
+  // Containers we remux are NOT the problem — saying so would mask the real
+  // failure exactly the way the old numeric codes did.
+  if (needsRemux(url)) return null;
+  const extension = url.match(/\.([a-z0-9]+)(?:\?|$)/i)?.[1]?.toLowerCase();
+  if (!extension) return null;
+  const mime = EXTENSION_MIME[extension];
+  if (!mime) return null;
+  if (document.createElement("video").canPlayType(mime) !== "") return null;
+  return `This file is a .${extension} (${mime}) — a container this player cannot open. The video inside may be fine; it is the wrapper that is unsupported.`;
+};
+
+const userMessageFromDiagnostic = (
+  diagnostic: Record<string, unknown>,
+  playbackMode: PlaybackMode,
+): string | null => {
+  const url = typeof diagnostic.playbackUrl === "string" ? diagnostic.playbackUrl : "";
+  // Ahead of the numeric codes: if the container itself is unopenable, that IS
+  // the answer, and a code number would only obscure it.
+  const container = url ? unsupportedContainerMessage(url) : null;
+  if (container) return container;
+  const code = diagnosticFailureCode(diagnostic, playbackMode);
+  return code == null ? null : playbackErrorMessage(code, headlineReason(diagnostic));
+};
+
+const resolveLiveFailureMessage = (
+  diagnostic: Record<string, unknown>,
+  options: { userMessage?: string },
+): string => {
+  if (options.userMessage) return options.userMessage;
+  // #9 = generic playback failure with no more specific diagnostic.
+  return (
+    userMessageFromDiagnostic(diagnostic, "hls") ??
+    playbackErrorMessage(9, headlineReason(diagnostic))
+  );
+};
+
+/**
+ * Fetch the first bytes of the stream and return a paste-friendly diagnostic.
+ *
+ * `probeUrl` is what the media engine actually loaded — normally the relay
+ * wrapper. Probing the bare provider URL instead (which this used to do) is a
+ * guaranteed cross-origin `TypeError: Failed to fetch` for every provider on
+ * earth, so EVERY failure came back as code 7 "fetch/CORS failure" and the
+ * relay's own answer — the status, the block page, the provider's words — was
+ * never looked at. `sourceUrl` stays the provider URL, because the extension
+ * and container checks are about the media, not about the wrapper.
+ */
+const diagnoseStreamUrl = async (
+  probeUrl: string,
+  sourceUrl: string = probeUrl,
+): Promise<Record<string, unknown>> => {
+  const urlExtension = sourceUrl.match(/\.([a-z0-9]+)(?:\?|$)/i)?.[1]?.toLowerCase() ?? "none";
+  const crossOrigin = isCrossOriginStream(probeUrl);
+  const base: Record<string, unknown> = {
+    streamUrl: sourceUrl,
+    playbackUrl: sourceUrl,
+    probeUrl,
+    scheme: /^https:/i.test(sourceUrl) ? "https" : /^http:/i.test(sourceUrl) ? "http" : "other",
+    urlExtension,
+    crossOrigin,
+    pageOrigin: window.location.origin,
+  };
+
+  const controller = new AbortController();
+  // Long enough to outlast the relay's own deliberate stalls. relay.rs waits
+  // UPSTREAM_HEADERS_TIMEOUT (12s) for the provider to answer and can hold a
+  // request through a cool-down for RATE_LIMIT_TOTAL_STALL (15s), so the old 6s
+  // budget aborted during ordinary back-pressure and reported it as a fetch
+  // failure — inventing a network fault that was never there. Capped rather
+  // than made generous: this only delays the error box on an attempt that has
+  // already failed, and a timeout is now its own diagnosis rather than a lie.
+  const PROBE_TIMEOUT_MS = 15000;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(probeUrl, {
+      method: "GET",
+      headers: { Range: "bytes=0-2047", Accept: "*/*" },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    // Read only the first chunk — a live stream that ignores Range never ends,
+    // so we must not await the whole body.
+    const reader = response.body?.getReader();
+    let bytes = new Uint8Array(0);
+    if (reader) {
+      const { value } = await reader.read();
+      bytes = value ?? new Uint8Array(0);
+      void reader.cancel().catch(() => undefined);
+    } else {
+      bytes = new Uint8Array(await response.arrayBuffer());
+    }
+    clearTimeout(timer);
+    const payloadKind = classifyStreamPayload(contentType.toLowerCase(), bytes);
+    const preview = formatBodyPreview(bytes);
+    return {
+      ...base,
+      probeFetch: "ok",
+      httpStatus: response.status,
+      httpStatusText: response.statusText,
+      // Our own relay explains its refusals in plain text (e.g. it quotes the
+      // provider's block page back to us). Surfacing it separately keeps that
+      // sentence out of the "is this video?" payload guessing entirely.
+      relayMessage: response.status >= 400 ? preview.text || null : null,
+      contentType,
+      contentLength: response.headers.get("content-length"),
+      payloadKind,
+      payloadMeaning: describePayloadKind(payloadKind),
+      bodyPreviewText: preview.text || "(non-text or empty)",
+      bodyPreviewHex: preview.hex || "(empty)",
+      urlExtensionMatchesPayload:
+        urlExtension === "m3u8"
+          ? payloadKind === "hls-manifest"
+          : urlExtension === "ts"
+            ? payloadKind === "mpegts"
+            : "n/a",
+    };
+  } catch (error) {
+    clearTimeout(timer);
+    return {
+      ...base,
+      probeFetch: timedOut ? "timeout" : "failed",
+      fetchError: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      likelyCause: timedOut
+        ? `No response within ${PROBE_TIMEOUT_MS / 1000}s — the provider never answered, or the relay is holding the request through a rate-limit cool-down`
+        : crossOrigin
+          ? "CORS block or network error on cross-origin fetch from browser"
+          : "Network error reaching stream URL",
+    };
+  }
+};
+
+const logPlaybackReport = (reason: string, context: Record<string, unknown>, diagnostic: Record<string, unknown>) => {
+  const report = {
+    _instruction: "Copy the JSON block below and paste it in your support message",
+    reason,
+    timestamp: new Date().toISOString(),
+    userAgent: navigator.userAgent,
+    ...context,
+    streamProbe: diagnostic,
+  };
+  console.error("[IPTV][Player] PLAYBACK FAILED");
+  console.error("[IPTV][Player] Paste this JSON:", JSON.stringify(report, null, 2));
+  return report;
+};
+
+export const VideoPlayer = ({
+  item,
+  autoplay,
+  volume,
+  muted,
+  volumePercentMode,
+  onVolume,
+  onMuted,
+  onError,
+  onPlayingState,
+  onProgress,
+  onEnded,
+  resumeFrom,
+  playbackBlocked = false,
+  onPlaybackBlockedAction,
+  nextEpisode = null,
+  onPlayNextEpisode,
+  onPlayLocalFile,
+  localFile,
+  onMediaInfo,
+  creditsDetection = true,
+  creditsAutoNext = false,
+  videoFitMode = "contain",
+  onVideoFitModeChange,
+  className,
+}: VideoPlayerProps) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hlsRef = useRef<Hls | null>(null);
+  const remuxRef = useRef<RemuxSource | null>(null);
+  const mpegtsRef = useRef<ReturnType<typeof mpegts.createPlayer> | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  // Analysis-only tap off the gain node, used by the credits detector. Never
+  // connected to the destination, so it cannot affect what the user hears.
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioGraphFailedRef = useRef(false);
+  const switchingSourceRef = useRef(false);
+  const hasAppliedResumeRef = useRef(false);
+  const hideTimerRef = useRef<number | null>(null);
+  const startupTimerRef = useRef<number | null>(null);
+
+  const onProgressRef = useRef(onProgress);
+  const onEndedRef = useRef(onEnded);
+  const onErrorRef = useRef(onError);
+  const onPlayingStateRef = useRef(onPlayingState);
+  const onMediaInfoRef = useRef(onMediaInfo);
+  const resumeFromRef = useRef(resumeFrom);
+
+  const [loading, setLoading] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Incremented by the error box's "Try again" — re-runs the playback effect
+  // for the same item (provider hiccups like connection limits are transient).
+  const [retryNonce, setRetryNonce] = useState(0);
+  // Frame-watchdog auto-reload budget, per item (prevents reload loops).
+  const autoRecoverRef = useRef<{ id: string; count: number }>({ id: "", count: 0 });
+  // Fallback fullscreen for macOS WKWebView, where the element Fullscreen API
+  // can't be enabled without breaking video rendering: the player covers the
+  // page via CSS while the native window goes fullscreen through the relay.
+  const [cssFullscreen, setCssFullscreen] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  // The full failure report for the error box's "details" disclosure. Kept
+  // beside the message rather than only in the console, which the packaged app
+  // has no way to open.
+  const [localErrorDetail, setLocalErrorDetail] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [buffered, setBuffered] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [controlsVisible, setControlsVisible] = useState(true);
+  const [downloadBusy, setDownloadBusy] = useState(false);
+  const [downloadHint, setDownloadHint] = useState<string | null>(null);
+  // CSS zoom for the video layer (1 = fit as-is). Lets the user enlarge low-res
+  // streams that would otherwise render small/letterboxed, or crop-zoom into any
+  // stream. Applied as a transform, so playback/controls are unaffected.
+  const [videoScale, setVideoScale] = useState(1);
+
+  const setVideoZoom = useCallback((value: number) => {
+    setVideoScale(clampVideoZoom(value));
+  }, []);
+  const nudgeVideoZoom = useCallback((delta: number) => {
+    setVideoScale((prev) => clampVideoZoom(prev + delta));
+  }, []);
+
+  useEffect(() => {
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason;
+      if (!(reason instanceof Error || reason instanceof DOMException)) return;
+      const message = `${reason.name} ${reason.message}`.toLowerCase();
+      if (message.includes("aborterror") && message.includes("bodystreambuffer was aborted")) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+    return () => window.removeEventListener("unhandledrejection", onUnhandledRejection);
+  }, []);
+
+  useEffect(() => {
+    onProgressRef.current = onProgress;
+  }, [onProgress]);
+  useEffect(() => {
+    onEndedRef.current = onEnded;
+  }, [onEnded]);
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+  useEffect(() => {
+    onPlayingStateRef.current = onPlayingState;
+  }, [onPlayingState]);
+  useEffect(() => {
+    onMediaInfoRef.current = onMediaInfo;
+  }, [onMediaInfo]);
+  useEffect(() => {
+    resumeFromRef.current = resumeFrom;
+  }, [resumeFrom]);
+
+  const onCastProgress = useCallback((positionSec: number, durationSec: number) => {
+    onProgressRef.current(positionSec, durationSec);
+  }, []);
+
+  const {
+    clearCastMessage,
+    isCasting,
+    mirror,
+    deviceName,
+    castMessage,
+    requestCastSession,
+    stopCasting,
+    castPlayPause,
+    castSeekTo,
+    castSetVolumeLevel,
+    castMuteToggle,
+    canCast,
+    castDevices,
+    pendingCastDevice,
+    selectCastDevice,
+    confirmCastDevice,
+    dismissCastConfirm,
+    cancelCastPicker,
+  } = useChromecast(item, onCastProgress);
+
+  useEffect(() => {
+    setDownloadHint(null);
+    setDownloadBusy(false);
+    setVideoScale(1);
+    clearCastMessage();
+  }, [item?.id, clearCastMessage]);
+
+  useEffect(() => {
+    if (!isCasting) return;
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    video.muted = true;
+  }, [isCasting, item?.id]);
+
+  const resumeAudioContext = useCallback(() => {
+    const context = audioContextRef.current;
+    if (!context || context.state === "running") return;
+    void context.resume().catch(() => undefined);
+  }, []);
+
+  const ensureAudioGraph = useCallback((): boolean => {
+    if (audioGraphFailedRef.current) return false;
+    const video = videoRef.current;
+    if (!video || typeof window === "undefined") return false;
+    const AudioContextCtor = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) {
+      audioGraphFailedRef.current = true;
+      return false;
+    }
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new AudioContextCtor();
+      }
+      if (!mediaSourceRef.current) {
+        mediaSourceRef.current = audioContextRef.current.createMediaElementSource(video);
+      }
+      if (!gainNodeRef.current) {
+        gainNodeRef.current = audioContextRef.current.createGain();
+        mediaSourceRef.current.connect(gainNodeRef.current);
+        gainNodeRef.current.connect(audioContextRef.current.destination);
+      }
+      if (!analyserRef.current) {
+        // Side-chain only: gain still feeds the destination directly, and the
+        // analyser's own output goes nowhere.
+        const analyser = audioContextRef.current.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.5;
+        gainNodeRef.current.connect(analyser);
+        analyserRef.current = analyser;
+      }
+      return true;
+    } catch {
+      audioGraphFailedRef.current = true;
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isCasting) return;
+    onPlayingStateRef.current(!mirror.isPaused);
+  }, [isCasting, mirror.isPaused]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const requestedVolume = muted ? 0 : Math.min(2, Math.max(0, volume));
+    const shouldUseBoost = requestedVolume > 1.0001 || Boolean(gainNodeRef.current);
+
+    if (shouldUseBoost && ensureAudioGraph()) {
+      const context = audioContextRef.current;
+      const gainNode = gainNodeRef.current;
+      if (context?.state === "running" && gainNode) {
+        video.muted = false;
+        video.volume = 1;
+        gainNode.gain.value = requestedVolume;
+        return;
+      }
+      resumeAudioContext();
+    }
+
+    video.volume = Math.min(1, requestedVolume);
+    video.muted = muted;
+  }, [ensureAudioGraph, muted, resumeAudioContext, volume]);
+
+  const mirrorRef = useRef(mirror);
+  useEffect(() => {
+    mirrorRef.current = mirror;
+  }, [mirror]);
+
+  const displayTime = isCasting ? mirror.currentTime : currentTime;
+  const displayDuration = isCasting ? mirror.duration : duration;
+  const displayPlaying = isCasting ? !mirror.isPaused : isPlaying;
+  const displayLoading = isCasting ? !mirror.isMediaLoaded : loading;
+  const displayBuffered = isCasting ? displayTime : buffered;
+
+  const isLive = useMemo(
+    () => !Number.isFinite(displayDuration) || displayDuration <= 0,
+    [displayDuration],
+  );
+
+  /* --------------------------------------------------- end-credits detection */
+
+  // Marker sources, in the order resolveMarkerCreditsStart applies them: the
+  // playlist/provider can ship exact timestamps per item, and past behaviour on
+  // this device can teach a series-wide one. Either short-circuits the
+  // heuristic entirely (see docs/credits-detection.md).
+  const creditsMarkers = useMemo(
+    () =>
+      item
+        ? {
+            backend: parseMarkersFromItem(item),
+            learned: getLearnedMarkers(creditsGroupId(item), duration),
+          }
+        : null,
+    [item, duration],
+  );
+  const creditsConfig = useMemo(() => ({ debug: import.meta.env.DEV }), []);
+
+  const credits = useCreditsDetection({
+    videoRef,
+    analyserRef,
+    duration,
+    isLive: isLive || item?.section === "live",
+    // Casting moves playback off this element entirely — nothing to measure.
+    enabled: creditsDetection && Boolean(item) && !isCasting,
+    contentKey: item?.id ?? null,
+    markers: creditsMarkers,
+    config: creditsConfig,
+  });
+
+  const subtitles = useSubtitles(videoRef, item?.id ?? null);
+  const subtitleInputRef = useRef<HTMLInputElement | null>(null);
+  const [subtitleDropActive, setSubtitleDropActive] = useState(false);
+
+  const [subtitleSyncOpen, setSubtitleSyncOpen] = useState(false);
+
+  const openSubtitlePicker = useCallback(() => subtitleInputRef.current?.click(), []);
+
+  // A sync panel for a track that is no longer selected would be stranded.
+  useEffect(() => {
+    if (subtitles.selectedId === "off") setSubtitleSyncOpen(false);
+  }, [subtitles.selectedId]);
+
+  const handleSubtitleFiles = useCallback(
+    (files: FileList | null) => {
+      const file = files?.[0];
+      if (file) void subtitles.addFile(file);
+    },
+    [subtitles],
+  );
+
+  /* --- automatic subtitle sync ------------------------------------------ */
+
+  const [autoSyncBusy, setAutoSyncBusy] = useState(false);
+  const [autoSyncStatus, setAutoSyncStatus] = useState<string | null>(null);
+  const [autoSyncFraction, setAutoSyncFraction] = useState<number | null>(null);
+  const autoSyncAbortRef = useRef<AbortController | null>(null);
+
+  /** The stages, in the order they happen, phrased for the person watching. */
+  const AUTO_SYNC_STAGE: Record<SubtitleSyncPhase, string> = useMemo(
+    () => ({
+      "preparing-audio": "Preparing audio…",
+      "detecting-speech": "Detecting speech…",
+      "finding-alignment": "Finding alignment…",
+      applying: "Applying sync…",
+      done: "Done",
+    }),
+    [],
+  );
+
+  /**
+   * What the media is, from the sync engine's point of view.
+   *
+   * A dropped file is a blob: URL that exists only in this tab, so the backend
+   * could never fetch it — the File goes instead, and the browser engine reads
+   * it lazily. Library content is a real URL the backend can pull itself,
+   * which is the whole reason the native path is worth having.
+   */
+  const syncMedia = useMemo(
+    () => ({
+      file: localFile ?? undefined,
+      // Through the relay, exactly as playback fetches it. The raw provider URL
+      // is not fetchable from this page — wrong CORS, and often a redirect that
+      // only works with the player headers — so the browser engine has to ask
+      // for it the same way the video element does. The native engine unwraps
+      // it again (see subtitleSync.ts) since it fetches the provider directly.
+      url: localFile ? undefined : item?.streamUrl ? toRelayUrl(item.streamUrl) : undefined,
+      durationSec: Number.isFinite(duration) && duration > 0 ? duration : undefined,
+    }),
+    [localFile, item?.streamUrl, duration],
+  );
+
+  const canAutoSync =
+    subtitles.selectedId !== "off" &&
+    subtitles.selectedCues.length > 0 &&
+    canSyncSubtitles({ media: syncMedia });
+
+  const describeSyncResult = useCallback((result: SubtitleSyncResult): string => {
+    if (!result.applied) {
+      return `Couldn't find a confident match — ${result.qualityReasons[0] ?? "the subtitles were left alone"}. Try matching a line instead.`;
+    }
+    // Two decimals, not formatOffset's one. formatOffset exists for the manual
+    // delay, where the controls move in 0.5s steps and a tenth is all the
+    // precision there is; the aligner works to a hundredth of a second and
+    // rounding "+2.37s" to "+2.4s" throws that away in the one place the user
+    // is being told what it found.
+    const seconds = result.offsetMs / 1000;
+    const shift = `${seconds >= 0 ? "+" : ""}${seconds.toFixed(2).replace(/\.?0+$/, "")}s`;
+    const where = result.processingMode === "native" ? "" : " (in your browser)";
+    if (result.perCueOffsetsMs) {
+      const segments = result.segments?.length ?? 1;
+      return `Subtitles synchronized in ${segments} section${segments === 1 ? "" : "s"}, around ${shift}${where}`;
+    }
+    if (Math.abs(result.framerateScaleFactor - 1) > 1e-6) {
+      return `Subtitles synchronized: ${shift} and a framerate correction${where}`;
+    }
+    return `Subtitles synchronized: ${shift}${where}`;
+  }, []);
+
+  const handleAutoSync = useCallback(async () => {
+    if (autoSyncBusy) return;
+    const cues = subtitles.selectedCues;
+    if (cues.length === 0) {
+      setAutoSyncStatus("Pick a subtitle track first.");
+      return;
+    }
+
+    // The run belongs to THIS track. A sync takes minutes and the user may pick
+    // a different one meanwhile; applying these timings to that track would be
+    // worse than not syncing at all.
+    const startedOn = subtitles.selectedId;
+
+    const controller = new AbortController();
+    autoSyncAbortRef.current = controller;
+    setAutoSyncBusy(true);
+    setAutoSyncFraction(null);
+    setAutoSyncStatus("Preparing audio…");
+
+    try {
+      // ffsubsync's own default is to align against the video's other subtitle
+      // track when there is one — exact, instant, and no audio decoded at all.
+      // Only fall through to listening when there isn't.
+      const referenceCues = await subtitles.collectReferenceCues(controller.signal);
+      if (controller.signal.aborted) return;
+
+      const result = await syncSubtitles({
+        cues,
+        media: syncMedia,
+        referenceCues: referenceCues.length > 0 ? referenceCues : undefined,
+        signal: controller.signal,
+        onProgress: ({ phase, fraction, detail }) => {
+          setAutoSyncFraction(fraction ?? null);
+          setAutoSyncStatus(detail ? `${AUTO_SYNC_STAGE[phase]} ${detail}` : AUTO_SYNC_STAGE[phase]);
+        },
+      });
+      if (controller.signal.aborted) return;
+
+      setAutoSyncStatus(AUTO_SYNC_STAGE.applying);
+      setAutoSyncFraction(null);
+      if (!result.applied) {
+        setAutoSyncStatus(describeSyncResult(result));
+        return;
+      }
+      if (!subtitles.applySyncedCues(result.subtitles, undefined, startedOn)) {
+        setAutoSyncStatus("Finished, but you changed track — nothing was applied.");
+        return;
+      }
+      setAutoSyncStatus(describeSyncResult(result));
+    } catch (error) {
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+        setAutoSyncStatus(null);
+      } else {
+        setAutoSyncStatus(
+          `Sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      setAutoSyncFraction(null);
+    } finally {
+      if (autoSyncAbortRef.current === controller) autoSyncAbortRef.current = null;
+      setAutoSyncBusy(false);
+    }
+  }, [AUTO_SYNC_STAGE, autoSyncBusy, describeSyncResult, subtitles, syncMedia]);
+
+  const handleCancelAutoSync = useCallback(() => {
+    autoSyncAbortRef.current?.abort();
+  }, []);
+
+  // A run belongs to the item it was started on; loading another one must not
+  // leave it applying its answer to a different film's subtitles.
+  useEffect(() => {
+    autoSyncAbortRef.current?.abort();
+    setAutoSyncStatus(null);
+    setAutoSyncFraction(null);
+  }, [item?.id]);
+
+  const [dropNotice, setDropNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!dropNotice) return;
+    const timer = window.setTimeout(() => setDropNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [dropNotice]);
+
+  /** A drop can be a subtitle to load or a video to play — decide per file. */
+  const handleDroppedFiles = useCallback(
+    (files: FileList | null) => {
+      const list = Array.from(files ?? []);
+      if (list.length === 0) return;
+
+      // Subtitles first: dropping a video AND its .srt together should play
+      // the video with the subtitle already loaded, not race over the item.
+      const subtitle = list.find((file) => isSubtitleFile(file));
+      if (subtitle) void subtitles.addFile(subtitle);
+
+      const video = list.find((file) => isVideoFile(file));
+      if (video && onPlayLocalFile) {
+        // Warn rather than block: the container may still be playable even
+        // when canPlayType is unsure, and a wrong guess should not stop the
+        // user watching their own file.
+        const mime = guessVideoMime(video);
+        const probe = document.createElement("video");
+        if (mime && probe.canPlayType(mime) === "") {
+          setDropNotice(`${video.name} may not play — this browser has no ${mime} support.`);
+        }
+        onPlayLocalFile(video);
+        return;
+      }
+      if (!subtitle) {
+        setDropNotice(`${list[0].name} is not a video or subtitle file.`);
+      }
+    },
+    [onPlayLocalFile, subtitles],
+  );
+
+  // Only claim a drag that actually carries a file, so dragging anything else
+  // over the player (text selections, links) still behaves normally.
+  const dragHasFile = (event: React.DragEvent): boolean =>
+    Array.from(event.dataTransfer?.types ?? []).includes("Files");
+
+  const handleDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    if (!dragHasFile(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setSubtitleDropActive(true);
+  }, []);
+
+  const handleDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    // Fires for every child crossed during the drag; ignore all but the exit
+    // from the player itself, or the hint flickers.
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setSubtitleDropActive(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!dragHasFile(event)) return;
+      event.preventDefault();
+      setSubtitleDropActive(false);
+      handleDroppedFiles(event.dataTransfer?.files ?? null);
+    },
+    [handleDroppedFiles],
+  );
+
+  const {
+    creditsDetected,
+    detectedAt: creditsDetectedAt,
+    dismissed: creditsDismissed,
+    dismiss: dismissCredits,
+    markDetected: markCreditsDetected,
+  } = credits;
+  const showCreditsSuggestion = creditsDetected && !creditsDismissed && Boolean(nextEpisode) && !isCasting;
+
+  const recordCredits = useCallback(
+    (update: Partial<CreditsFeedbackRecord>) => {
+      if (!item) return;
+      const contentId = creditsContentId(item);
+      const groupId = creditsGroupId(item);
+      const durationSec = videoRef.current?.duration ?? duration;
+      if (!contentId || !groupId || !Number.isFinite(durationSec) || durationSec <= 0) return;
+      recordCreditsFeedback({ ...update, contentId, groupId, durationSec });
+    },
+    [duration, item],
+  );
+
+  // Anonymous, local-only: what was detected, what the user did about it, and
+  // whether the episode ran to the end. Aggregated by getLearnedMarkers.
+  useEffect(() => {
+    if (!creditsDetected || creditsDetectedAt == null) return;
+    recordCredits({ detectedCreditsStart: creditsDetectedAt });
+  }, [creditsDetected, creditsDetectedAt, recordCredits]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !item) return;
+    const onEndedFeedback = () => recordCredits({ reachedVideoEnd: true });
+    video.addEventListener("ended", onEndedFeedback);
+    return () => video.removeEventListener("ended", onEndedFeedback);
+  }, [item, recordCredits]);
+
+  const [creditsCountdown, setCreditsCountdown] = useState<number | null>(null);
+  const [countdownCancelled, setCountdownCancelled] = useState(false);
+
+  useEffect(() => {
+    setCountdownCancelled(false);
+    setCreditsCountdown(null);
+  }, [item?.id]);
+
+  const handleCreditsPlayNext = useCallback(() => {
+    recordCredits({ userSkippedAt: videoRef.current?.currentTime ?? null });
+    setCreditsCountdown(null);
+    onPlayNextEpisode?.();
+  }, [onPlayNextEpisode, recordCredits]);
+
+  const handleCreditsDismiss = useCallback(() => {
+    recordCredits({ userDismissed: true });
+    setCountdownCancelled(true);
+    setCreditsCountdown(null);
+    dismissCredits();
+  }, [dismissCredits, recordCredits]);
+
+  // "Mark credits start" control: available whenever detection itself would
+  // run (VOD, known duration, not casting) — not gated behind auto-detection,
+  // since the whole point is covering what the heuristic misses (anime
+  // OP/ED over full-motion animation, credits over active footage, ...).
+  // A deliberate click is trusted immediately (see getLearnedMarkers) and
+  // also fires the same "up next" overlay a detection would, right now.
+  const canMarkCredits = creditsDetection && Boolean(item) && !isLive && item?.section !== "live" && !isCasting;
+  const [creditsMarkHint, setCreditsMarkHint] = useState<string | null>(null);
+
+  const handleMarkCreditsStart = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || !item) return;
+    const at = video.currentTime;
+    recordCredits({ userMarkedAt: at });
+    markCreditsDetected(at);
+    setCreditsMarkHint(`Marked — credits start at ${formatDuration(at)}`);
+    window.setTimeout(() => setCreditsMarkHint(null), 4000);
+  }, [item, recordCredits, markCreditsDetected]);
+
+  useEffect(() => {
+    if (!showCreditsSuggestion || !creditsAutoNext || countdownCancelled) {
+      setCreditsCountdown(null);
+      return;
+    }
+    setCreditsCountdown(CREDITS_COUNTDOWN_SEC);
+    const timer = window.setInterval(() => {
+      setCreditsCountdown((remaining) => (remaining == null ? null : remaining - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [countdownCancelled, creditsAutoNext, showCreditsSuggestion]);
+
+  useEffect(() => {
+    if (creditsCountdown == null || creditsCountdown > 0) return;
+    handleCreditsPlayNext();
+  }, [creditsCountdown, handleCreditsPlayNext]);
+
+  // Controls auto-hide only while genuinely playing; the scheduled hide reads
+  // this ref so a stale timer can't hide the bar while paused/loading/errored.
+  const canAutoHideRef = useRef(false);
+  useEffect(() => {
+    canAutoHideRef.current = displayPlaying && !displayLoading && !localError;
+  }, [displayPlaying, displayLoading, localError]);
+
+  const showControls = useCallback(() => {
+    setControlsVisible(true);
+    if (hideTimerRef.current != null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+
+  const clearStartupTimer = useCallback(() => {
+    if (startupTimerRef.current != null) {
+      window.clearTimeout(startupTimerRef.current);
+      startupTimerRef.current = null;
+    }
+  }, []);
+
+  const destroyMpegTsPlayer = useCallback(() => {
+    if (!mpegtsRef.current) return;
+    const player = mpegtsRef.current;
+    mpegtsRef.current = null;
+    try {
+      player.pause();
+    } catch {
+      // no-op
+    }
+    try {
+      player.detachMediaElement();
+    } catch {
+      // no-op
+    }
+    try {
+      player.destroy();
+    } catch {
+      // no-op
+    }
+  }, []);
+
+  const scheduleHide = useCallback(() => {
+    if (hideTimerRef.current != null) {
+      window.clearTimeout(hideTimerRef.current);
+    }
+    hideTimerRef.current = window.setTimeout(() => {
+      // Only auto-hide during active playback (paused/loading/error keep the bar
+      // up). A focused control button must NOT keep the bar up — that's the
+      // "stuck bar after clicking play/fullscreen" case — but don't yank away a
+      // focused text field (e.g. the volume % input) mid-edit.
+      if (!canAutoHideRef.current) return;
+      const active = document.activeElement;
+      const editingField =
+        active instanceof HTMLInputElement &&
+        active.type !== "range" &&
+        Boolean(containerRef.current?.contains(active));
+      if (editingField) return;
+      setControlsVisible(false);
+    }, CONTROLS_HIDE_MS);
+  }, []);
+
+  const bumpControls = useCallback(() => {
+    showControls();
+    scheduleHide();
+  }, [showControls, scheduleHide]);
+
+  useEffect(() => {
+    if (!displayPlaying || displayLoading || localError) {
+      showControls();
+      return;
+    }
+    scheduleHide();
+    return () => {
+      if (hideTimerRef.current != null) {
+        window.clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = null;
+      }
+    };
+  }, [displayPlaying, displayLoading, localError, showControls, scheduleHide]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !item) return;
+    hasAppliedResumeRef.current = false;
+    if (playbackBlocked) {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      destroyMpegTsPlayer();
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      const message = "You are not connected to a Community IPTV Player backend.";
+      setLoading(false);
+      setLocalError(message);
+      setLocalErrorDetail(null);
+      onErrorRef.current(message);
+      onPlayingStateRef.current(false);
+      return;
+    }
+    // retryNonce is a dependency so "Try again" re-runs this effect verbatim.
+    void retryNonce;
+    setLoading(true);
+    setLocalError(null);
+    setLocalErrorDetail(null);
+    onErrorRef.current(null);
+    setCurrentTime(0);
+    setDuration(0);
+    setBuffered(0);
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+    destroyMpegTsPlayer();
+
+    const onLoadedMetadata = () => {
+      const resumePoint = resumeFromRef.current;
+      setDuration(Number.isFinite(video.duration) ? video.duration : 0);
+      // 0x0 is an audio-only stream — report nothing rather than a fake size.
+      if (video.videoWidth > 0) {
+        onMediaInfoRef.current?.({
+          width: video.videoWidth,
+          height: video.videoHeight,
+          // Infinity for a live stream, NaN before it is known.
+          durationSec: Number.isFinite(video.duration) ? video.duration : null,
+        });
+      }
+      if (hasAppliedResumeRef.current) return;
+      if (resumePoint > 3 && Number.isFinite(video.duration) && resumePoint < video.duration) {
+        video.currentTime = resumePoint;
+      }
+      hasAppliedResumeRef.current = true;
+    };
+    const onLoadedData = () => {
+      markPlaybackStarted();
+      clearStartupTimer();
+      setLoading(false);
+    };
+    const onDurationChange = () => setDuration(Number.isFinite(video.duration) ? video.duration : 0);
+    const onPlay = () => {
+      setIsPlaying(true);
+      onPlayingStateRef.current(true);
+      // Playback genuinely (re)started — clear any stale error, e.g. a slow
+      // restream that recovered, or "press play to start" after a manual play.
+      setLocalError(null);
+      setLocalErrorDetail(null);
+      onErrorRef.current(null);
+    };
+    const onPause = () => {
+      setIsPlaying(false);
+      onPlayingStateRef.current(false);
+    };
+    const onWaiting = () => setLoading(true);
+    const onPlaying = () => {
+      markPlaybackStarted();
+      clearStartupTimer();
+      setLoading(false);
+    };
+    const onTimeUpdate = () => {
+      setCurrentTime(video.currentTime);
+      if (video.buffered.length > 0) setBuffered(video.buffered.end(video.buffered.length - 1));
+      onProgressRef.current(video.currentTime, Number.isFinite(video.duration) ? video.duration : 0);
+    };
+    const onProgressEvent = () => {
+      if (video.buffered.length > 0) setBuffered(video.buffered.end(video.buffered.length - 1));
+    };
+    const onEndedInternal = () => {
+      onProgressRef.current(video.duration, video.duration);
+      onEndedRef.current();
+    };
+
+    const streamUrl = item.streamUrl;
+    const playbackMode = resolvePlaybackMode(streamUrl, item.section);
+
+    // Per-category http/https decision. The user's scheme is kept; for an HTTP
+    // host the first watch of a category tries HTTPS, falls back to HTTP, and
+    // caches whichever actually plays (see httpsCapability.ts). Assigned in the
+    // IIFE below; closures read them at playback time.
+    let playbackBaseUrl = streamUrl;
+    let playbackUrl = streamUrl;
+    let vlcFallbackUrl: string | null = null;
+    let liveAttempts: ReturnType<typeof buildLivePlaybackAttempts> = [];
+    let liveAttemptIndex = 0;
+    let activeLiveAttempts: ReturnType<typeof buildLivePlaybackAttempts> = [];
+    // Set by the effect cleanup. `startLiveAttempt` now awaits the relay before
+    // opening the next engine, so the item can change mid-flight; without this
+    // the abandoned attempt would attach itself to the new item's element.
+    let tornDown = false;
+
+    const category = categoryForSection(item.section);
+    let testingHttps = false;
+    let httpFallbackUrl: string | null = null;
+    let currentSchemeHttps = /^https:/i.test(streamUrl);
+    let playbackStarted = false;
+
+    // Called once real playback begins; commits to the current scheme and, if we
+    // were testing HTTPS for this category, records that HTTPS works.
+    const markPlaybackStarted = () => {
+      if (playbackStarted) return;
+      playbackStarted = true;
+      httpFallbackUrl = null;
+      // NOTE: do not clear errors here — this also fires on `loadeddata`, which
+      // arrives even when autoplay was rejected, and would erase the
+      // "press play to start" message leaving a silent paused player. Errors
+      // are cleared on the `play`/`playing` events (real playback) instead.
+      if (testingHttps && currentSchemeHttps) {
+        writeHttpsCapability(streamUrl, category, "yes");
+        console.info("[IPTV][Player] HTTPS works for this category — cached 'yes'", { category });
+      }
+    };
+
+    const playbackContext: Record<string, unknown> = {
+      itemId: item.id,
+      title: item.title,
+      section: item.section,
+      streamUrl,
+      playbackUrl,
+      engine: modeLabel(playbackMode),
+      autoplay,
+      hlsSupported: Hls.isSupported(),
+      mpegtsSupported: canUseMpegTsEngine(),
+      crossOrigin: isCrossOriginStream(streamUrl),
+    };
+
+    const failPlayback = (
+      reason: string,
+      extra?: Record<string, unknown>,
+      existingDiagnostic?: Record<string, unknown>,
+    ) => {
+      clearStartupTimer();
+      // First-watch HTTPS test failed before anything played: remember this
+      // category is HTTP-only and retry the whole thing over HTTP.
+      if (httpFallbackUrl && !playbackStarted) {
+        const fallback = httpFallbackUrl;
+        httpFallbackUrl = null;
+        if (testingHttps) {
+          writeHttpsCapability(streamUrl, category, "no");
+          console.warn("[IPTV][Player] HTTPS failed for this category — cached 'no', falling back to HTTP", {
+            category,
+            reason,
+          });
+        }
+        playbackBaseUrl = fallback;
+        playbackUrl = fallback;
+        currentSchemeHttps = false;
+        void beginPlayback();
+        return;
+      }
+      void (async () => {
+        // Only diagnose now that playback has actually failed (the provider
+        // connection is free again). Prefer the URL of the attempt that failed.
+        const hasDiagnostic = existingDiagnostic && Object.keys(existingDiagnostic).length > 0;
+        const diagTarget = typeof extra?.playbackUrl === "string" ? extra.playbackUrl : playbackUrl;
+        // Probe through the relay, exactly as the engine loaded it — anything
+        // already pointing at /api/* is left alone so we never ask the relay to
+        // proxy itself.
+        const probeTarget = isRelayUrl(diagTarget) ? diagTarget : toRelayUrl(diagTarget);
+        const diagnostic = hasDiagnostic
+          ? existingDiagnostic
+          : await diagnoseStreamUrl(probeTarget, diagTarget);
+        const attemptsTried = activeLiveAttempts.slice(0, liveAttemptIndex + 1).map((a) => a.label);
+        const userMessage = resolveLiveFailureMessage(diagnostic, {
+          userMessage: typeof extra?.userMessage === "string" ? extra.userMessage : undefined,
+        });
+        const report = logPlaybackReport(
+          reason,
+          {
+            ...playbackContext,
+            vlcFallbackUrl,
+            attemptsTried,
+            ...extra,
+          },
+          diagnostic,
+        );
+        setLocalError(userMessage);
+        setLocalErrorDetail(formatPlaybackReport(report));
+        onErrorRef.current(userMessage);
+        setLoading(false);
+      })();
+    };
+
+    const playCurrent = () => {
+      if (!autoplay) return;
+      void video.play().catch(() => {
+        onErrorRef.current("Autoplay is blocked by browser policy. Press play to start.");
+      });
+    };
+
+    const armStartupTimeout = (label?: string) => {
+      const timeoutMs =
+        label === "restream-hls"
+          ? RESTREAM_STARTUP_TIMEOUT_MS
+          : label === "direct-ts"
+            ? MPEGTS_STARTUP_TIMEOUT_MS
+            : SOURCE_STARTUP_TIMEOUT_MS;
+      clearStartupTimer();
+      startupTimerRef.current = window.setTimeout(() => {
+        if (item.section === "live" && liveAttemptIndex + 1 < activeLiveAttempts.length) {
+          tryLiveHlsNext("startup-timeout");
+          return;
+        }
+        const cur = activeLiveAttempts[liveAttemptIndex];
+        failPlayback("startup-timeout", {
+          timeoutMs,
+          readyState: video.readyState,
+          networkState: video.networkState,
+          attemptLabel: cur?.label,
+          // mpegts attempts go through the relay; HLS/restream URLs are same-origin already.
+          playbackUrl: cur ? (cur.engine === "mpegts" ? toRelayUrl(cur.url) : cur.url) : playbackUrl,
+        });
+      }, timeoutMs);
+    };
+
+    const prepareVideo = () => {
+      switchingSourceRef.current = true;
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      destroyMpegTsPlayer();
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      setLoading(true);
+      setLocalError(null);
+      setLocalErrorDetail(null);
+      onErrorRef.current(null);
+    };
+
+    let latestDiagnostic: Record<string, unknown> = {};
+
+    const startLiveAttempt = async (attemptIndex: number) => {
+      const attempt = activeLiveAttempts[attemptIndex];
+      if (!attempt) {
+        failPlayback("no-live-attempts");
+        return;
+      }
+      const previous = activeLiveAttempts[liveAttemptIndex];
+      liveAttemptIndex = attemptIndex;
+      prepareVideo();
+      // Leaving a restream: its ffmpeg is still holding a provider connection,
+      // and the next attempt is about to open one of its own. Awaiting the stop
+      // is the whole point — starting first is exactly the overlap that makes a
+      // one-slot account refuse the second request with a block page.
+      if (previous && previous !== attempt && previous.label === "restream-hls") {
+        await stopRestream(vlcFallbackUrl ?? undefined);
+      }
+      if (tornDown) return;
+      if (autoplay) armStartupTimeout(attempt.label);
+
+      console.info("[IPTV][Player] Live playback attempt", {
+        ...playbackContext,
+        attempt: attemptIndex,
+        attemptLabel: attempt.label,
+        engine: attempt.engine,
+        playbackUrl: toRelayUrl(attempt.url),
+      });
+
+      const failOrNext = (reason: string, extra: Record<string, unknown>) => {
+        if (liveAttemptIndex + 1 < activeLiveAttempts.length) {
+          tryLiveHlsNext(reason, extra);
+          return;
+        }
+        // Diagnose the same-origin relay URL (not the direct provider URL) so we
+        // can see what the relay actually returns: TS bytes, an HTML SPA page
+        // (relay middleware not running — restart the dev server), or a 502.
+        failPlayback(
+          reason,
+          { ...extra, attemptLabel: attempt.label, playbackUrl: toRelayUrl(attempt.url) },
+          latestDiagnostic,
+        );
+      };
+
+      if (attempt.engine === "mpegts") {
+        if (!canUseMpegTsEngine()) {
+          failOrNext("mpegts-unsupported", { attemptLabel: attempt.label });
+          return;
+        }
+        const player = createLiveMpegTs(toRelayUrl(attempt.url));
+        mpegtsRef.current = player;
+        player.attachMediaElement(video);
+        player.load();
+        // Report the stream's actual codecs and whether this browser's Media
+        // Source can decode them — tells us if a stall is a decode problem.
+        player.on(mpegts.Events.MEDIA_INFO, (mediaInfo: unknown) => {
+          const info = (mediaInfo ?? {}) as {
+            mimeType?: string;
+            videoCodec?: string;
+            audioCodec?: string;
+            width?: number;
+            height?: number;
+          };
+          const mse = typeof MediaSource !== "undefined" ? MediaSource : undefined;
+          const supported = info.mimeType ? Boolean(mse?.isTypeSupported(info.mimeType)) : "unknown";
+          console.info("[IPTV][Player] mpegts MEDIA_INFO (codec check)", {
+            attemptLabel: attempt.label,
+            playbackUrl: attempt.url,
+            mimeType: info.mimeType,
+            videoCodec: info.videoCodec,
+            audioCodec: info.audioCodec,
+            resolution: info.width && info.height ? `${info.width}x${info.height}` : undefined,
+            mseCanDecode: supported,
+          });
+          if (supported === false) {
+            failOrNext("mpegts-codec-unsupported", {
+              attemptLabel: attempt.label,
+              mimeType: info.mimeType,
+              videoCodec: info.videoCodec,
+              audioCodec: info.audioCodec,
+              userMessage: `This channel uses a codec your browser cannot decode (video: ${info.videoCodec ?? "?"}, audio: ${info.audioCodec ?? "?"}). Browser playback needs H.264 video + AAC audio.`,
+            });
+          }
+        });
+        // NOTE: do not clear the startup timeout merely because bytes are
+        // downloading. A provider "debug"/HTML page also downloads (speed > 0)
+        // but never decodes — clearing here would make playback spin forever.
+        // The timer is cleared by the real `loadeddata`/`playing` events.
+        player.on(mpegts.Events.ERROR, (errorType: unknown, errorDetails: unknown, errorInfo: unknown) => {
+          failOrNext("mpegts-error", { errorType, errorDetails, errorInfo });
+        });
+        switchingSourceRef.current = false;
+        playCurrent();
+        if (!autoplay) setLoading(false);
+        return;
+      }
+
+      const hls = createLiveHls();
+      hlsRef.current = hls;
+      hls.loadSource(attempt.url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        clearStartupTimer();
+        console.info("[IPTV][Player] HLS manifest parsed", {
+          ...playbackContext,
+          attemptLabel: attempt.label,
+          playbackUrl: attempt.url,
+        });
+      });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data?.fatal) {
+          console.warn("[IPTV][Player] HLS non-fatal error", {
+            ...playbackContext,
+            attemptLabel: attempt.label,
+            hlsErrorType: data.type,
+            hlsErrorDetails: data.details,
+          });
+          return;
+        }
+        failOrNext("hls-fatal", {
+          hlsErrorType: data.type,
+          hlsErrorDetails: data.details,
+          hlsErrorResponseCode: data.response?.code,
+          hlsErrorResponseText: data.response?.text?.slice(0, 300),
+        });
+      });
+      switchingSourceRef.current = false;
+      playCurrent();
+      if (!autoplay) setLoading(false);
+    };
+
+    const tryLiveHlsNext = (reason: string, extra?: Record<string, unknown>) => {
+      const nextIndex = liveAttemptIndex + 1;
+      if (nextIndex >= activeLiveAttempts.length) {
+        failPlayback(reason, extra, latestDiagnostic);
+        return;
+      }
+      console.warn("[IPTV][Player] Switching live playback method", {
+        ...playbackContext,
+        reason,
+        from: activeLiveAttempts[liveAttemptIndex],
+        to: activeLiveAttempts[nextIndex],
+      });
+      void startLiveAttempt(nextIndex);
+    };
+
+    const beginPlayback = async () => {
+      // (Re)build everything from the current base URL — this runs once for the
+      // primary scheme and again if we fall back from HTTPS to HTTP.
+      vlcFallbackUrl = item.section === "live" ? toXtreamTsUrl(playbackBaseUrl) : null;
+      liveAttempts = item.section === "live" ? buildLivePlaybackAttempts(playbackBaseUrl) : [];
+      activeLiveAttempts = liveAttempts.map((attempt) => ({ ...attempt }));
+      liveAttemptIndex = 0;
+      playbackUrl = playbackBaseUrl;
+      playbackContext.playbackUrl = playbackUrl;
+      playbackContext.scheme = currentSchemeHttps ? "https" : "http";
+      playbackContext.testingHttps = testingHttps;
+      playbackContext.category = category;
+      playbackContext.vlcFallbackUrl = vlcFallbackUrl;
+
+      const playbackPlan =
+        item.section === "live" ? activeLiveAttempts.map((a) => `${a.label}:${a.url}`) : [playbackUrl];
+
+      if (item.section === "live") {
+        // IMPORTANT: do NOT probe the provider before playing live. Many Xtream
+        // servers allow only one connection per stream, so an extra diagnostic
+        // fetch (even one we immediately abort) makes the provider reject
+        // mpegts.js's real connection. Play straight away; diagnostics only run
+        // afterwards if playback fails.
+        latestDiagnostic = {};
+        console.info("[IPTV][Player] Starting live playback (no pre-probe)", {
+          ...playbackContext,
+          playbackPlan,
+        });
+        console.info(
+          "[IPTV][Player] Paste this JSON:",
+          JSON.stringify({ ...playbackContext, playbackPlan }, null, 2),
+        );
+        void startLiveAttempt(0);
+        return;
+      }
+
+      // Do NOT pre-probe VOD either — same reason live doesn't (see above).
+      // The probe is a real provider connection (Range: bytes=0-2047), opened
+      // immediately before the video element opens its own, on an IP-locked
+      // panel that counts connections. It also serializes its full round trip
+      // (400-1500ms observed) in front of time-to-first-frame.
+      //
+      // Nothing is lost diagnostically: failPlayback still runs a fresh probe
+      // when playback actually fails, which is when the answer matters. And a
+      // provider block page is already caught server-side without spending an
+      // extra connection — relay.rs returns a clear, retryable 502 when a media
+      // URL answers with text/html.
+      latestDiagnostic = {};
+      console.info("[IPTV][Player] Starting playback (no pre-probe)", {
+        ...playbackContext,
+        playbackPlan,
+      });
+      console.info(
+        "[IPTV][Player] Paste this JSON:",
+        JSON.stringify({ ...playbackContext, playbackPlan }, null, 2),
+      );
+
+      prepareVideo();
+      // The remux pipe is an ffmpeg spawn: measured against a real episode it
+      // emits NOTHING for ~8s (connect, seek, cut the first fragment) and only
+      // reaches a playable buffer around 10-12s. The 12s byte-path budget kills
+      // it right at that edge, which looks exactly like "shows a frame, then
+      // stops". Give it the same allowance the other ffmpeg path already gets.
+      if (autoplay) armStartupTimeout(playbackMode === "remux" ? "restream-hls" : undefined);
+
+      if (playbackMode === "hls") {
+        const hls = new Hls();
+        hlsRef.current = hls;
+        hls.loadSource(toRelayUrl(playbackUrl));
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          console.info("[IPTV][Player] HLS manifest parsed", playbackContext);
+        });
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (!data?.fatal) {
+            console.warn("[IPTV][Player] HLS non-fatal error", {
+              ...playbackContext,
+              hlsErrorType: data.type,
+              hlsErrorDetails: data.details,
+            });
+            return;
+          }
+          failPlayback(
+            "hls-fatal",
+            {
+              hlsErrorType: data.type,
+              hlsErrorDetails: data.details,
+              hlsErrorResponseCode: data.response?.code,
+              hlsErrorResponseText: data.response?.text?.slice(0, 300),
+            },
+            latestDiagnostic,
+          );
+        });
+        switchingSourceRef.current = false;
+        playCurrent();
+        if (!autoplay) setLoading(false);
+        return;
+      }
+
+      if (playbackMode === "mpegts") {
+        const player = mpegts.createPlayer(
+          {
+            type: "mpegts",
+            url: toRelayUrl(playbackUrl),
+            isLive: false,
+            cors: true,
+            withCredentials: false,
+          },
+          {
+            isLive: false,
+            enableStashBuffer: false,
+            stashInitialSize: 128 * 1024,
+            lazyLoad: false,
+            deferLoadAfterSourceOpen: false,
+            liveBufferLatencyChasing: true,
+            liveBufferLatencyMaxLatency: 1.0,
+            liveBufferLatencyMinRemain: 0.2,
+            liveSync: false,
+            liveSyncMaxLatency: 1.0,
+            liveSyncTargetLatency: 0.4,
+            liveSyncPlaybackRate: 1.2,
+          },
+        );
+        mpegtsRef.current = player;
+        player.attachMediaElement(video);
+        player.load();
+        player.on(mpegts.Events.STATISTICS_INFO, (info: unknown) => {
+          const speed = (info as { speed?: number } | null)?.speed ?? 0;
+          if (autoplay && speed > 0) armStartupTimeout();
+        });
+        if (autoplay) {
+          const started = player.play();
+          if (started && typeof (started as Promise<void>).catch === "function") {
+            void (started as Promise<void>).catch((error: unknown) => {
+              if (isAbortLikeError(error)) return;
+              onErrorRef.current("Autoplay is blocked by browser policy. Press play to start.");
+            });
+          }
+        }
+        player.on(mpegts.Events.ERROR, (errorType: unknown, errorDetails: unknown, errorInfo: unknown) => {
+          failPlayback("mpegts-error", { errorType, errorDetails, errorInfo });
+        });
+        switchingSourceRef.current = false;
+        playCurrent();
+        if (!autoplay) setLoading(false);
+        return;
+      }
+
+      if (playbackMode === "remux") {
+        // A container the engine cannot open: the relay stream-copies it into
+        // fragmented MP4 and we feed that to MediaSource. Not <video src> —
+        // a piped fMP4 reports no duration, which would kill the scrubber,
+        // credits detection and continue-watching.
+        remuxRef.current?.destroy();
+        remuxRef.current = attachRemuxSource(video, {
+          buildUrl: (startSec) => buildRemuxUrl(playbackUrl, startSec),
+          // Start at the resume point so we never fetch from 0 and seek.
+          startSec: hasAppliedResumeRef.current ? 0 : Math.max(0, resumeFromRef.current),
+          onError: (message) => failPlayback("remux-error", { userMessage: message }),
+          onDuration: (durationSec) => setDuration(durationSec),
+        });
+        // The resume is served by the remuxer's own start offset.
+        hasAppliedResumeRef.current = true;
+        switchingSourceRef.current = false;
+        playCurrent();
+        if (!autoplay) setLoading(false);
+        return;
+      }
+
+      video.src = toRelayUrl(playbackUrl);
+      switchingSourceRef.current = false;
+      playCurrent();
+      if (!autoplay) setLoading(false);
+    };
+
+    void (async () => {
+      // Play through the same-origin relay (/api/stream). The relay fetches the
+      // upstream with proper headers from the server, so the browser is not
+      // subject to CORS / the provider's browser gating. We keep the user's
+      // scheme as-is — the relay does the upstream fetch server-side.
+      playbackBaseUrl = streamUrl;
+      playbackUrl = streamUrl;
+      currentSchemeHttps = /^https:/i.test(streamUrl);
+      testingHttps = false;
+      httpFallbackUrl = null;
+      await beginPlayback();
+    })();
+
+    const onErrorEvent = () => {
+      if (switchingSourceRef.current) return;
+      const mediaErr = video.error;
+      failPlayback("native-video-error", {
+        currentSrc: video.currentSrc,
+        networkState: video.networkState,
+        readyState: video.readyState,
+        mediaErrorCode: mediaErr?.code,
+        mediaErrorName: mediaErrorName(mediaErr?.code),
+        mediaErrorMessage: mediaErr?.message,
+      });
+    };
+    const onRateChange = () => setPlaybackRate(video.playbackRate);
+
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("loadeddata", onLoadedData);
+    video.addEventListener("durationchange", onDurationChange);
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("progress", onProgressEvent);
+    video.addEventListener("ended", onEndedInternal);
+    video.addEventListener("error", onErrorEvent);
+    video.addEventListener("ratechange", onRateChange);
+
+    return () => {
+      tornDown = true;
+      // Release the provider connection this player was holding. Destroying
+      // hls.js only closes OUR end of the loopback hop — the relay's ffmpeg
+      // keeps pulling the provider until its 120s idle reaper notices, so
+      // closing the player or switching to a movie left the account paying for
+      // a stream nobody was watching, and the next open was refused.
+      if (item.section === "live" && activeLiveAttempts.some((a) => a.label === "restream-hls")) {
+        void stopRestream(vlcFallbackUrl ?? toXtreamTsUrl(item.streamUrl) ?? undefined);
+      }
+      clearStartupTimer();
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("loadeddata", onLoadedData);
+      video.removeEventListener("durationchange", onDurationChange);
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("progress", onProgressEvent);
+      video.removeEventListener("ended", onEndedInternal);
+      video.removeEventListener("error", onErrorEvent);
+      video.removeEventListener("ratechange", onRateChange);
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      if (remuxRef.current) {
+        remuxRef.current.destroy();
+        remuxRef.current = null;
+      }
+      destroyMpegTsPlayer();
+      if (analyserRef.current) {
+        try {
+          analyserRef.current.disconnect();
+        } catch {
+          // no-op
+        }
+        analyserRef.current = null;
+      }
+      if (gainNodeRef.current) {
+        try {
+          gainNodeRef.current.disconnect();
+        } catch {
+          // no-op
+        }
+        gainNodeRef.current = null;
+      }
+      if (mediaSourceRef.current) {
+        try {
+          mediaSourceRef.current.disconnect();
+        } catch {
+          // no-op
+        }
+        mediaSourceRef.current = null;
+      }
+      if (audioContextRef.current) {
+        void audioContextRef.current.close().catch(() => undefined);
+        audioContextRef.current = null;
+      }
+    };
+  }, [item, autoplay, clearStartupTimer, destroyMpegTsPlayer, playbackBlocked, retryNonce]);
+
+  useEffect(() => {
+    const onFsChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
+
+  // Frame watchdog: WKWebView occasionally plays AUDIO while the video layer
+  // never presents a frame (fixed by a manual reload). Detect "playing, video
+  // track present, zero frames presented" and self-heal: first nudge the
+  // decoder with a micro-seek, then reload the source (bounded per item).
+  useEffect(() => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number })
+      | null;
+    if (!video || !item) return;
+    if (typeof video.requestVideoFrameCallback !== "function") return;
+
+    let cancelled = false;
+    let nudged = false;
+    let timer: number | null = null;
+
+    /**
+     * Everything needed to tell the candidate causes apart, in one line.
+     *
+     * The two warnings below used to carry no state at all, which made a black
+     * screen unactionable: starved video range, a decoder holding samples it
+     * will not present, and an unattached compositing layer all look identical
+     * from the outside. They separate cleanly on these fields — see the
+     * `diagnosis` note below.
+     */
+    const frameState = () => {
+      const buffered: [number, number][] = [];
+      for (let i = 0; i < video.buffered.length; i += 1) {
+        buffered.push([video.buffered.start(i), video.buffered.end(i)]);
+      }
+      const t = video.currentTime;
+      const ahead = buffered.find(([s, e]) => t >= s && t <= e);
+      return {
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        readyState: video.readyState,
+        networkState: video.networkState,
+        currentTime: Number(t.toFixed(3)),
+        paused: video.paused,
+        buffered,
+        // Whether the element HAS the data it is failing to show.
+        currentTimeIsBuffered: Boolean(ahead),
+        bufferedAheadSec: ahead ? Number((ahead[1] - t).toFixed(3)) : 0,
+        diagnosis: !video.videoWidth
+          ? "no video track (audio-only source, or the track never opened)"
+          : ahead
+            ? "samples present but no frame presented — decoder or compositing layer"
+            : buffered.length > 0 && buffered[0][0] > t
+              ? "playhead is BEHIND the buffered range — audio-only head or bad start position"
+              : "video range starved — bytes have not arrived",
+      };
+    };
+
+    const arm = () => {
+      if (cancelled) return;
+      let gotFrame = false;
+      video.requestVideoFrameCallback?.(() => {
+        gotFrame = true;
+      });
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (cancelled || gotFrame || video.paused || video.readyState < 2) return;
+        // videoWidth === 0 means an audio-only stream — nothing to heal.
+        if (video.videoWidth === 0) return;
+        if (autoRecoverRef.current.id !== item.id) {
+          autoRecoverRef.current = { id: item.id, count: 0 };
+        }
+        if (!nudged) {
+          nudged = true;
+          console.warn("[IPTV][Player] playing but no video frames — nudging decoder", frameState());
+          try {
+            video.currentTime = video.currentTime + 0.01;
+          } catch {
+            /* ignore */
+          }
+          arm();
+          return;
+        }
+        if (autoRecoverRef.current.count < 2) {
+          autoRecoverRef.current.count += 1;
+          console.warn("[IPTV][Player] still no video frames — auto-reloading source", frameState());
+          setRetryNonce((nonce) => nonce + 1);
+        } else {
+          const state = frameState();
+          const message = playbackErrorMessage(10, state.diagnosis);
+          setLocalError(message);
+          setLocalErrorDetail(
+            formatPlaybackReport({
+              _instruction: "Copy the JSON block below and paste it in your support message",
+              reason: "no-video-frames",
+              timestamp: new Date().toISOString(),
+              itemId: item.id,
+              title: item.title,
+              section: item.section,
+              streamUrl: item.streamUrl,
+              currentSrc: video.currentSrc,
+              ...state,
+            }),
+          );
+          onErrorRef.current(message);
+        }
+      }, 3000);
+    };
+
+    const onPlaying = () => arm();
+    video.addEventListener("playing", onPlaying);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      video.removeEventListener("playing", onPlaying);
+    };
+  }, [item, retryNonce]);
+
+  const title = useMemo(() => item?.title ?? "No stream selected", [item]);
+
+  const togglePlay = useCallback(() => {
+    if (!item) return;
+    if (playbackBlocked) {
+      onPlaybackBlockedAction?.();
+      return;
+    }
+    if (isCasting) {
+      castPlayPause();
+      return;
+    }
+    resumeAudioContext();
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) void video.play().catch(() => undefined);
+    else video.pause();
+  }, [item, playbackBlocked, onPlaybackBlockedAction, isCasting, castPlayPause, resumeAudioContext]);
+
+  const seekTo = useCallback(
+    (seconds: number) => {
+      if (isCasting) {
+        castSeekTo(seconds);
+        return;
+      }
+      const video = videoRef.current;
+      if (!video) return;
+      const target = Math.max(0, Number.isFinite(video.duration) ? Math.min(seconds, video.duration) : seconds);
+      // A remuxed source has no byte-range seeking of its own: inside the
+      // buffered window this is free, and outside it respawns ffmpeg at the
+      // target — one provider connection per gesture, no more.
+      remuxRef.current?.seek(target);
+      video.currentTime = target;
+      setCurrentTime(target);
+    },
+    [isCasting, castSeekTo],
+  );
+
+  const skipBy = useCallback(
+    (delta: number) => {
+      if (isCasting) {
+        castSeekTo((mirrorRef.current.currentTime || 0) + delta);
+        return;
+      }
+      const video = videoRef.current;
+      if (!video) return;
+      seekTo((video.currentTime || 0) + delta);
+    },
+    [isCasting, castSeekTo, seekTo],
+  );
+
+  /**
+   * Collapse a held arrow key into ONE seek.
+   *
+   * Every keydown used to call skipBy directly, so the OS auto-repeat (and a TV
+   * remote's D-pad repeat) fired a seek per tick — a scrub storm upstream, which
+   * is what trips the provider's rate limiter. Deltas accumulate and commit once
+   * the key comes up; because skipBy resolves against the live currentTime at
+   * commit time, summing them first is equivalent to applying each in turn.
+   */
+  const stagedSkipRef = useRef(0);
+  const stagedSkipTimerRef = useRef<number | null>(null);
+
+  const commitStagedSkip = useCallback(() => {
+    if (stagedSkipTimerRef.current != null) {
+      window.clearTimeout(stagedSkipTimerRef.current);
+      stagedSkipTimerRef.current = null;
+    }
+    const delta = stagedSkipRef.current;
+    stagedSkipRef.current = 0;
+    if (delta !== 0) skipBy(delta);
+  }, [skipBy]);
+
+  const stageSkip = useCallback(
+    (delta: number) => {
+      stagedSkipRef.current += delta;
+      if (stagedSkipTimerRef.current != null) window.clearTimeout(stagedSkipTimerRef.current);
+      // Safety net: TV browsers drop keyup often enough that waiting only for it
+      // would strand the seek forever.
+      stagedSkipTimerRef.current = window.setTimeout(commitStagedSkip, 400);
+    },
+    [commitStagedSkip],
+  );
+
+  const toggleMute = useCallback(() => {
+    if (isCasting) {
+      castMuteToggle();
+      return;
+    }
+    onMuted(!muted);
+  }, [muted, onMuted, isCasting, castMuteToggle]);
+
+  const handleOverlayVolume = useCallback(
+    (value: number) => {
+      const clamped = Math.min(2, Math.max(0, value));
+      if (clamped > 1) resumeAudioContext();
+      onVolume(clamped);
+      if (isCasting) castSetVolumeLevel(clamped);
+    },
+    [onVolume, isCasting, castSetVolumeLevel, resumeAudioContext],
+  );
+
+  const handleCastClick = useCallback(() => {
+    if (isCasting) stopCasting();
+    else void requestCastSession();
+  }, [isCasting, stopCasting, requestCastSession]);
+
+  const toggleFullscreen = useCallback(async () => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    // Exit whichever fullscreen mode is active.
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    if (cssFullscreen) {
+      setCssFullscreen(false);
+      if (servedByLocalRelay()) {
+        void fetch("/api/window/fullscreen?on=false", { method: "POST" }).catch(() => undefined);
+      }
+      return;
+    }
+
+    // macOS WKWebView (the bundled window): every WebKit-native fullscreen
+    // route is broken here — the fullscreen preference (KVC or public API)
+    // and AVKit presentation mode all destroy video rendering, and
+    // requestFullscreen "succeeds" as a whole-page fullscreen. Go straight to
+    // CSS fullscreen (only the player covers the page, our controls intact)
+    // plus true native WINDOW fullscreen via the relay.
+    const isMacWebKitWindow =
+      servedByLocalRelay() && /Mac/i.test(navigator.userAgent) && !/Chrom/i.test(navigator.userAgent);
+    if (!isMacWebKitWindow) {
+      // Standard element Fullscreen API (browsers, Windows WebView2).
+      try {
+        if (typeof container.requestFullscreen !== "function") throw new Error("unavailable");
+        await container.requestFullscreen();
+        return;
+      } catch {
+        /* fall through to CSS fullscreen */
+      }
+    }
+
+    setCssFullscreen(true);
+    if (servedByLocalRelay()) {
+      void fetch("/api/window/fullscreen?on=true", { method: "POST" }).catch(() => undefined);
+    }
+  }, [cssFullscreen]);
+
+  const togglePip = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (!("pictureInPictureEnabled" in document)) return;
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else {
+        await video.requestPictureInPicture();
+      }
+    } catch {
+      /* pip disallowed */
+    }
+  }, []);
+
+  const setRate = useCallback((rate: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.playbackRate = rate;
+    setPlaybackRate(rate);
+  }, []);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      const withinPlayer = el.contains(target);
+      if (!withinPlayer && !isFullscreen && !cssFullscreen) return;
+      switch (event.key.toLowerCase()) {
+        case "escape":
+          if (cssFullscreen) {
+            event.preventDefault();
+            void toggleFullscreen();
+          }
+          break;
+        case " ":
+        case "k":
+          event.preventDefault();
+          togglePlay();
+          bumpControls();
+          break;
+        case "arrowleft":
+          event.preventDefault();
+          stageSkip(event.shiftKey ? -30 : -5);
+          bumpControls();
+          break;
+        case "arrowright":
+          event.preventDefault();
+          stageSkip(event.shiftKey ? 30 : 5);
+          bumpControls();
+          break;
+        case "j":
+          event.preventDefault();
+          stageSkip(-10);
+          bumpControls();
+          break;
+        case "l":
+          event.preventDefault();
+          stageSkip(10);
+          bumpControls();
+          break;
+        case "arrowup":
+          event.preventDefault();
+          handleOverlayVolume(Math.min(2, (volume || 0) + 0.05));
+          bumpControls();
+          break;
+        case "arrowdown":
+          event.preventDefault();
+          handleOverlayVolume(Math.max(0, (volume || 0) - 0.05));
+          bumpControls();
+          break;
+        case "m":
+          event.preventDefault();
+          toggleMute();
+          bumpControls();
+          break;
+        case "f":
+          event.preventDefault();
+          void toggleFullscreen();
+          break;
+        case "p":
+          event.preventDefault();
+          void togglePip();
+          break;
+        case "+":
+        case "=":
+          event.preventDefault();
+          nudgeVideoZoom(VIDEO_ZOOM_STEP);
+          bumpControls();
+          break;
+        case "-":
+        case "_":
+          event.preventDefault();
+          nudgeVideoZoom(-VIDEO_ZOOM_STEP);
+          bumpControls();
+          break;
+        case "0":
+          event.preventDefault();
+          setVideoZoom(1);
+          bumpControls();
+          break;
+        case "n":
+          if (onPlayNextEpisode && nextEpisode) {
+            event.preventDefault();
+            onPlayNextEpisode();
+          }
+          break;
+        default:
+          break;
+      }
+    };
+    // Commit the accumulated skip when the key is released — one seek per
+    // gesture, however long it was held.
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (["arrowleft", "arrowright", "j", "l"].includes(event.key.toLowerCase())) {
+        commitStagedSkip();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    document.addEventListener("keyup", onKeyUp);
+    return () => {
+      document.removeEventListener("keydown", handler);
+      document.removeEventListener("keyup", onKeyUp);
+    };
+  }, [
+    bumpControls,
+    commitStagedSkip,
+    stageSkip,
+    cssFullscreen,
+    handleOverlayVolume,
+    isFullscreen,
+    nextEpisode,
+    nudgeVideoZoom,
+    onPlayNextEpisode,
+    setVideoZoom,
+    skipBy,
+    toggleFullscreen,
+    toggleMute,
+    togglePip,
+    togglePlay,
+    volume,
+  ]);
+
+  const canPip = typeof document !== "undefined" && "pictureInPictureEnabled" in document;
+
+  const handleDownload = useCallback(async () => {
+    if (!item) return;
+    setDownloadBusy(true);
+    setDownloadHint(null);
+    const result = await downloadMediaFile({
+      streamUrl: item.streamUrl,
+      title: item.title,
+      video: videoRef.current,
+    });
+    setDownloadBusy(false);
+    if (result.ok) {
+      setDownloadHint("Saved to your downloads folder.");
+      window.setTimeout(() => setDownloadHint(null), 4000);
+    } else {
+      setDownloadHint(result.message);
+    }
+  }, [item]);
+  return (
+    <>
+      <div
+        className={clsx(
+          // `.panel` applies backdrop-filter, which makes this div the containing
+          // block for fixed descendants — with it, the fullscreen player would
+          // "cover" only its own panel. Drop it while in CSS fullscreen.
+          cssFullscreen ? "flex min-h-0 flex-col" : "panel flex min-h-0 flex-col overflow-hidden",
+          className,
+        )}
+      >
+        <div
+          ref={containerRef}
+          className={clsx(
+            "player-viewport group/player overflow-hidden",
+            // CSS fullscreen fallback: cover the whole page above the app chrome.
+            // Must REPLACE `relative`, not sit beside it — Tailwind's `relative`
+            // rule comes after `fixed` in the stylesheet and would win.
+            cssFullscreen ? "fixed inset-0 z-[100] bg-black" : "relative",
+            // Hide the cursor with the controls during playback (e.g. fullscreen);
+            // any pointer move re-shows both via bumpControls.
+            !controlsVisible && "cursor-none",
+          )}
+          onPointerMove={bumpControls}
+          onPointerLeave={() => {
+            if (displayPlaying && !displayLoading && !localError) setControlsVisible(false);
+          }}
+          // Show on focus AND reschedule the hide, so a control keeping focus
+          // (after a click, or tabbing) doesn't leave the bar stuck visible.
+          onFocus={bumpControls}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          tabIndex={0}
+        >
+          <video
+            ref={videoRef}
+            className={clsx(
+              // The element's box must be the VIEWPORT, not the media. With only
+              // max-w/max-h (plus Preflight's `video { height: auto }`) a replaced
+              // element keeps the stream's own aspect ratio, so box ratio == media
+              // ratio and object-fit is a definitional no-op — contain, cover and
+              // fill all paint identically. Absolute rather than a w-full/h-full
+              // flex item so a future in-flow sibling can't shrink it; every
+              // sibling overlay is already absolute, and the parent is always
+              // positioned (`relative`, or `fixed inset-0` in CSS fullscreen).
+              "absolute inset-0 h-full w-full bg-black transition-transform duration-150",
+              // With no stream selected the element has no source; hide it so the
+              // WebView's default gray "no video" poster doesn't show — the black
+              // viewport and the overlay ("No stream selected") remain instead.
+              !item && "hidden",
+            )}
+            style={{
+              objectFit: videoFitMode,
+              ...(videoScale !== 1 ? { transform: `scale(${videoScale})`, transformOrigin: "center center" } : null),
+            }}
+            controls={false}
+            playsInline
+            onClick={togglePlay}
+            onDoubleClick={() => void toggleFullscreen()}
+          />
+          {subtitleSyncOpen ? (
+            <SubtitleSyncPanel
+              cues={subtitles.selectedCues}
+              offsetSec={subtitles.offsetSec}
+              // Halved resolution: the panel re-renders its whole cue list on
+              // every change, and 2 Hz is plenty for a highlight and a clock.
+              currentTime={Math.round(displayTime * 2) / 2}
+              onPick={(cueStartSec) => {
+                // Match against the live position, not the coarsened prop —
+                // this is the one number the whole feature turns on.
+                const at = videoRef.current?.currentTime;
+                subtitles.setOffset(
+                  offsetForMatch(cueStartSec, Number.isFinite(at) ? (at as number) : displayTime),
+                );
+                setSubtitleSyncOpen(false);
+              }}
+              onClose={() => setSubtitleSyncOpen(false)}
+            />
+          ) : null}
+          {/* A sibling of the video, NOT a child of PlayerOverlay. That overlay
+              is click-through (pointer-events-none, re-enabled per control) and
+              fades itself out with the controls — a dialog nested inside it
+              inherited both, so every click on a device landed on the video
+              underneath and started/stopped playback instead. */}
+          <CastDevicePicker
+            devices={castDevices}
+            pending={pendingCastDevice}
+            itemTitle={title}
+            onPick={selectCastDevice}
+            onConfirm={() => void confirmCastDevice()}
+            onDismissConfirm={dismissCastConfirm}
+            onCancel={cancelCastPicker}
+          />
+          {dropNotice ? (
+            <div className="pointer-events-none absolute bottom-28 left-1/2 z-30 -translate-x-1/2 rounded-lg bg-amber-500/15 px-3 py-1.5 text-xs text-amber-100 shadow-lg ring-1 ring-amber-400/30">
+              {dropNotice}
+            </div>
+          ) : null}
+          {subtitles.hint ? (
+            <div className="pointer-events-none absolute bottom-20 left-1/2 z-30 -translate-x-1/2 rounded-lg bg-slate-950/90 px-3 py-1.5 text-xs text-cyan-100 shadow-lg">
+              {subtitles.hint}
+            </div>
+          ) : null}
+          {subtitleDropActive ? (
+            <div className="pointer-events-none absolute inset-3 z-30 flex items-center justify-center rounded-xl border-2 border-dashed border-cyan-400/70 bg-slate-950/70">
+              <p className="text-sm font-medium text-cyan-100">
+                {onPlayLocalFile
+                  ? "Drop a video to play it, or a subtitle file (.srt, .vtt, .ass)"
+                  : "Drop a subtitle file (.srt, .vtt, .ass)"}
+              </p>
+            </div>
+          ) : null}
+          <input
+            ref={subtitleInputRef}
+            type="file"
+            accept=".srt,.vtt,.ass,.ssa,text/vtt,text/plain"
+            className="hidden"
+            onChange={(event) => {
+              handleSubtitleFiles(event.target.files);
+              // Clear so picking the SAME file again still fires onChange.
+              event.target.value = "";
+            }}
+          />
+          <PlayerOverlay
+            title={title}
+            loading={displayLoading}
+            error={localError}
+            errorDetail={localErrorDetail}
+            isPlaying={displayPlaying}
+            isLive={isLive}
+            isFullscreen={isFullscreen || cssFullscreen}
+            canPip={canPip}
+            canCast={canCast}
+            castActive={isCasting}
+            castDeviceLabel={deviceName}
+            castHint={castMessage}
+            muted={muted}
+            volume={volume}
+            volumePercentMode={volumePercentMode}
+            currentTime={displayTime}
+            duration={displayDuration}
+            buffered={displayBuffered}
+            playbackRate={playbackRate}
+            controlsVisible={controlsVisible}
+            onTogglePlay={togglePlay}
+            onSeekTo={seekTo}
+            onSkip={skipBy}
+            onToggleMute={toggleMute}
+            onVolume={handleOverlayVolume}
+            onTogglePip={() => void togglePip()}
+            onToggleFullscreen={() => void toggleFullscreen()}
+            onCast={handleCastClick}
+            onChangePlaybackRate={setRate}
+            videoScale={videoScale}
+            onVideoScale={setVideoZoom}
+            videoFitMode={videoFitMode}
+            onVideoFitModeChange={onVideoFitModeChange}
+            subtitleOptions={subtitles.options}
+            subtitleSelectedId={subtitles.selectedId}
+            onSelectSubtitle={subtitles.select}
+            subtitleOffsetSec={subtitles.offsetSec}
+            onNudgeSubtitleOffset={subtitles.nudgeOffset}
+            onResetSubtitleOffset={subtitles.resetOffset}
+            onAddSubtitleFile={openSubtitlePicker}
+            onOpenSubtitleSync={
+              subtitles.selectedId === "off" ? undefined : () => setSubtitleSyncOpen(true)
+            }
+            // Kept mounted while a run is in flight even if the selection
+            // changed underneath it — otherwise the button (and with it the
+            // only way to cancel) disappears mid-sync.
+            onAutoSyncSubtitles={
+              canAutoSync || autoSyncBusy ? () => void handleAutoSync() : undefined
+            }
+            onCancelAutoSync={handleCancelAutoSync}
+            autoSyncBusy={autoSyncBusy}
+            autoSyncStatus={autoSyncStatus}
+            autoSyncFraction={autoSyncFraction}
+            onUndoAutoSync={subtitles.canUndoSyncedCues ? subtitles.undoSyncedCues : undefined}
+            subtitleHint={subtitles.hint}
+            canPlayNext={Boolean(nextEpisode)}
+            nextEpisodeLabel={
+              nextEpisode ? `S${nextEpisode.season ?? 0}E${nextEpisode.episode ?? 0} · ${nextEpisode.title}` : null
+            }
+            onPlayNext={onPlayNextEpisode}
+            canDownload={Boolean(item)}
+            downloadBusy={downloadBusy}
+            downloadHint={downloadHint}
+            isHlsStream={item ? isHlsUrl(item.streamUrl) : false}
+            onDownload={() => void handleDownload()}
+            errorActionLabel={playbackBlocked ? "Connect backend" : "Try again"}
+            onErrorAction={
+              playbackBlocked
+                ? onPlaybackBlockedAction
+                : () => setRetryNonce((nonce) => nonce + 1)
+            }
+          />
+          <CreditsOverlay
+            visible={showCreditsSuggestion}
+            nextEpisodeLabel={
+              nextEpisode ? `S${nextEpisode.season ?? 0}E${nextEpisode.episode ?? 0} · ${nextEpisode.title}` : null
+            }
+            countdownSeconds={creditsCountdown}
+            countdownTotalSeconds={CREDITS_COUNTDOWN_SEC}
+            onPlayNext={handleCreditsPlayNext}
+            onDismiss={handleCreditsDismiss}
+            onCancelCountdown={() => {
+              setCountdownCancelled(true);
+              setCreditsCountdown(null);
+            }}
+          />
+          {import.meta.env.DEV ? (
+            <CreditsDebugPanel
+              result={credits}
+              triggerScore={DEFAULT_CREDITS_CONFIG.triggerScore}
+              requiredConsecutiveSamples={DEFAULT_CREDITS_CONFIG.requiredConsecutiveSamples}
+            />
+          ) : null}
+        </div>
+      </div>
+    <PlayerNavBar
+      nextEpisode={nextEpisode}
+      onPlayNext={onPlayNextEpisode ?? (() => {})}
+      canMarkCredits={canMarkCredits}
+      onMarkCreditsStart={handleMarkCreditsStart}
+      creditsMarkHint={creditsMarkHint}
+    />
+    </>
+  );
+};

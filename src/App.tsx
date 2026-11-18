@@ -1,0 +1,1604 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Analytics } from "@vercel/analytics/react";
+import type { AppSettings, UIFilters } from "./types/player";
+import type {
+  ContinueWatchingEntry,
+  EpisodeItem,
+  FavoriteEntry,
+  PlaybackProgress,
+  PlaylistItem,
+  PlaylistSection,
+  RecentEntry,
+  SavedPlaylist,
+} from "./types/models";
+import { storage } from "./utils/storage";
+import { getShareId, itemMatchesShareId } from "./utils/shareId";
+import { buildEpisodeUrl, buildWatchPath, parseWatchPath, resolveWatchDeepLink } from "./utils/watchUrl";
+import {
+  buildSeriesFromCatalog,
+  findSeriesCatalogItem,
+  getGroups,
+  getNextEpisode,
+  groupSeries,
+} from "./utils/grouping";
+import { useActivePlaylist } from "./hooks/useActivePlaylist";
+import { usePlaylistImport } from "./hooks/usePlaylistImport";
+import { useFavorites } from "./hooks/useFavorites";
+import { useRecents } from "./hooks/useRecents";
+import { useContinueWatching } from "./hooks/useContinueWatching";
+import { usePlaylistFilter } from "./hooks/usePlaylistFilter";
+import { usePlayer } from "./hooks/usePlayer";
+import { useDebouncedValue } from "./hooks/useDebouncedValue";
+import { useBackendConnection } from "./hooks/useBackendConnection";
+import { Header } from "./components/layout/Header";
+import { MobileMenu } from "./components/layout/MobileMenu";
+import { UpdateBanner } from "./components/shared/UpdateBanner";
+import { checkForUpdate, type UpdateInfo } from "./utils/appUpdate";
+import { getRelayBase } from "./utils/secureUrl";
+import { openDebugLogWindow, setDebugModeEnabled } from "./utils/debugLog";
+import { isNativeRuntime } from "./utils/relayDiscovery";
+import { SearchOverlay, type SearchOpenFocus } from "./components/layout/SearchOverlay";
+import { PlaylistImportModal } from "./components/playlist/PlaylistImportModal";
+import { VideoPlayer } from "./components/player/VideoPlayer";
+import { PlaylistManager } from "./components/playlist/PlaylistManager";
+import { SettingsView } from "./components/views/SettingsView";
+import { ErrorState } from "./components/shared/ErrorState";
+import { InstallAppBanner } from "./components/shared/InstallAppBanner";
+import { BackendConnectionModal } from "./components/shared/BackendConnectionModal";
+import { DetailsPanel } from "./components/panels/DetailsPanel";
+import { formatDuration, now } from "./utils/time";
+import { playlistDb } from "./utils/indexedDb";
+import { loadPlaylistSource } from "./utils/loadPlaylistSource";
+import { loadXtreamSeriesEpisodes } from "./utils/xtream";
+import { backupToBackend } from "./utils/backendBackup";
+import { serializePlaylistItemsToM3u } from "./utils/exportM3u";
+import { resolveRecentDisplayItem, resolveRecentItemId } from "./utils/recentItems";
+import { buildLocalVideoItem, isLocalItem } from "./utils/localMedia";
+import { RemoteModeGate } from "./components/views/RemoteModeGate";
+import { useSyncSession } from "./hooks/useSyncSession";
+import {
+  getRemoteMode,
+  isRemoteLanClient,
+  saveRemoteMode,
+  type RemoteMode,
+  type SyncCommand,
+  type SyncFollowerReport,
+} from "./utils/syncSession";
+import { initTvNavigation } from "./utils/tvNavigation";
+
+const initialFilters: UIFilters = {
+  query: "",
+  selectedGroup: "all",
+  favoritesOnly: false,
+};
+
+const App = () => {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const deepLink = useMemo(() => parseWatchPath(location.pathname), [location.pathname]);
+
+  const [state, setState] = useState(storage.load);
+  const [importOpen, setImportOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchFocus, setSearchFocus] = useState<SearchOpenFocus | null>(null);
+  const [filters, setFilters] = useState<UIFilters>(initialFilters);
+  const debouncedQuery = useDebouncedValue(filters.query, 180);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const lastProgressRef = useRef<Record<string, number>>({});
+  const syncedPlaylistIdsRef = useRef<Set<string>>(new Set());
+  const restoredLastVisitRef = useRef(false);
+  const appliedDeepLinkKey = useRef<string | null>(null);
+  // Deep link the "connect a backend first" modal has already been raised for.
+  // The modal is a prompt, not a gate: once dismissed it must stay dismissed.
+  const promptedBackendKey = useRef<string | null>(null);
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
+  const [loadingSeriesId, setLoadingSeriesId] = useState<string | null>(null);
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [connectionPlaybackError, setConnectionPlaybackError] = useState<string | null>(null);
+  /**
+   * Resolution/duration of a dropped file, read once its metadata loads. Held
+   * beside the item rather than merged into it on purpose: the playback effect
+   * depends on the item's identity, so enriching it would restart playback,
+   * which would load metadata again — a loop.
+   */
+  const [localMediaInfo, setLocalMediaInfo] = useState<{
+    width: number;
+    height: number;
+    durationSec: number | null;
+  } | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const updateCheckedRef = useRef(false);
+  const backendConnection = useBackendConnection();
+  const canPlayVideos = backendConnection.connected;
+
+  // Remote devices (another browser on http://<master-ip>:11471/) choose per
+  // session between following the master's playback and browsing normally.
+  // Local/native sessions skip the chooser entirely ("regular" from the start).
+  const [remoteMode, setRemoteMode] = useState<RemoteMode | null>(() =>
+    isRemoteLanClient() ? getRemoteMode() : "regular",
+  );
+  const remoteGateOpen = remoteMode === null;
+  const syncFollowerConfigured = remoteMode === "sync" && isRemoteLanClient();
+  const chooseRemoteMode = useCallback((mode: RemoteMode) => {
+    saveRemoteMode(mode);
+    setRemoteMode(mode);
+  }, []);
+
+  // D-pad / TV-remote spatial navigation (self-activates only in TV contexts).
+  useEffect(() => {
+    initTvNavigation();
+  }, []);
+  // @vercel/analytics only has a collector to talk to on Vercel-hosted origins;
+  // its script 404s anywhere else. The app is also served from Cloudflare Pages
+  // (ctv.1guy.dev), the local relay, and LAN addresses — all of which this
+  // excludes, along with localhost.
+  const shouldRenderAnalytics =
+    typeof window !== "undefined" && /(^|\.)vercel\.app$/i.test(window.location.hostname);
+
+  // Release-only auto-update check. Debug builds report `debug: true` from the
+  // relay and are skipped, and the web build (no native runtime) never checks.
+  const serverInfo = backendConnection.serverInfo;
+  useEffect(() => {
+    if (updateCheckedRef.current) return;
+    if (!backendConnection.isNative) return;
+    if (!serverInfo || serverInfo.debug || !serverInfo.version) return;
+    updateCheckedRef.current = true;
+    void checkForUpdate(serverInfo.version).then((info) => {
+      if (info) setUpdateInfo(info);
+    });
+  }, [backendConnection.isNative, serverInfo]);
+
+  const handleUpdate = useCallback(async () => {
+    if (!updateInfo) return;
+    const isAndroid = typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent);
+    setUpdateBusy(true);
+    try {
+      // One-tap Android install: the relay downloads the APK and opens the system
+      // installer. Fall back to the browser (download the APK / open the release
+      // page) if that isn't available or fails.
+      if (isAndroid && backendConnection.isNative && updateInfo.apkUrl) {
+        try {
+          const res = await fetch(
+            `${getRelayBase()}/api/update/install?url=${encodeURIComponent(updateInfo.apkUrl)}`,
+            { method: "POST" },
+          );
+          if (res.ok) return; // installer launched
+        } catch {
+          /* fall through to browser download */
+        }
+      }
+      const target = isAndroid && updateInfo.apkUrl ? updateInfo.apkUrl : updateInfo.releaseUrl;
+      if (backendConnection.isNative) {
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(target);
+      } else {
+        window.open(target, "_blank", "noopener");
+      }
+    } catch (error) {
+      // The desktop window loads http://127.0.0.1:11471 (WebviewUrl::External),
+      // which Tauri's ACL treats as remote content — capabilities/default.json's
+      // `remote.urls` is what grants it the opener permissions. If that ever
+      // regresses, surface it instead of failing silently.
+      console.error("[IPTV][Update] openUrl failed", error);
+      window.open(updateInfo.releaseUrl, "_blank", "noopener");
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, [updateInfo, backendConnection.isNative]);
+
+  const setPlaylists = useCallback((playlists: SavedPlaylist[]) => setState((prev) => ({ ...prev, playlists })), []);
+  const setActivePlaylistId = useCallback(
+    (activePlaylistId: string | null) => setState((prev) => ({ ...prev, activePlaylistId })),
+    [],
+  );
+  const setFavorites = useCallback((favorites: FavoriteEntry[]) => setState((prev) => ({ ...prev, favorites })), []);
+  const setRecents = useCallback((recents: RecentEntry[]) => setState((prev) => ({ ...prev, recents })), []);
+  const setProgress = useCallback((progress: PlaybackProgress[]) => setState((prev) => ({ ...prev, progress })), []);
+  const setContinueWatching = useCallback(
+    (continueWatching: ContinueWatchingEntry[]) => setState((prev) => ({ ...prev, continueWatching })),
+    [],
+  );
+  const setSettings = useCallback((settings: AppSettings) => setState((prev) => ({ ...prev, settings })), []);
+  const setSection = useCallback((section: PlaylistSection) => setState((prev) => ({ ...prev, section })), []);
+  const toggleRightPanel = useCallback(() => {
+    setState((prev) => ({
+      ...prev,
+      settings: { ...prev.settings, rightPanelOpen: !prev.settings.rightPanelOpen },
+    }));
+  }, []);
+
+  useEffect(() => {
+    const result = storage.save(state);
+    if (!result.ok) {
+      setStorageError("Local storage is full. Please remove some playlists or clear app data from Settings.");
+      return;
+    }
+    if (result.degraded) {
+      setStorageError("Storage is near browser quota. Some non-critical metadata was compacted to keep your app state saved.");
+      return;
+    }
+    setStorageError(null);
+  }, [state]);
+
+  // Mirror playlists to the relay's durable on-disk backup after meaningful
+  // changes settle (debounced). Keyed on playlist/library changes, NOT on
+  // playback progress, so it doesn't churn while watching. No-op without a relay.
+  useEffect(() => {
+    // A remote device is talking to the MASTER's relay — pushing this device's
+    // state there would overwrite the master's own backup file.
+    if (isRemoteLanClient()) return;
+    const handle = window.setTimeout(() => {
+      void backupToBackend();
+    }, 6000);
+    return () => window.clearTimeout(handle);
+  }, [
+    state.playlists,
+    state.favorites,
+    state.recents,
+    state.settings,
+    state.activePlaylistId,
+  ]);
+
+  useEffect(() => {
+    const needsHydration = state.playlists.filter((playlist) => playlist.itemCount > 0 && playlist.items.length === 0);
+    if (!needsHydration.length) return;
+
+    let active = true;
+    void (async () => {
+      const entries = await Promise.all(
+        needsHydration.map(async (playlist) => {
+          try {
+            const items = await playlistDb.loadPlaylistItems(playlist.id);
+            if (items.length > 0) {
+              return [playlist.id, items] as const;
+            }
+            const sourceContent = await playlistDb.loadPlaylistSourceContent(playlist.id);
+            const parsed = await loadPlaylistSource(playlist.id, playlist.source, sourceContent ?? "");
+            if (parsed.items.length > 0) {
+              await playlistDb.savePlaylistItems(playlist.id, parsed.items);
+            }
+            return [playlist.id, parsed.items] as const;
+          } catch (err) {
+            console.error("[IPTV] playlist hydrate failed", playlist.id, err);
+            return [playlist.id, [] as PlaylistItem[]] as const;
+          }
+        }),
+      );
+      if (!active) return;
+      const itemMap = new Map(entries);
+      setState((prev) => ({
+        ...prev,
+        playlists: prev.playlists.map((playlist) => {
+          const loaded = itemMap.get(playlist.id);
+          if (!loaded || playlist.items.length > 0) return playlist;
+          return { ...playlist, items: loaded, itemCount: loaded.length || playlist.itemCount };
+        }),
+      }));
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [state.playlists]);
+
+  useEffect(() => {
+    const candidates = state.playlists.filter((playlist) => playlist.items.length > 0 && !syncedPlaylistIdsRef.current.has(playlist.id));
+    if (!candidates.length) return;
+    void (async () => {
+      for (const playlist of candidates) {
+        try {
+          await playlistDb.savePlaylistItems(playlist.id, playlist.items);
+          syncedPlaylistIdsRef.current.add(playlist.id);
+        } catch {
+          // Keep app usable even if IndexedDB fails in restricted environments.
+        }
+      }
+    })();
+  }, [state.playlists]);
+
+  useEffect(() => {
+    if (state.settings.theme === "light") document.documentElement.classList.add("light");
+    else document.documentElement.classList.remove("light");
+  }, [state.settings.theme]);
+
+  useEffect(() => {
+    setDebugModeEnabled(state.settings.debugMode);
+    if (state.settings.debugMode && isNativeRuntime()) void openDebugLogWindow();
+  }, [state.settings.debugMode]);
+
+  useEffect(() => {
+    if (canPlayVideos) setConnectionPlaybackError(null);
+  }, [canPlayVideos]);
+
+  const activePlaylist = useActivePlaylist(state.playlists, state.activePlaylistId);
+  const playlistItems = useMemo(() => activePlaylist?.items ?? [], [activePlaylist]);
+  const hasSeriesCatalog = useMemo(
+    () => playlistItems.some((item) => item.section === "series" && item.kind === "series"),
+    [playlistItems],
+  );
+  const buildSeriesViewForItems = useCallback(
+    (items: PlaylistItem[]) =>
+      items.some((item) => item.section === "series" && item.kind === "series")
+        ? buildSeriesFromCatalog(items, items.filter((item) => item.section === "series" && item.kind === "series"))
+        : groupSeries(items),
+    [],
+  );
+  const {
+    importFromSource,
+    loading: importing,
+    error: importError,
+    setError: setImportError,
+    progress: importProgress,
+    progressLabel: importProgressLabel,
+  } = usePlaylistImport();
+
+  const { favoriteSet, toggleFavorite, clearFavorites } = useFavorites(state.favorites, setFavorites);
+  const { pushRecent, clearRecents } = useRecents(state.recents, setRecents);
+  const { updateProgress, setWatched, clearContinueWatching, removeContinueWatching, getResumePosition } = useContinueWatching(
+    state.continueWatching,
+    setContinueWatching,
+    state.progress,
+    setProgress,
+  );
+
+  const progressByItemId = useMemo(() => {
+    const map = new Map<string, PlaybackProgress>();
+    for (const entry of state.progress) map.set(entry.itemId, entry);
+    return map;
+  }, [state.progress]);
+
+  const handleSetWatched = useCallback(
+    (episodes: EpisodeItem[], watched: boolean) => {
+      setWatched(
+        episodes.map((episode) => ({ playlistId: episode.playlistId, itemId: episode.id })),
+        watched,
+      );
+    },
+    [setWatched],
+  );
+
+  const initialPlayerVolume = state.settings.rememberedVolume ?? state.settings.defaultVolume;
+  const { playerState, setCurrentItem, setError, setPlaying, setVolume, setMuted } = usePlayer(initialPlayerVolume);
+
+  // Hold the launch auto-restore until the WebView has warmed up. Attaching a
+  // video during the very first paints reliably reproduces WKWebView's
+  // audio-only/black-layer state (the VideoPlayer frame watchdog is the cure;
+  // this is the prevention).
+  const [warmedUp, setWarmedUp] = useState(false);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setWarmedUp(true), 700);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    // Don't auto-start anything behind the remote-device chooser; and a sync
+    // follower plays what the master says, not this device's last-played item.
+    if (remoteGateOpen) return;
+    if (syncFollowerConfigured) {
+      restoredLastVisitRef.current = true;
+      return;
+    }
+    if (deepLink) {
+      restoredLastVisitRef.current = true;
+      return;
+    }
+    if (restoredLastVisitRef.current) return;
+    if (!warmedUp) return;
+    if (location.pathname !== "/") {
+      restoredLastVisitRef.current = true;
+      return;
+    }
+
+    const watch = state.lastPlayedWatch;
+    if (watch) {
+      // Same hold as the lastPlayedId branch below: with no backend the watch
+      // URL can only produce a "connect first" prompt over an empty player, and
+      // it keeps the deep-link effect live for the rest of the visit. Stay on
+      // "/" (ref left unset, so the restore still runs once a backend connects)
+      // — the player then stays free for a dropped local file, which needs none.
+      if (!canPlayVideos) return;
+      restoredLastVisitRef.current = true;
+      navigate(buildWatchPath(watch.playlistName, watch.shareId), { replace: true });
+      return;
+    }
+
+    if (!state.lastPlayedId) {
+      restoredLastVisitRef.current = true;
+      return;
+    }
+
+    const stillHydrating = state.playlists.some((p) => (p.itemCount ?? 0) > 0 && p.items.length === 0);
+    const found = state.playlists.flatMap((p) => p.items).find((i) => i.id === state.lastPlayedId);
+
+    if (found) {
+      if (!canPlayVideos) return;
+      restoredLastVisitRef.current = true;
+      setCurrentItem(found);
+      if (found.playlistId !== state.activePlaylistId) setActivePlaylistId(found.playlistId);
+      setSection(found.section);
+      return;
+    }
+
+    if (stillHydrating) return;
+    restoredLastVisitRef.current = true;
+  }, [
+    deepLink,
+    location.pathname,
+    navigate,
+    state.playlists,
+    state.lastPlayedId,
+    state.lastPlayedWatch,
+    state.activePlaylistId,
+    canPlayVideos,
+    setCurrentItem,
+    setSection,
+    setActivePlaylistId,
+    warmedUp,
+    remoteGateOpen,
+    syncFollowerConfigured,
+  ]);
+
+  useEffect(() => {
+    const item = playerState.currentItem;
+    if (!item) return;
+    const pl = state.playlists.find((p) => p.id === item.playlistId);
+    if (!pl) return;
+    const shareId = getShareId(item);
+    const target = buildWatchPath(pl.name, shareId);
+    const watch = { playlistName: pl.name, shareId, itemId: item.id };
+
+    setState((prev) => {
+      if (
+        prev.lastPlayedId === item.id &&
+        prev.lastPlayedWatch?.playlistName === watch.playlistName &&
+        prev.lastPlayedWatch?.shareId === watch.shareId &&
+        prev.lastPlayedWatch?.itemId === watch.itemId &&
+        prev.lastPlayedItem?.id === item.id
+      ) {
+        return prev;
+      }
+      return { ...prev, lastPlayedId: item.id, lastPlayedWatch: watch, lastPlayedItem: item };
+    });
+
+    if (location.pathname !== target) navigate(target, { replace: true });
+  }, [playerState.currentItem, state.playlists, location.pathname, navigate]);
+
+  useEffect(() => {
+    if (!deepLink) {
+      appliedDeepLinkKey.current = null;
+      promptedBackendKey.current = null;
+      setDeepLinkError(null);
+    }
+  }, [deepLink]);
+
+  const handlePlayerVolume = useCallback(
+    (next: number) => {
+      const clamped = Math.min(2, Math.max(0, next));
+      setVolume(clamped);
+      if (clamped > 0 && playerState.muted) setMuted(false);
+    },
+    [playerState.muted, setMuted, setVolume],
+  );
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setState((prev) => {
+        const v = playerState.volume;
+        if (Math.abs((prev.settings.rememberedVolume ?? 0) - v) < 0.0005) return prev;
+        return { ...prev, settings: { ...prev.settings, rememberedVolume: v } };
+      });
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [playerState.volume]);
+
+  const sectionItems = useMemo(() => {
+    switch (state.section) {
+      case "live":
+        return playlistItems.filter((item) => item.section === "live" && (item.kind === "live" || item.kind === "unknown"));
+      case "movies":
+        return playlistItems.filter((item) => item.section === "movies" && item.kind === "movie");
+      case "series":
+        return hasSeriesCatalog
+          ? playlistItems.filter((item) => item.section === "series" && item.kind === "series")
+          : playlistItems.filter((item) => item.section === "series" && item.kind === "series_episode");
+      case "catchup":
+        return playlistItems.filter((item) => item.section === "catchup");
+      default:
+        return playlistItems;
+    }
+  }, [playlistItems, state.section, hasSeriesCatalog]);
+  const groups = useMemo(() => getGroups(sectionItems), [sectionItems]);
+
+  useEffect(() => {
+    setFilters((prev) => ({ ...prev, query: "" }));
+  }, [state.section]);
+
+  useEffect(() => {
+    if (filters.selectedGroup !== "all" && !groups.includes(filters.selectedGroup)) {
+      setFilters((prev) => ({ ...prev, selectedGroup: "all" }));
+    }
+  }, [state.section, groups, filters.selectedGroup]);
+
+  const filtersForSearch = useMemo(
+    () => ({ ...filters, query: debouncedQuery }),
+    [filters, debouncedQuery],
+  );
+  const filteredItems = usePlaylistFilter(sectionItems, filtersForSearch, favoriteSet);
+  const allSeriesForPlaylist = useMemo(() => buildSeriesViewForItems(playlistItems), [buildSeriesViewForItems, playlistItems]);
+  const seriesFavoriteItemById = useMemo(() => {
+    const map = new Map<string, PlaylistItem>();
+    for (const show of allSeriesForPlaylist) {
+      const directItem = playlistItems.find((item) => item.id === show.id && item.section === "series");
+      if (directItem) {
+        map.set(show.id, directItem);
+        continue;
+      }
+      const firstEpisode = show.episodes[0];
+      if (firstEpisode) {
+        const episodeItem = playlistItems.find((item) => item.id === firstEpisode.id);
+        if (episodeItem) map.set(show.id, episodeItem);
+      }
+    }
+    return map;
+  }, [allSeriesForPlaylist, playlistItems]);
+  const favoriteSeriesIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [seriesId, item] of seriesFavoriteItemById.entries()) {
+      if (favoriteSet.has(item.id)) ids.add(seriesId);
+    }
+    return ids;
+  }, [seriesFavoriteItemById, favoriteSet]);
+
+  useEffect(() => {
+    if (!["live", "movies", "series", "catchup"].includes(state.section)) return;
+
+    const kindCounts = playlistItems.reduce<Record<string, number>>((acc, it) => {
+      const k = it.kind ?? "undefined";
+      acc[k] = (acc[k] ?? 0) + 1;
+      return acc;
+    }, {});
+
+    const payload = {
+      section: state.section,
+      activePlaylistId: state.activePlaylistId,
+      playlistItemsTotal: playlistItems.length,
+      activePlaylist: activePlaylist
+        ? { id: activePlaylist.id, name: activePlaylist.name, itemCount: activePlaylist.itemCount, itemsInMemory: activePlaylist.items.length }
+        : null,
+      kindCounts,
+      filtersSnapshot: { query: filters.query, selectedGroup: filters.selectedGroup, favoritesOnly: filters.favoritesOnly },
+      sectionItemsLength: sectionItems.length,
+      filteredItemsLength: filteredItems.length,
+      groupsLength: groups.length,
+    };
+
+    const maxFullLog = 300;
+    if (sectionItems.length <= maxFullLog) {
+      console.log("[IPTV browse] tab or playlist load — sectionItems + filteredItems", {
+        ...payload,
+        sectionItems,
+        filteredItems,
+      });
+    } else {
+      console.log("[IPTV browse] large playlist — preview only (full arrays on window.__iptv*)", {
+        ...payload,
+        sectionItemsPreview: sectionItems.slice(0, 40),
+        filteredItemsPreview: filteredItems.slice(0, 40),
+      });
+      (window as unknown as { __iptvSectionItems?: PlaylistItem[]; __iptvFilteredItems?: PlaylistItem[] }).__iptvSectionItems =
+        sectionItems;
+      (window as unknown as { __iptvSectionItems?: PlaylistItem[]; __iptvFilteredItems?: PlaylistItem[] }).__iptvFilteredItems =
+        filteredItems;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only log on tab / playlist load / active playlist change, not on every search keystroke
+  }, [state.section, playlistItems.length, state.activePlaylistId]);
+
+  const favoritesItems = useMemo(
+    () =>
+      state.favorites
+        .map((entry) => state.playlists.flatMap((playlist) => playlist.items).find((item) => item.id === entry.itemId))
+        .filter(Boolean) as PlaylistItem[],
+    [state.favorites, state.playlists],
+  );
+
+  const recentsItems = useMemo(() => {
+    const seen = new Set<string>();
+    const items: PlaylistItem[] = [];
+    for (const entry of state.recents) {
+      const playlist = state.playlists.find((pl) => pl.id === entry.playlistId);
+      if (!playlist) continue;
+      const grouped = buildSeriesViewForItems(playlist.items);
+      const item = resolveRecentDisplayItem(entry.itemId, entry.playlistId, playlist.items, grouped);
+      if (!item) continue;
+      const key = `${item.playlistId}::${item.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+    return items;
+  }, [buildSeriesViewForItems, state.recents, state.playlists]);
+
+  const pushRecentForItem = useCallback(
+    (item: PlaylistItem) => {
+      const playlist = state.playlists.find((pl) => pl.id === item.playlistId);
+      const items = playlist?.items ?? playlistItems;
+      const grouped = playlist ? buildSeriesViewForItems(items) : allSeriesForPlaylist;
+      pushRecent(item.playlistId, resolveRecentItemId(item, items, grouped));
+    },
+    [allSeriesForPlaylist, buildSeriesViewForItems, playlistItems, pushRecent, state.playlists],
+  );
+
+  const continueItems = useMemo(
+    () =>
+      state.continueWatching
+        .map((entry) => state.playlists.flatMap((playlist) => playlist.items).find((item) => item.id === entry.itemId))
+        .filter(Boolean) as PlaylistItem[],
+    [state.continueWatching, state.playlists],
+  );
+
+  // ---- master/follower playback sync (see useSyncSession) -------------------
+
+  // Live position at timeupdate cadence, BEFORE onPlayerProgress's 5s persist
+  // throttle — sync reports/commands need the real position, not the last save.
+  const livePositionRef = useRef({ positionSec: 0, durationSec: 0 });
+  const currentItemIdForSync = playerState.currentItem?.id ?? null;
+  useEffect(() => {
+    // New item: zero the snapshot immediately, or a follower's next report
+    // would pair the NEW episode id with the OLD episode's end position and
+    // the master would mark the new episode watched on arrival.
+    livePositionRef.current = { positionSec: 0, durationSec: 0 };
+  }, [currentItemIdForSync]);
+
+  const buildSyncCommand = useCallback(
+    (item: PlaylistItem): SyncCommand | null => {
+      // A dropped file lives behind a blob URL that only this document can
+      // resolve — there is nothing a follower could play.
+      if (isLocalItem(item)) return null;
+      const playlist = state.playlists.find((p) => p.id === item.playlistId);
+      const progressEntry = progressByItemId.get(item.id);
+      return {
+        item,
+        playlistName: playlist?.name ?? "",
+        shareId: getShareId(item),
+        positionSec: progressEntry?.positionSec ?? 0,
+        durationSec: progressEntry?.durationSec ?? 0,
+      };
+    },
+    [state.playlists, progressByItemId],
+  );
+
+  const playRemoteItem = useCallback(
+    (command: SyncCommand) => {
+      const item = command.item;
+      if (!item?.id || !item.streamUrl) return;
+      // Seed the resume point with the master's position so the episode starts
+      // where the master is, not where this device last left it.
+      if (command.durationSec > 0 && command.positionSec > 0) {
+        updateProgress(item.playlistId, item.id, command.positionSec, command.durationSec);
+      } else {
+        // Master starts from the beginning (no progress entry, or the item was
+        // marked watched, which stores position 0) — drop this device's stale
+        // local resume so playback starts at 0 like the master's.
+        removeContinueWatching(item.id);
+      }
+      if (item.playlistId !== state.activePlaylistId && state.playlists.some((p) => p.id === item.playlistId)) {
+        setActivePlaylistId(item.playlistId);
+      }
+      setSection(item.section);
+      setCurrentItem(item);
+      pushRecentForItem(item);
+    },
+    [
+      state.activePlaylistId,
+      state.playlists,
+      updateProgress,
+      removeContinueWatching,
+      setActivePlaylistId,
+      setSection,
+      setCurrentItem,
+      pushRecentForItem,
+    ],
+  );
+
+  const applyRemoteProgress = useCallback(
+    (report: SyncFollowerReport) => {
+      if (!report.itemId || !(report.durationSec > 0)) return;
+      const items = state.playlists.flatMap((playlist) => playlist.items);
+      // Item ids match when the follower restored this device's backup; the
+      // shareId fallback covers a follower with its own import of the playlist.
+      let item = items.find((entry) => entry.id === report.itemId);
+      if (!item && report.shareId) {
+        const share = report.shareId;
+        item = items.find((entry) => itemMatchesShareId(entry, share));
+      }
+      if (!item) return;
+      // While this device is actively playing the same item, its own progress
+      // is fresher — don't tug the resume point back and forth.
+      if (playerState.currentItem?.id === item.id && playerState.isPlaying) return;
+      updateProgress(item.playlistId, item.id, report.positionSec, report.durationSec);
+    },
+    [state.playlists, playerState.currentItem, playerState.isPlaying, updateProgress],
+  );
+
+  const syncSession = useSyncSession({
+    connected: backendConnection.connected,
+    remoteMode,
+    savedBackendOrigin: backendConnection.savedBackendOrigin,
+    currentItem: playerState.currentItem,
+    isPlaying: playerState.isPlaying,
+    buildCommand: buildSyncCommand,
+    getLivePosition: () => livePositionRef.current,
+    playRemoteItem,
+    applyRemoteProgress,
+  });
+  const syncFollowerActive = syncSession.role === "follower";
+
+  const openSearch = useCallback((focus?: SearchOpenFocus | null) => {
+    setSearchFocus(focus ?? null);
+    setSearchOpen(true);
+  }, []);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchFocus(null);
+  }, []);
+
+  const showBackendRequired = useCallback(() => {
+    setConnectionPlaybackError(
+      "You are not connected to a Community IPTV Player backend, so playback was not started.",
+    );
+    setConnectionOpen(true);
+  }, []);
+
+  // That banner describes a refusal that no longer applies once a backend is
+  // up — don't leave it under the player for the rest of the visit.
+  useEffect(() => {
+    if (canPlayVideos) setConnectionPlaybackError(null);
+  }, [canPlayVideos]);
+
+  useEffect(() => {
+    if (!deepLink) return;
+    // Same warm-up hold as the launch restore: don't attach a video into a
+    // cold WebView (audio-only/black-layer state).
+    if (!warmedUp) return;
+    // Never auto-play behind the remote-device chooser.
+    if (remoteGateOpen) return;
+    const { playlistName, shareId } = deepLink;
+    const key = `${playlistName}\0${shareId}`;
+
+    // Raise the backend modal at most once per link. This effect re-runs on
+    // nearly every render (pushRecentForItem's identity is not stable), so
+    // calling showBackendRequired() unconditionally reopened the modal the
+    // instant the user closed it. The inline "not connected" banner below the
+    // player stays up either way, with its own way back into the modal.
+    const promptBackendOnce = () => {
+      if (promptedBackendKey.current === key) return;
+      promptedBackendKey.current = key;
+      showBackendRequired();
+    };
+
+    const hints: { itemId?: string | null } = {};
+    if (state.lastPlayedWatch?.playlistName === playlistName && state.lastPlayedWatch?.shareId === shareId) {
+      hints.itemId = state.lastPlayedWatch.itemId ?? state.lastPlayedId;
+    }
+
+    const resolution = resolveWatchDeepLink(state.playlists, deepLink, hints);
+
+    if (resolution.status === "pending") {
+      setDeepLinkError(null);
+      return;
+    }
+
+    if (resolution.status === "not_found") {
+      // On a normal refresh the deep link IS the user's own last-played item.
+      // If it can't be matched in the (compacted / lazily-loaded) playlist —
+      // e.g. a series episode whose episodes haven't been re-fetched yet —
+      // restore the saved item directly instead of showing a share-mismatch error.
+      const savedItem = state.lastPlayedItem;
+      if (
+        savedItem &&
+        state.lastPlayedWatch?.playlistName === playlistName &&
+        state.lastPlayedWatch?.shareId === shareId
+      ) {
+        setDeepLinkError(null);
+        if (playerState.currentItem?.id === savedItem.id) {
+          appliedDeepLinkKey.current = key;
+          return;
+        }
+        if (appliedDeepLinkKey.current === key) return;
+        if (!canPlayVideos) {
+          promptBackendOnce();
+          return;
+        }
+        appliedDeepLinkKey.current = key;
+        if (savedItem.playlistId !== state.activePlaylistId) setActivePlaylistId(savedItem.playlistId);
+        setSection(savedItem.section);
+        setCurrentItem(savedItem);
+        pushRecentForItem(savedItem);
+        return;
+      }
+
+      if (!resolution.playlist && state.playlists.length > 0) {
+        setDeepLinkError(
+          `No playlist named “${playlistName}”. Links use the exact playlist name — rename or import a playlist to match.`,
+        );
+      } else if (resolution.playlist && resolution.playlist.items.length > 0) {
+        setDeepLinkError(
+          `That stream is not in playlist “${playlistName}”. Both people need the same stream URL in the M3U so the episode ID matches.`,
+        );
+      }
+      return;
+    }
+
+    const { item, playlist } = resolution;
+
+    if (playerState.currentItem?.id === item.id) {
+      appliedDeepLinkKey.current = key;
+      setDeepLinkError(null);
+      return;
+    }
+
+    if (appliedDeepLinkKey.current === key) return;
+    if (!canPlayVideos) {
+      setDeepLinkError(null);
+      promptBackendOnce();
+      return;
+    }
+    appliedDeepLinkKey.current = key;
+    setDeepLinkError(null);
+
+    setActivePlaylistId(playlist.id);
+    setSection(item.section);
+    setCurrentItem(item);
+    pushRecentForItem(item);
+  }, [
+    deepLink,
+    playerState.currentItem,
+    pushRecentForItem,
+    canPlayVideos,
+    showBackendRequired,
+    setActivePlaylistId,
+    setCurrentItem,
+    setSection,
+    state.activePlaylistId,
+    state.lastPlayedId,
+    state.lastPlayedItem,
+    state.lastPlayedWatch,
+    state.playlists,
+    warmedUp,
+    remoteGateOpen,
+  ]);
+
+  const handleToggleFavorite = (item: PlaylistItem) => toggleFavorite(item.playlistId, item.id);
+  const handleToggleFavoriteSeries = useCallback(
+    (seriesId: string) => {
+      const item = seriesFavoriteItemById.get(seriesId);
+      if (!item) return;
+      toggleFavorite(item.playlistId, item.id);
+    },
+    [seriesFavoriteItemById, toggleFavorite],
+  );
+
+  // Returns the series' episodes (already-loaded or freshly fetched), or null
+  // when they could not be obtained. Callers that only care whether it worked
+  // can treat null as failure; callers that need to act on the episodes (e.g.
+  // "mark this whole series watched" from the list, where nothing is loaded
+  // yet) get them directly, without waiting for a re-render to observe them.
+  const ensureSeriesLoaded = useCallback(
+    async (seriesViewId: string, options?: { silent?: boolean }): Promise<PlaylistItem[] | null> => {
+      if (!activePlaylist || activePlaylist.source.type !== "xtream" || !activePlaylist.source.xtream) return null;
+      const seriesItem = activePlaylist.items.find((item) => item.id === seriesViewId && item.kind === "series");
+      if (!seriesItem) return null;
+      const seriesId = seriesItem.xuiId ?? seriesItem.sourceId;
+      const alreadyLoaded = activePlaylist.items.filter(
+        (item) => item.kind === "series_episode" && item.parentSeriesId === seriesId,
+      );
+      if (alreadyLoaded.length > 0) return alreadyLoaded;
+
+      setLoadingSeriesId(seriesViewId);
+      try {
+        const episodes = await loadXtreamSeriesEpisodes(activePlaylist.id, activePlaylist.source.xtream, seriesItem);
+        setState((prev) => ({
+          ...prev,
+          playlists: prev.playlists.map((playlist) => {
+            if (playlist.id !== activePlaylist.id) return playlist;
+            const withoutPrevious = playlist.items.filter(
+              (item) => !(item.kind === "series_episode" && item.parentSeriesId === seriesId),
+            );
+            const nextItems = [...withoutPrevious, ...episodes];
+            return { ...playlist, items: nextItems, itemCount: nextItems.length, lastUpdatedAt: now() };
+          }),
+        }));
+        return episodes;
+      } catch (error) {
+        // The auto-load on restore is a background nicety — never surface a
+        // network error banner for a request the user didn't ask for.
+        if (!options?.silent) {
+          setImportError(error instanceof Error ? error.message : "Failed to load series details.");
+        }
+        return null;
+      } finally {
+        setLoadingSeriesId((current) => (current === seriesViewId ? null : current));
+      }
+    },
+    [activePlaylist, setImportError],
+  );
+
+  /**
+   * Mark an entire series watched/unwatched straight from a list row, where its
+   * episodes are usually NOT loaded yet (they are fetched lazily and never
+   * persisted). Load them first, then mark — otherwise this would mark zero
+   * episodes and silently do nothing.
+   */
+  const handleSetSeriesWatched = useCallback(
+    async (seriesViewId: string, watched: boolean) => {
+      // Prefer episodes we already have. This is the ONLY path that works for
+      // non-Xtream (M3U) playlists, where every episode ships in the playlist
+      // and ensureSeriesLoaded deliberately refuses to run.
+      const known = allSeriesForPlaylist.find((show) => show.id === seriesViewId)?.episodes ?? [];
+      const episodes: PlaylistItem[] = known.length > 0 ? known : ((await ensureSeriesLoaded(seriesViewId)) ?? []);
+      if (episodes.length === 0) return;
+      setWatched(
+        episodes.map((episode) => ({ playlistId: episode.playlistId, itemId: episode.id })),
+        watched,
+      );
+    },
+    [allSeriesForPlaylist, ensureSeriesLoaded, setWatched],
+  );
+
+  // Cold-launch / deep-link restore plays an episode recovered from
+  // `state.lastPlayedItem` whose series has never been fetched — Xtream
+  // episodes are lazy and are never written to IndexedDB, so a relaunch always
+  // starts with zero episode rows. Without this, every SeriesItem has
+  // `episodes: []`, getNextEpisode returns null, and the "Up next" bar, the
+  // end-credits suggestion and auto-advance are all dead until the user
+  // browses into the series by hand.
+  //
+  // Resolve the parent from `parentSeriesId` — NOT by scanning loaded
+  // episodes, which is circular for a series that isn't loaded yet.
+  const autoLoadedSeriesRef = useRef<string | null>(null);
+  useEffect(() => {
+    const item = playerState.currentItem;
+    if (!item || item.kind !== "series_episode") return;
+    if (!activePlaylist || item.playlistId !== activePlaylist.id) return;
+
+    // Cheap guards before the O(catalog) scan — this playlist has ~23k items.
+    const parentSeriesId = item.parentSeriesId;
+    if (!parentSeriesId) return; // M3U: nothing to lazy-load
+    if (autoLoadedSeriesRef.current === parentSeriesId) return; // already attempted
+
+    // Null until IndexedDB hydration lands; the effect re-runs when
+    // activePlaylist gets its items, so there's no missed-window race.
+    const catalog = findSeriesCatalogItem(activePlaylist.items, item);
+    if (!catalog) return;
+
+    autoLoadedSeriesRef.current = parentSeriesId;
+    void ensureSeriesLoaded(catalog.id, { silent: true }).then((episodes) => {
+      // Let a transient provider/relay failure retry on the next change rather
+      // than suppressing the bar for the rest of the session. null = failed;
+      // an empty array is a real answer (series genuinely has no episodes).
+      if (episodes === null && autoLoadedSeriesRef.current === parentSeriesId) {
+        autoLoadedSeriesRef.current = null;
+      }
+    });
+  }, [activePlaylist, ensureSeriesLoaded, playerState.currentItem]);
+
+  const handlePlay = useCallback((item: PlaylistItem) => {
+    if (item.kind === "series") {
+      if (item.playlistId !== state.activePlaylistId) setActivePlaylistId(item.playlistId);
+      void ensureSeriesLoaded(item.id);
+      openSearch({ category: "series", seriesId: item.id });
+      return;
+    }
+    if (!canPlayVideos) {
+      showBackendRequired();
+      return;
+    }
+    setCurrentItem(item);
+    pushRecentForItem(item);
+  }, [
+    canPlayVideos,
+    ensureSeriesLoaded,
+    openSearch,
+    pushRecentForItem,
+    setActivePlaylistId,
+    setCurrentItem,
+    showBackendRequired,
+    state.activePlaylistId,
+  ]);
+
+  const openSearchForNowPlaying = useCallback(() => {
+    const item = playerState.currentItem;
+    if (!item) {
+      openSearch();
+      return;
+    }
+
+    if (item.kind === "series") {
+      void ensureSeriesLoaded(item.id);
+      openSearch({ category: "series", seriesId: item.id });
+      return;
+    }
+
+    if (item.kind === "series_episode" || item.section === "series") {
+      const show = allSeriesForPlaylist.find((series) => series.episodes.some((ep) => ep.id === item.id));
+      if (show) {
+        void ensureSeriesLoaded(show.id);
+        openSearch({ category: "series", seriesId: show.id });
+        return;
+      }
+
+      const catalog = playlistItems.find(
+        (entry) =>
+          entry.kind === "series" &&
+          (entry.id === item.parentSeriesId ||
+            entry.xuiId === item.parentSeriesId ||
+            entry.sourceId === item.parentSeriesId),
+      );
+      if (catalog) {
+        void ensureSeriesLoaded(catalog.id);
+        openSearch({ category: "series", seriesId: catalog.id });
+        return;
+      }
+    }
+
+    const categoryBySection: Partial<Record<PlaylistSection, SearchOpenFocus["category"]>> = {
+      live: "live",
+      movies: "movies",
+      catchup: "catchup",
+      series: "series",
+      favorites: "favorites",
+      recents: "recents",
+      continue: "continue",
+    };
+    openSearch({ category: categoryBySection[item.section] ?? "all" });
+  }, [allSeriesForPlaylist, ensureSeriesLoaded, openSearch, playerState.currentItem, playlistItems]);
+
+  const handleSearchPlay = useCallback(
+    (item: PlaylistItem) => {
+      setSearchOpen(false);
+      setSearchFocus(null);
+      setSection(item.section);
+      setActivePlaylistId(item.playlistId);
+      handlePlay(item);
+    },
+    [handlePlay, setActivePlaylistId, setSection],
+  );
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.code !== "Slash" || searchOpen) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable=true]")) return;
+      event.preventDefault();
+      openSearch();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openSearch, searchOpen]);
+
+  const goToBrowseFromDetails = useCallback(
+    (item: PlaylistItem) => {
+      // Only switch to a playlist that actually exists — a dropped local file
+      // carries a synthetic id, and selecting it would empty the whole library
+      // (and persist that). Same guard as playRemoteItem.
+      if (item.playlistId !== state.activePlaylistId && state.playlists.some((p) => p.id === item.playlistId)) {
+        setActivePlaylistId(item.playlistId);
+      }
+      if (item.kind === "series_episode") {
+        const pl = state.playlists.find((p) => p.id === item.playlistId);
+        if (!pl) return;
+        const grouped = buildSeriesViewForItems(pl.items);
+        // The grouped scan only works once episodes are loaded; fall back to the
+        // catalog row so this isn't a silent no-op for a lazily-loaded series.
+        const showId =
+          grouped.find((s) => s.episodes.some((ep) => ep.id === item.id))?.id ??
+          findSeriesCatalogItem(pl.items, item)?.id;
+        if (showId) {
+          void ensureSeriesLoaded(showId);
+          openSearch({ category: "series", seriesId: showId });
+        }
+        return;
+      }
+      if (item.kind === "series") {
+        void ensureSeriesLoaded(item.id);
+        openSearch({ category: "series", seriesId: item.id });
+        return;
+      }
+      const categoryBySection: Partial<Record<PlaylistSection, SearchOpenFocus["category"]>> = {
+        live: "live",
+        movies: "movies",
+        catchup: "catchup",
+        favorites: "favorites",
+        recents: "recents",
+        continue: "continue",
+      };
+      openSearch({ category: categoryBySection[item.section] ?? "all" });
+    },
+    [buildSeriesViewForItems, ensureSeriesLoaded, openSearch, state.activePlaylistId, state.playlists, setActivePlaylistId],
+  );
+
+  const currentNextEpisode = useMemo(() => {
+    const current = playerState.currentItem;
+    if (!current || current.kind !== "series_episode") return null;
+    return getNextEpisode(allSeriesForPlaylist, current.id);
+  }, [allSeriesForPlaylist, playerState.currentItem]);
+
+  const handleImport = async (
+    name: string,
+    source: SavedPlaylist["source"],
+    text?: string,
+  ) => {
+    const payload = await importFromSource(name, source, text);
+    if (!payload) return;
+    const { playlist, sourceContent } = payload;
+    try {
+      await Promise.all([
+        playlistDb.savePlaylistItems(playlist.id, playlist.items),
+        playlistDb.savePlaylistSourceContent(playlist.id, sourceContent),
+      ]);
+    } catch {
+      setImportError("Failed to persist playlist data locally. Please check browser storage permissions.");
+      return;
+    }
+    const next = [playlist, ...state.playlists];
+    setPlaylists(next);
+    setActivePlaylistId(playlist.id);
+    setImportOpen(false);
+  };
+
+  const deletePlaylist = (playlistId: string) => {
+    void playlistDb.deletePlaylistItems(playlistId);
+    void playlistDb.deletePlaylistSourceContent(playlistId);
+    const next = state.playlists.filter((playlist) => playlist.id !== playlistId);
+    setPlaylists(next);
+    if (state.activePlaylistId === playlistId) setActivePlaylistId(next[0]?.id ?? null);
+  };
+
+  const renamePlaylist = (playlistId: string) => {
+    const current = state.playlists.find((playlist) => playlist.id === playlistId);
+    if (!current) return;
+    const newName = window.prompt("Rename playlist", current.name)?.trim();
+    if (!newName) return;
+    setPlaylists(state.playlists.map((playlist) => (playlist.id === playlistId ? { ...playlist, name: newName } : playlist)));
+  };
+
+  const downloadPlaylist = async (playlistId: string) => {
+    const playlist = state.playlists.find((value) => value.id === playlistId);
+    if (!playlist) return;
+
+    let sourceContent: string | null = null;
+    try {
+      sourceContent = await playlistDb.loadPlaylistSourceContent(playlist.id);
+    } catch {
+      sourceContent = null;
+    }
+
+    let text = sourceContent && sourceContent.includes("#EXTM3U") ? sourceContent : null;
+    if (!text) {
+      const items = playlist.items.length > 0 ? playlist.items : await playlistDb.loadPlaylistItems(playlist.id);
+      text = serializePlaylistItemsToM3u(items);
+    }
+
+    const blob = new Blob([text], { type: "application/x-mpegURL;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const safeBaseName =
+      playlist.name
+        .replace(/[<>:"/\\|?*]+/g, "_")
+        .split("")
+        .filter((char) => char.charCodeAt(0) >= 32)
+        .join("")
+        .trim() || "playlist";
+    a.download = `${safeBaseName}.m3u`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const refreshPlaylist = async (playlistId: string) => {
+    const playlist = state.playlists.find((value) => value.id === playlistId);
+    if (!playlist || !["url", "xtream"].includes(playlist.source.type)) return;
+    try {
+      const parsed = await loadPlaylistSource(playlist.id, playlist.source);
+      await Promise.all([
+        playlistDb.savePlaylistItems(playlist.id, parsed.items),
+        playlistDb.savePlaylistSourceContent(playlist.id, parsed.sourceContent),
+      ]);
+      setPlaylists(
+        state.playlists.map((entry) =>
+          entry.id === playlist.id
+            ? {
+                ...entry,
+                source: parsed.normalizedSource ?? entry.source,
+                items: parsed.items,
+                itemCount: parsed.items.length,
+                importErrors: parsed.errors,
+                lastUpdatedAt: now(),
+              }
+            : entry,
+        ),
+      );
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : "Playlist refresh failed.");
+    }
+  };
+
+  /**
+   * Play a video file dropped on the player. It becomes a synthetic item in
+   * its own playlist so the normal pipeline (title, details, subtitles) works
+   * unchanged — while recents/progress/last-played skip it, because a blob URL
+   * is dead as soon as the app reloads and would restore into a broken item.
+   */
+  const localObjectUrlRef = useRef<string | null>(null);
+  const staleObjectUrlsRef = useRef<string[]>([]);
+  /**
+   * The File itself, kept alongside its blob: URL.
+   *
+   * The URL is all playback needs, but automatic subtitle sync has to DECODE
+   * the audio, and a blob: URL can only be read by pulling the whole thing into
+   * memory — untenable for the multi-gigabyte files this is most useful on. The
+   * File can be read lazily, so it is what gets handed to the sync engine.
+   * Holding it costs nothing: the blob: URL already pins the same bytes.
+   */
+  const [localFile, setLocalFile] = useState<File | null>(null);
+  const handlePlayLocalFile = useCallback(
+    (file: File) => {
+      // Retire the previous blob rather than revoking it here — the <video> is
+      // still pointed at it until the player's effect swaps sources below.
+      if (localObjectUrlRef.current) staleObjectUrlsRef.current.push(localObjectUrlRef.current);
+      const objectUrl = URL.createObjectURL(file);
+      localObjectUrlRef.current = objectUrl;
+      setLocalMediaInfo(null);
+      // A blob URL needs no backend, so any earlier "not connected" refusal is
+      // no longer about what's on screen.
+      setConnectionPlaybackError(null);
+      setLocalFile(file);
+      setCurrentItem(buildLocalVideoItem(file, objectUrl));
+      // Drop the watch URL. It describes a library item that is no longer on
+      // screen, and leaving it up keeps the deep-link effect live: it would
+      // re-raise "not connected" over the file that just started, then swap the
+      // file out for the linked item the moment a backend appears.
+      if (deepLink) navigate("/", { replace: true });
+    },
+    [deepLink, navigate, setCurrentItem],
+  );
+
+  // Runs after VideoPlayer's own effect (child effects flush first), so by now
+  // the element has let go of the old source and the blob is safe to release.
+  useEffect(() => {
+    for (const url of staleObjectUrlsRef.current) URL.revokeObjectURL(url);
+    staleObjectUrlsRef.current = [];
+    if (isLocalItem(playerState.currentItem)) return;
+    if (!localObjectUrlRef.current) return;
+    URL.revokeObjectURL(localObjectUrlRef.current);
+    localObjectUrlRef.current = null;
+  }, [playerState.currentItem]);
+  useEffect(
+    () => () => {
+      for (const url of staleObjectUrlsRef.current) URL.revokeObjectURL(url);
+      if (localObjectUrlRef.current) URL.revokeObjectURL(localObjectUrlRef.current);
+    },
+    [],
+  );
+
+  const onPlayerProgress = (positionSec: number, durationSec: number) => {
+    if (!playerState.currentItem) return;
+    // A dropped file has no library entry to resume into.
+    if (isLocalItem(playerState.currentItem)) return;
+    if (Number.isFinite(positionSec) && Number.isFinite(durationSec) && durationSec > 0) {
+      livePositionRef.current = { positionSec, durationSec };
+    }
+    const id = playerState.currentItem.id;
+    const lastSaved = lastProgressRef.current[id] ?? 0;
+    if (Math.abs(positionSec - lastSaved) < 5 && positionSec < durationSec - 1) return;
+    lastProgressRef.current[id] = positionSec;
+    updateProgress(playerState.currentItem.playlistId, id, positionSec, durationSec);
+  };
+
+  const onPlayerEnded = () => {
+    const current = playerState.currentItem;
+    if (!current) return;
+    onPlayerProgress(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+    if (current.section === "series" && currentNextEpisode) {
+      handlePlay(currentNextEpisode);
+    }
+  };
+
+  const exportData = async () => {
+    const playlistsWithItems = await Promise.all(
+      state.playlists.map(async (playlist) => {
+        if (playlist.items.length > 0) return playlist;
+        try {
+          const items = await playlistDb.loadPlaylistItems(playlist.id);
+          return { ...playlist, items, itemCount: items.length || playlist.itemCount };
+        } catch {
+          return playlist;
+        }
+      }),
+    );
+    const blob = new Blob([JSON.stringify({ ...state, playlists: playlistsWithItems }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "iptv-player-data.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importData = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const playlists = Array.isArray(parsed.playlists) ? parsed.playlists : [];
+      await Promise.all(
+        playlists.map(async (playlist: SavedPlaylist) => {
+          const items = Array.isArray(playlist.items) ? playlist.items : [];
+          await playlistDb.savePlaylistItems(playlist.id, items);
+        }),
+      );
+      storage.save({
+        ...parsed,
+        playlists: playlists.map((playlist: SavedPlaylist) => ({
+          ...playlist,
+          itemCount: playlist.itemCount ?? playlist.items?.length ?? 0,
+          items: [],
+        })),
+      });
+      setState(storage.load());
+      window.alert("App data imported.");
+    } catch {
+      window.alert("Invalid backup file.");
+    }
+  };
+
+  const currentResume = playerState.currentItem ? getResumePosition(playerState.currentItem.id) : 0;
+
+  const currentItemPlaylist = useMemo(
+    () => state.playlists.find((p) => p.id === playerState.currentItem?.playlistId) ?? null,
+    [state.playlists, playerState.currentItem?.playlistId],
+  );
+
+  const episodePageUrl = useMemo(() => {
+    if (!playerState.currentItem || !currentItemPlaylist) return null;
+    return buildEpisodeUrl(currentItemPlaylist.name, getShareId(playerState.currentItem));
+  }, [playerState.currentItem, currentItemPlaylist]);
+
+  const settingsPanel = (
+    <SettingsView
+      embedded
+      settings={state.settings}
+      onUpdate={setSettings}
+      onClearFavorites={clearFavorites}
+      onClearRecents={clearRecents}
+      onClearContinue={clearContinueWatching}
+      onRemoveAllPlaylists={() => {
+        void Promise.all([playlistDb.clearPlaylistItems(), playlistDb.clearPlaylistSources()]);
+        setPlaylists([]);
+        setActivePlaylistId(null);
+      }}
+      onExport={exportData}
+      onImport={importData}
+    />
+  );
+
+  // Playlists + stream-details panels. On tablet/desktop they live in the right
+  // column; on phones they move into the slide-in menu drawer (same elements,
+  // rendered in whichever spot is visible for the current breakpoint).
+  const playlistsPanel = (
+    <PlaylistManager
+      playlists={state.playlists}
+      activePlaylistId={state.activePlaylistId}
+      onSelect={setActivePlaylistId}
+      onDelete={deletePlaylist}
+      onDownload={(playlistId) => {
+        void downloadPlaylist(playlistId);
+      }}
+      onRename={renamePlaylist}
+      onRefresh={refreshPlaylist}
+      onAddPlaylist={() => setImportOpen(true)}
+    />
+  );
+  // Facts only the loaded file can tell us, folded into the details panel.
+  const localFileMetadata = useMemo(() => {
+    if (!localMediaInfo || !isLocalItem(playerState.currentItem)) return undefined;
+    return {
+      resolution: `${localMediaInfo.width}x${localMediaInfo.height}`,
+      ...(localMediaInfo.durationSec ? { length: formatDuration(localMediaInfo.durationSec) } : {}),
+    };
+  }, [localMediaInfo, playerState.currentItem]);
+
+  const detailsPanel = (
+    <DetailsPanel
+      item={playerState.currentItem}
+      extraMetadata={localFileMetadata}
+      resumeAt={currentResume}
+      episodePageUrl={episodePageUrl}
+      onGoToBrowse={isLocalItem(playerState.currentItem) ? undefined : goToBrowseFromDetails}
+    />
+  );
+
+  // Remote device, first visit this session: choose sync vs regular before the
+  // app (and its auto-restore effects, held via remoteGateOpen) does anything.
+  // The click on this page is also the autoplay-unlock gesture for TV browsers.
+  if (remoteGateOpen) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden bg-slate-950">
+        <RemoteModeGate onChoose={chooseRemoteMode} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden text-slate-100">
+      {syncFollowerActive ? (
+        <div className="fixed bottom-4 left-4 z-50 flex items-center gap-2 rounded-full border border-cyan-400/40 bg-slate-900/90 px-3 py-1.5 text-xs text-cyan-200 shadow-lg">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" aria-hidden />
+          Synced to master
+          <button
+            type="button"
+            className="ml-1 rounded-full px-2 py-0.5 text-slate-300 hover:bg-slate-700/60 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400"
+            onClick={() => chooseRemoteMode("regular")}
+          >
+            Leave
+          </button>
+        </div>
+      ) : null}
+      <Header
+        currentItem={playerState.currentItem}
+        rightPanelOpen={state.settings.rightPanelOpen}
+        backendStatus={backendConnection.status}
+        onOpenSearch={() => openSearch()}
+        onOpenNowPlaying={openSearchForNowPlaying}
+        onOpenBackendConnection={() => setConnectionOpen(true)}
+        onToggleRightPanel={toggleRightPanel}
+        onToggleMobileMenu={() => setMobileMenuOpen((open) => !open)}
+      />
+      <main className="mx-auto flex min-h-0 w-full max-w-[1920px] flex-1 flex-col overflow-hidden px-4 py-3 lg:px-8">
+        <div
+          className={
+            state.settings.rightPanelOpen
+              ? "grid h-full min-h-0 gap-4 overflow-hidden xl:grid-cols-[minmax(0,1fr)_380px]"
+              : "grid h-full min-h-0 gap-4 overflow-hidden"
+          }
+        >
+          <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
+            {updateInfo && !updateDismissed ? (
+              <UpdateBanner
+                update={updateInfo}
+                busy={updateBusy}
+                onUpdate={() => void handleUpdate()}
+                onDismiss={() => setUpdateDismissed(true)}
+              />
+            ) : null}
+            <VideoPlayer
+              // Mobile: a normal 16:9 frame at the top with the content list
+              // below (see the sm:hidden panel further down). sm+ keeps the
+              // player filling the column next to the right sidebar.
+              className="aspect-video w-full shrink-0 sm:aspect-auto sm:min-h-0 sm:w-auto sm:flex-1 sm:shrink"
+              item={playerState.currentItem}
+              // A sync follower must start playback without a click — the
+              // master, not the user in front of this screen, chose the item.
+              autoplay={state.settings.autoplay || syncFollowerActive}
+              volume={playerState.volume}
+              muted={playerState.muted}
+              volumePercentMode={state.settings.volumePercentMode}
+              onVolume={handlePlayerVolume}
+              onMuted={setMuted}
+              onError={setError}
+              onPlayingState={setPlaying}
+              onProgress={onPlayerProgress}
+              onEnded={onPlayerEnded}
+              resumeFrom={currentResume}
+              onPlayLocalFile={handlePlayLocalFile}
+              // Only while THAT file is what's on screen — playing something
+              // else must not leave the previous file's audio as the reference.
+              localFile={isLocalItem(playerState.currentItem) ? localFile : null}
+              onMediaInfo={(info) => {
+                if (isLocalItem(playerState.currentItem)) setLocalMediaInfo(info);
+              }}
+              // A local file streams from a blob URL — it needs no backend.
+              playbackBlocked={!canPlayVideos && !isLocalItem(playerState.currentItem)}
+              onPlaybackBlockedAction={showBackendRequired}
+              nextEpisode={currentNextEpisode}
+              onPlayNextEpisode={() => currentNextEpisode && handlePlay(currentNextEpisode)}
+              creditsDetection={state.settings.creditsDetection}
+              creditsAutoNext={state.settings.creditsAutoNext}
+              videoFitMode={state.settings.videoFitMode}
+              onVideoFitModeChange={(videoFitMode) => setSettings({ ...state.settings, videoFitMode })}
+            />
+            {importError ? <ErrorState message={importError} onRetry={() => setImportError(null)} /> : null}
+            {storageError ? <ErrorState message={storageError} /> : null}
+            {deepLinkError ? (
+              <ErrorState
+                message={deepLinkError}
+                actionLabel="Go to home"
+                onRetry={() => {
+                  setDeepLinkError(null);
+                  navigate("/", { replace: true });
+                }}
+              />
+            ) : null}
+            {connectionPlaybackError ? (
+              <ErrorState
+                message={connectionPlaybackError}
+                actionLabel="Open connection"
+                onRetry={() => setConnectionOpen(true)}
+              />
+            ) : null}
+            {/* Phones: the playlists + details panels sit right under the player
+                (the sm+ right column below carries them otherwise). */}
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden sm:hidden">
+              {playlistsPanel}
+              {detailsPanel}
+            </div>
+          </div>
+          {/* Tablet/desktop right column. Hidden on phones — those panels are
+              under the player there. */}
+          {state.settings.rightPanelOpen ? (
+            <div className="hidden h-full min-h-0 flex-col gap-3 overflow-hidden sm:flex">
+              {playlistsPanel}
+              {detailsPanel}
+            </div>
+          ) : null}
+        </div>
+      </main>
+      <MobileMenu
+        open={mobileMenuOpen}
+        onClose={() => setMobileMenuOpen(false)}
+        backendStatus={backendConnection.status}
+        onOpenBackendConnection={() => setConnectionOpen(true)}
+        onOpenSettings={() => openSearch({ category: "settings" })}
+      />
+      <SearchOverlay
+        open={searchOpen}
+        onClose={closeSearch}
+        initialFocus={searchFocus}
+        settingsPanel={settingsPanel}
+        playlistItems={playlistItems}
+        groupedSeries={allSeriesForPlaylist}
+        favoritesItems={favoritesItems}
+        recentsItems={recentsItems}
+        continueItems={continueItems}
+        favoriteSet={favoriteSet}
+        favoriteSeriesIds={favoriteSeriesIds}
+        progressByItemId={progressByItemId}
+        loadingSeriesId={loadingSeriesId}
+        activeItemId={playerState.currentItem?.id}
+        onPlay={handleSearchPlay}
+        onToggleFavorite={handleToggleFavorite}
+        onToggleFavoriteSeries={handleToggleFavoriteSeries}
+        onEnsureSeriesLoaded={(seriesId) => {
+          void ensureSeriesLoaded(seriesId);
+        }}
+        onSetWatched={handleSetWatched}
+        onSetSeriesWatched={(seriesId, watched) => {
+          void handleSetSeriesWatched(seriesId, watched);
+        }}
+      />
+      <PlaylistImportModal
+        open={importOpen}
+        loading={importing}
+        error={importError}
+        progress={importProgress}
+        progressLabel={importProgressLabel}
+        onClose={() => setImportOpen(false)}
+        onSubmit={handleImport}
+      />
+      <InstallAppBanner />
+      <BackendConnectionModal
+        open={connectionOpen}
+        connection={backendConnection}
+        syncFollowers={syncSession.followers}
+        onClose={() => setConnectionOpen(false)}
+      />
+      {shouldRenderAnalytics ? <Analytics /> : null}
+    </div>
+  );
+};
+
+export default App;

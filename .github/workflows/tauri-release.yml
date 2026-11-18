@@ -1,0 +1,417 @@
+name: Build and Release Tauri App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Cancel a superseded run for the same ref (e.g. a re-pushed tag) so we don't
+# burn macOS runner minutes finishing a build that's already stale.
+concurrency:
+  group: tauri-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    # macos-13 (Intel) was observed queuing for a full 24h with no runner ever
+    # assigned (steps: [] in the job API) — it was fully deprecated/unsupported
+    # by GitHub on 2025-12-08 (github.blog/changelog/2025-09-19-...), so it
+    # simply never had capacity again. macos-15-intel is the documented
+    # replacement (supported until 2027-08). timeout-minutes is kept as a
+    # general safety net, but note it bounds execution time once a runner is
+    # assigned — it would NOT by itself have caught a job that never gets one;
+    # fail-fast: false means one platform failing/timing out doesn't block the
+    # others from building and publishing normally.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows (x64)
+            platform: windows
+            artifacts: |
+              src-tauri/target/release/bundle/msi/*.msi
+              src-tauri/target/release/bundle/nsis/*-setup.exe
+          - os: macos-latest
+            label: macOS (Apple Silicon)
+            platform: macos-arm64
+            artifacts: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+          - os: macos-15-intel
+            label: macOS (Intel)
+            platform: macos-x64
+            artifacts: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+          - os: ubuntu-22.04
+            label: Linux (x64)
+            platform: linux
+            artifacts: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/appimage/*.AppImage
+              src-tauri/target/release/bundle/rpm/*.rpm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # Tauri v2 system dependencies (WebKitGTK, tray, AppImage/deb/rpm tooling).
+      # reqwest's default TLS needs libssl-dev on Linux.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            build-essential \
+            file \
+            rpm \
+            squashfs-tools
+
+      # Tauri's AppImage bundler downloads its AppRun launcher into its cache
+      # with mode 0770 and copies it into the AppDir as-is, where linuxdeploy's
+      # GTK plugin renames it AppRun.wrapped. When root mounts the AppImage and
+      # another user starts it (firejail --appimage, and so the AppImage
+      # catalog at appimage.github.io), that launcher is not executable and the
+      # app dies with "AppRun.wrapped: Permission denied" before any window.
+      # The bundler only downloads it when the cached copy is missing, so seed
+      # the cache with the same file at 0755 first. (tauri-apps/tauri#16155;
+      # still 0770 in the bundler source as of 2.12.)
+      - name: Seed Tauri's AppRun with world-executable permissions
+        if: runner.os == 'Linux'
+        run: |
+          TOOLS="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          mkdir -p "$TOOLS"
+          curl -fsSL -o "$TOOLS/AppRun-x86_64" \
+            https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-x86_64
+          chmod 0755 "$TOOLS/AppRun-x86_64"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: node scripts/set-version.mjs "${GITHUB_REF_NAME#v}"
+
+      - name: Lint
+        run: npm run lint
+
+      # Decide whether this macOS build can be Developer ID signed + notarized.
+      # It can only when the maintainer has added the Apple secrets below. The
+      # printed value is just the boolean `true`/`false`, never the secrets.
+      - name: Detect macOS signing secrets
+        id: macsign
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "enabled=${{ secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_CERTIFICATE != '' }}" >> "$GITHUB_OUTPUT"
+
+      # macOS, signed + notarized. Tauri's bundler imports APPLE_CERTIFICATE (a
+      # base64 .p12) into a throwaway keychain, signs the .app with
+      # APPLE_SIGNING_IDENTITY, then notarizes + staples via the Apple ID creds —
+      # producing a DMG that opens with NO Gatekeeper warning. Runs only when the
+      # secrets are present so the default open-source build never breaks.
+      - name: Build Tauri bundles (signed + notarized)
+        if: runner.os == 'macOS' && steps.macsign.outputs.enabled == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri:build
+
+      - name: Note un-notarized macOS build
+        if: runner.os == 'macOS' && steps.macsign.outputs.enabled != 'true'
+        shell: bash
+        run: |
+          echo "::notice title=Un-notarized macOS build::No Apple signing secrets configured, so this DMG is only ad-hoc signed and not notarized. It works, but after downloading users must clear quarantine once with: xattr -dr com.apple.quarantine '/Applications/Community IPTV Player.app' (documented in the README's macOS Gatekeeper Warning section). Add the APPLE_* repo secrets to enable notarization."
+
+      # Windows, Linux, and the unsigned macOS fallback. Runs
+      # scripts/prepare-tauri-sidecars.mjs (per-platform ffmpeg via ffmpeg-static)
+      # then `tauri build`.
+      #
+      # APPLE_SIGNING_IDENTITY=- is codesign's ad-hoc identity, which seals the
+      # bundle with no Apple account, certificate, or keychain involved: the
+      # bundler's certificate-import path runs only when APPLE_CERTIFICATE is
+      # set, and notarization only when APPLE_ID is, so neither is triggered
+      # here. It has to be handed to the bundler rather than run as a later
+      # step, because the bundler signs the .app *before* copying it into the
+      # DMG — a `codesign` afterwards would leave the copy that actually ships
+      # untouched. This does NOT remove the Gatekeeper warning (ad-hoc is not
+      # notarization; see the README's macOS section), it only means the
+      # shipped bundle carries a valid seal instead of no signature at all,
+      # which keeps it clear of the harsher "app is damaged and can't be
+      # opened" rejection. The Windows and Linux bundlers never read it.
+      - name: Build Tauri bundles
+        if: runner.os != 'macOS' || steps.macsign.outputs.enabled != 'true'
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: npm run tauri:build
+
+      # Fail the build on the two ways an AppImage has shipped unable to start,
+      # rather than finding out from a user (or the catalog):
+      # - anything readable or executable only by its owner/group (guards the
+      #   step that seeds AppRun above);
+      # - no bundled tray library: the app panics at startup without it on
+      #   systems that don't have it installed (see `tray-icon` in Cargo.toml).
+      # The SquashFS image starts right after the runtime's ELF section
+      # headers (e_shoff + e_shentsize * e_shnum); computed here rather than
+      # asked of the runtime, which may need libfuse2 just to load.
+      - name: Check AppImage contents
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for f in src-tauri/target/release/bundle/appimage/*.AppImage; do
+            offset=$(python3 -c 'import struct, sys
+          h = open(sys.argv[1], "rb").read(64)
+          print(struct.unpack_from("<Q", h, 0x28)[0] + struct.unpack_from("<H", h, 0x3A)[0] * struct.unpack_from("<H", h, 0x3C)[0])' "$f")
+            unsquashfs -lln -o "$offset" "$f" > appimage-files.txt
+            grep -q 'squashfs-root/AppRun' appimage-files.txt
+            bad=$(awk '
+              $1 ~ /^[-d]/ && ((substr($1,2,1) == "r" && substr($1,8,1) != "r") ||
+                               (substr($1,4,1) == "x" && substr($1,10,1) != "x"))' appimage-files.txt)
+            if [ -n "$bad" ]; then
+              echo "::error title=AppImage permissions::Files other users cannot read/run in $f"
+              echo "$bad"
+              exit 1
+            fi
+            if ! grep -q 'squashfs-root/usr/lib/libayatana-appindicator3\.so\.1' appimage-files.txt; then
+              echo "::error title=AppImage tray library::libayatana-appindicator3.so.1 is not bundled in $f"
+              exit 1
+            fi
+          done
+
+      # Tauri's bundler names files from productName + version + arch/locale
+      # (e.g. "Community IPTV Player_0.9.0_x64_en-US.msi") — rename to a short,
+      # consistent scheme for release/download links, shared with the Android
+      # job below: ctv_<version>_<platform>.<ext>. Reads the version from
+      # package.json rather than the git ref so a workflow_dispatch test run
+      # (no tag) still gets a real, meaningful name instead of an empty one.
+      # The AppImage is the one exception: it is named by architecture
+      # (ctv_<version>_x86_64.AppImage), because the AppImage catalog
+      # (appimage.github.io) flags "linux" in an AppImage's name — every
+      # AppImage is for Linux, so the word says nothing there.
+      - name: Rename release artifacts
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p release-assets
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            for f in $pattern; do
+              [ -f "$f" ] || continue
+              ext="${f##*.}"
+              platform="${{ matrix.platform }}"
+              [ "$ext" = "AppImage" ] && platform="x86_64"
+              cp "$f" "release-assets/ctv_${VERSION}_${platform}.${ext}"
+            done
+          done <<< "${{ matrix.artifacts }}"
+          ls -la release-assets/
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.os }}
+          if-no-files-found: error
+          path: release-assets/*
+
+      # body_path is set here AND on the Android job below, deliberately. Every
+      # job in this workflow publishes to the same tag's release, so whichever
+      # runs last wins the body — pointing all of them at the same checked-in
+      # file makes that race harmless instead of leaving the notes empty (which
+      # is what every release through v0.9.4 shipped with) depending on finish
+      # order. The file explains the macOS Gatekeeper block, which downloaders
+      # need at exactly this moment and would otherwise only find in the README.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-assets/*
+          body_path: .github/release-notes.md
+
+  # Android: a separate job rather than another matrix entry — it needs a
+  # completely different toolchain (JDK, Android SDK/NDK, a from-source ffmpeg
+  # cross-compile) and none of the desktop matrix's steps apply. Runs
+  # alongside the desktop matrix; softprops/action-gh-release safely accumulates
+  # assets from multiple jobs onto the same tag's release, same as the
+  # matrix entries above already do.
+  build-android:
+    name: Android (arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Must match the NDK version staged under ~/Library/Android/sdk/ndk on the
+      # maintainer's dev machine (see [[android-app-port]] memory) — the Rust
+      # target and the ffmpeg cross-compile both need the exact same toolchain.
+      NDK_VERSION: 26.1.10909125
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # All four ABIs Tauri's default (unrestricted) `android build` targets,
+          # matching what a full local `rustup target add` set already covers.
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Explicit SDK setup (cmdline-tools + accepted licenses) rather than
+      # relying on whatever happens to ship on the runner image, so a runner
+      # image change can't silently break this job.
+      #
+      # `packages` must be set: v3's default also installs the legacy `tools`
+      # package, which Google's SDK repository no longer serves, so sdkmanager
+      # fails with "Failed to find package 'tools'" (first hit on v0.9.13).
+      # Nothing here used `tools`; the build only ever needed platform-tools
+      # from this step (the NDK is installed explicitly below).
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android NDK
+        run: sdkmanager --install "ndk;${NDK_VERSION}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: node scripts/set-version.mjs "${GITHUB_REF_NAME#v}"
+
+      - name: Lint
+        run: npm run lint
+
+      # ffmpeg has no Android build of its own to fetch (unlike desktop's
+      # ffmpeg-static sidecar) — it's cross-compiled from source into a real,
+      # executable .so the Rust relay spawns for live-TV transcoding. arm64-v8a
+      # only: real phones/tablets are arm64; x86_64 is emulator-only and not
+      # worth doubling the (slow, from-source) build time for.
+      - name: Install pkg-config
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+      - name: Build ffmpeg sidecar for Android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: npm run android:ffmpeg
+
+      # Optional release signing, mirroring the macOS job's pattern: only
+      # active when the maintainer has added the secrets below. Unlike an
+      # unsigned macOS build (still openable with a Gatekeeper workaround), an
+      # unsigned Android release APK cannot be installed at all — so without
+      # these secrets we build the debug variant instead (auto-signed by
+      # Android's own built-in debug keystore, always installable) rather than
+      # ship a release APK nobody can actually put on a phone.
+      - name: Detect Android signing secrets
+        id: androidsign
+        shell: bash
+        run: echo "enabled=${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Decode Android keystore
+        if: steps.androidsign.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          KEYSTORE_PATH="$PWD/src-tauri/gen/android/release.jks"
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_PATH"
+          cat > src-tauri/gen/android/key.properties <<PROPS
+          storeFile=$KEYSTORE_PATH
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          PROPS
+
+      - name: Build signed Android APK (release)
+        if: steps.androidsign.outputs.enabled == 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: npm run android:build
+
+      - name: Note unsigned Android build
+        if: steps.androidsign.outputs.enabled != 'true'
+        shell: bash
+        run: |
+          echo "::notice title=Unsigned Android build::No ANDROID_KEYSTORE_BASE64 secret configured, so a release APK would be unsigned and unable to install on a device. Building the debug variant instead (auto-signed, fully installable, just flagged by Android as a non-Play-Store build). Add the ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD repo secrets to ship a properly signed release APK."
+
+      - name: Build Android APK (debug fallback)
+        if: steps.androidsign.outputs.enabled != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: npx tauri android build --apk --debug
+
+      # Same short, consistent scheme as the desktop artifacts above:
+      # ctv_<version>_<platform>.<ext>. Located by search rather than a
+      # hardcoded path since the signed/debug branches above land the APK
+      # under different output directories.
+      - name: Locate and rename APK
+        shell: bash
+        run: |
+          SRC="$(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
+          test -n "$SRC"
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p release-assets
+          cp "$SRC" "release-assets/ctv_${VERSION}_android-arm64.apk"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-android
+          if-no-files-found: error
+          path: release-assets/*
+
+      # Same body_path as the desktop matrix above — see the note there.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-assets/*
+          body_path: .github/release-notes.md

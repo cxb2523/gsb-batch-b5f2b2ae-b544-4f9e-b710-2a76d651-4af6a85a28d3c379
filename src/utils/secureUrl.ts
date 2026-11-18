@@ -1,0 +1,82 @@
+/**
+ * URL helpers for IPTV playback.
+ *
+ * Streams are played through the same-origin relay (api/stream.ts) via
+ * `toRelayUrl`, so the browser is not subject to the provider's CORS / redirect
+ * / browser-gating. `upgradeToHttps` / `isHttpUrl` remain available for callers
+ * that still reason about scheme.
+ */
+
+const isAbsoluteHttp = (value: string): boolean => /^https?:\/\//i.test(value);
+
+/** Build the HTTPS variant of an http URL (port 80 -> 443). https/other URLs pass through. */
+export const upgradeToHttps = (url: string): string => {
+  const trimmed = (url ?? "").trim();
+  if (!trimmed || !isAbsoluteHttp(trimmed)) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "http:") {
+      parsed.protocol = "https:";
+      if (parsed.port === "80") parsed.port = "443";
+    }
+    return parsed.toString();
+  } catch {
+    return trimmed;
+  }
+};
+
+/** True when the URL is HTTP. */
+export const isHttpUrl = (url: string): boolean => /^http:\/\//i.test((url ?? "").trim());
+
+const RELAY_PATH = "/api/stream";
+
+/**
+ * Base of the relay that serves /api/*. Empty string = same-origin (the bundled
+ * Tauri window, served by the local relay, OR the deployed site's own
+ * serverless relay). The discovery probe (relayDiscovery.ts) sets this to
+ * `http://127.0.0.1:11471` when the local helper app is detected, so the
+ * HTTPS site can route stream/restream calls to the home-IP relay.
+ */
+let RELAY_BASE = "";
+
+export const setRelayBase = (base: string): void => {
+  RELAY_BASE = (base ?? "").replace(/\/+$/, "");
+};
+
+export const getRelayBase = (): string => RELAY_BASE;
+
+/**
+ * Route a remote stream URL through the relay (api/stream.ts), so the browser
+ * fetches relayed bytes instead of hitting the provider's CORS / redirect /
+ * browser-gating directly. Prepends RELAY_BASE so it targets the local helper
+ * when discovered. Pass-through for already-relayed or root-relative paths.
+ */
+export const toRelayUrl = (url: string): string => {
+  const trimmed = (url ?? "").trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith(RELAY_BASE + RELAY_PATH + "?")) return trimmed;
+  if (!RELAY_BASE && (trimmed.startsWith(RELAY_PATH + "?") || trimmed.startsWith("/"))) return trimmed;
+  if (!isAbsoluteHttp(trimmed)) return trimmed;
+  return RELAY_BASE + RELAY_PATH + "?url=" + encodeURIComponent(trimmed);
+};
+
+/**
+ * True when `url` already targets the relay's own `/api/*` surface.
+ *
+ * Such a URL must never be handed to `toRelayUrl` again: the result would ask
+ * the relay to proxy itself, which its loopback blocklist correctly refuses
+ * with a 403 — turning a diagnosable failure into a misleading one.
+ */
+export const isRelayUrl = (url: string): boolean =>
+  (url ?? "").trim().startsWith(`${RELAY_BASE}/api/`);
+
+/**
+ * Normalize an optional asset URL (logos, covers) without changing its scheme -
+ * drops empties, passes through data:/blob:. Browsers auto-upgrade mixed-content
+ * images themselves, so we leave the provider's scheme untouched.
+ */
+export const cleanAssetUrl = (url?: string | null): string | undefined => {
+  const trimmed = url?.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
+};

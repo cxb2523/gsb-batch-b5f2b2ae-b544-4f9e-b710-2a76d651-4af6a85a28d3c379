@@ -1,0 +1,63 @@
+[package]
+name = "community-iptv-player"
+version = "0.8.0"
+description = "Community IPTV Player desktop relay and app shell"
+authors = ["Community IPTV Player contributors"]
+license = "MIT"
+repository = "https://github.com/orel56000/CommunityIPTVPlayer"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.4.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+# `tray-icon` has to be listed here, not only under the desktop-only table
+# below: the Tauri CLI reads the features of the first `tauri` entry it finds,
+# and only when it sees `tray-icon` does it bundle libayatana-appindicator into
+# the AppImage (and make the .deb/.rpm depend on it). Without it the app
+# panics at startup on any system that lacks the library. The feature is inert
+# on Android/iOS: Tauri compiles its tray code, and pulls in the tray-icon
+# crate, on desktop only.
+tauri = { version = "2.11.2", features = ["tray-icon"] }
+tauri-plugin-log = "2"
+
+# Local HTTP relay (axum + reqwest + tokio) — see src/relay.rs
+axum = "0.7"
+# Use rustls (not native-tls/OpenSSL) so the relay cross-compiles to Android/iOS
+# without an OpenSSL toolchain. rustls works the same on desktop.
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream",
+    "rustls-tls",
+    "http2",
+    "charset",
+] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+url = "2"
+tower-http = { version = "0.5", features = ["fs", "cors", "set-header"] }
+tauri-plugin-opener = "2"
+
+# Desktop-only dependencies. Native Google Cast (rust_cast pulls OpenSSL; mDNS
+# discovery is desktop-oriented) is excluded from the Android/iOS builds, which
+# have no OpenSSL toolchain and their own cast stack.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rust_cast = "0.21"
+mdns-sd = "0.20"
+
+# Mobile-only: the relay also serves the frontend build to OTHER devices
+# pairing with this one over the LAN (desktop already does this from a real
+# on-disk `dist/`; mobile's WebView loads its own UI via Tauri's asset
+# protocol instead, so there is no such path to serve from — this embeds the
+# same build into the binary at compile time so `/` still works there).
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+rust-embed = "8"
