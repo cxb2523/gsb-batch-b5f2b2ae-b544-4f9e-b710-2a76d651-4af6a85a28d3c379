@@ -121,3 +121,132 @@ test('small layer tasks are dynamically assigned without exceeding the worker li
     assert.ok(activeMaximum <= 2);
     assert.ok(workers.every(worker => worker.terminated));
 });
+
+test('a single failing task does not fail the search and only marks it degraded', async () => {
+    const { jobs, workers } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        // The first greedy worker crashes; the remaining tasks still return validated layouts.
+        const greedyIndex = workers.filter(w => w.greedy).length;
+        worker.greedy = true;
+        if (greedyIndex === 0) return worker.onerror(new Error('boom'));
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, 0, 1);
+        worker.onmessage({ data: { result } });
+    });
+    const result = await jobs.run(items(), [4, 4, 4]);
+    assert.equal(result.items.length, 2);
+    assert.equal(result.degraded, true);
+    assert.equal(result.noAlternative, undefined);
+    assert.equal(Packer.validatePackingResult(result.items, 4, 4, 4).valid, true);
+    assert.ok(workers.every(worker => worker.terminated));
+});
+
+test('illegal geometry from one task is rejected while other tasks still decide the search', async () => {
+    const { jobs, workers } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, 0, 1);
+        if (!workers.some(w => w.poisoned)) {
+            worker.poisoned = true;
+            result.items[0].x = NaN; // invalid geometry fails strict validation
+        }
+        worker.onmessage({ data: { result } });
+    });
+    const result = await jobs.run(items(), [4, 4, 4]);
+    assert.equal(result.items.length, 2);
+    assert.equal(result.degraded, true);
+    assert.equal(Packer.validatePackingResult(result.items, 4, 4, 4).valid, true);
+    assert.ok(workers.every(worker => worker.terminated));
+});
+
+test('noAlternative is returned only after every task settled with no legal result', async () => {
+    const unique = [new Item('one', 'One', 4, 4, 4)];
+    const { jobs, workers, calls } = setup((worker, data) => {
+        // Layer tasks find nothing; greedy tasks return the excluded signature itself.
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, 0, 1);
+        worker.onmessage({ data: { result } });
+    });
+    const first = await jobs.run(unique, [4, 4, 4]);
+    const alternative = await jobs.run(unique, [4, 4, 4],
+        { explore: true, excludeSignature: Packer.layoutSignature(first.items) });
+    assert.equal(alternative.noAlternative, true);
+    assert.equal(alternative.degraded, undefined);
+    assert.equal(alternative.items.length, 0);
+    assert.ok(workers.every(worker => worker.terminated));
+    assert.ok(calls.length > 0);
+});
+
+test('a complete layout cancels the remaining tasks but keeps the best result already received', async () => {
+    const six = Array.from({ length: 6 }, (_, i) => new Item('s' + i, 'Cube', 2, 2, 2));
+    const { jobs, workers, calls } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        // Every greedy task can pack all six; the first one resolves immediately.
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, data.start, 1);
+        worker.onmessage({ data: { result } });
+    });
+    const result = await jobs.run(six, [8, 8, 8]);
+    assert.equal(result.items.length, 6);
+    assert.equal(Packer.validatePackingResult(result.items, 8, 8, 8).valid, true);
+    // Workers whose tasks were cut short must all have been terminated and their timers cleared.
+    assert.ok(workers.length >= 1);
+    assert.ok(workers.every(worker => worker.terminated));
+});
+
+test('progress never moves backwards and always reaches 100 on a settled search', async () => {
+    const { jobs } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, 0, 1);
+        worker.onmessage({ data: { result } });
+    });
+    const seen = [];
+    const result = await jobs.run(items(), [4, 4, 4], {}, { onProgress(value) { seen.push(value); } });
+    assert.equal(result.items.length, 2);
+    for (let i = 1; i < seen.length; i++) assert.ok(seen[i] >= seen[i - 1], `progress moved backwards: ${seen[i - 1]} -> ${seen[i]}`);
+    assert.equal(seen[seen.length - 1], 100);
+});
+
+test('noAlternative searches also finish at 100 percent with a clear status label', async () => {
+    const unique = [new Item('only', 'One', 4, 4, 4)];
+    const { jobs } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        const result = new Packer(...data.bin).runGreedyPackTrials(data.items, data.options, 0, 1);
+        worker.onmessage({ data: { result } });
+    });
+    const first = await jobs.run(unique, [4, 4, 4]);
+    const seen = [], labels = [];
+    const alternative = await jobs.run(unique, [4, 4, 4],
+        { explore: true, excludeSignature: Packer.layoutSignature(first.items) },
+        { onProgress(value, label) { seen.push(value); labels.push(label); } });
+    assert.equal(alternative.noAlternative, true);
+    assert.equal(seen[seen.length - 1], 100);
+    assert.ok(labels[labels.length - 1].includes('未找到其他方案'));
+});
+
+test('all worker tasks failing does not masquerade as noAlternative while a fallback can still pack', async () => {
+    const { jobs, workers } = setup((worker, data) => {
+        if (data.layer) return worker.onmessage({ data: { result: null } });
+        worker.onerror(new Error('worker gone'));
+    });
+    const result = await jobs.run(items(), [4, 4, 4], { explore: true, seed: 7 });
+    assert.equal(result.noAlternative, undefined);
+    assert.equal(result.items.length, 2);
+    assert.equal(result.degraded, true);
+    assert.equal(Packer.validatePackingResult(result.items, 4, 4, 4).valid, true);
+    assert.ok(workers.every(worker => worker.terminated));
+});
+
+test('abort emits no completion progress and late worker replies cannot overwrite the verdict', async () => {
+    const { jobs, workers } = setup();
+    const controller = new AbortController();
+    const seen = [];
+    const pending = jobs.run(items(), [4, 4, 4], {}, {
+        signal: controller.signal,
+        onProgress(value) { seen.push(value); }
+    });
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+    assert.ok(seen.every(value => value < 100), 'a cancelled search must not report 100%');
+    assert.ok(workers.every(worker => worker.terminated));
+    // Late replies arriving after cancellation must be ignored without reviving the search.
+    for (const worker of workers) worker.onmessage?.({ data: { result: [] } });
+    assert.ok(workers.every(worker => worker.terminated));
+});
