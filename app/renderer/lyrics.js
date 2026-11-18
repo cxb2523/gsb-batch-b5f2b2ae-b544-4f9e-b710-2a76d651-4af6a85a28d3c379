@@ -42,6 +42,9 @@ let shiftLyricsTimeout = null
 let showingLyrics = false
 /** @type {import("genius-lyrics").Song[]} */
 let lyricsSearchCache = []
+let lyricsRequestCounter = 0
+/** @type {string|null} */
+let lyricsEditSongId = null
 
 /**
  * Short alias for lowercasing a string.
@@ -62,26 +65,47 @@ export const sanitizeLyrics = lyrics => {
 }
 
 /**
- * Fetch lyrics for a given song TODO.
+ * Fetch lyrics for a given song, cancelling any previous fetch request.
+ * Results of stale requests are discarded: no panel updates, no cache writes.
  * @param {import("./songs.js").Song} req
  * @param {boolean} force
  * @param {import("./songs.js").Song|null} originalReq
  */
 export const fetchLyrics = async(req, force = false, originalReq = null) => {
+    lyricsRequestCounter += 1
+    const requestId = lyricsRequestCounter
     const songInfoEl = document.getElementById("song-info")
     const fsLyricsEl = document.getElementById("fs-lyrics")
     const lyricsEditEl = document.getElementById("lyrics-edit-field")
     if (!songInfoEl || !fsLyricsEl || !isHTMLTextAreaElement(lyricsEditEl)) {
         return
     }
+    /**
+     * A request is only valid while it is the latest one for the current song.
+     */
+    const isCurrentRequest = () => requestId === lyricsRequestCounter
+        && currentAndNext().current?.id === req.id
+    /**
+     * Show lyrics in the sidebar, fullscreen view and editor.
+     * @param {string} lyrics
+     */
+    const showLyricsInPanels = lyrics => {
+        songInfoEl.textContent = lyrics
+        fsLyricsEl.textContent = lyrics
+        lyricsEditEl.value = lyrics
+        lyricsEditSongId = req.id
+        showingLyrics = Boolean(lyrics)
+    }
     // Use cache
     const cachedLyrics = getSong(req.id, req.path)?.lyrics
     if (cachedLyrics && !force) {
-        songInfoEl.textContent = cachedLyrics
-        fsLyricsEl.textContent = cachedLyrics
-        lyricsEditEl.textContent = cachedLyrics
-        showingLyrics = true
+        showLyricsInPanels(cachedLyrics)
         return
+    }
+    // Reset the panels to the cached lyrics or an empty state while fetching,
+    // so lyrics of a previous song are never left on screen
+    if (isCurrentRequest()) {
+        showLyricsInPanels(cachedLyrics ?? "")
     }
     if (!req.artist || !req.title) {
         return
@@ -99,13 +123,10 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
     for (const file of files) {
         const lyrics = sanitizeLyrics(readFile(file))
         if (lyrics) {
-            if (currentAndNext().current?.id === req.id) {
-                songInfoEl.textContent = lyrics
-                fsLyricsEl.textContent = lyrics
-                lyricsEditEl.value = lyrics
-                showingLyrics = true
+            if (isCurrentRequest()) {
+                showLyricsInPanels(lyrics)
+                updateLyricsOfSong(req.id, req.path, lyrics)
             }
-            updateLyricsOfSong(req.id, req.path, lyrics)
             return
         }
     }
@@ -151,15 +172,12 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
             if (!song.instrumental) {
                 lyrics = sanitizeLyrics(await song.lyrics())
             }
-            if (currentAndNext().current?.id === req.id) {
-                songInfoEl.textContent = lyrics
-                fsLyricsEl.textContent = lyrics
-                lyricsEditEl.value = lyrics
-                showingLyrics = true
+            if (isCurrentRequest()) {
+                showLyricsInPanels(lyrics)
+                updateLyricsOfSong(req.id, req.path, lyrics)
+                notify(`Found matching lyrics for: ${req.title} ${
+                    req.artist}`, "success", false)
             }
-            updateLyricsOfSong(req.id, req.path, lyrics)
-            notify(`Found matching lyrics for: ${req.title} ${
-                req.artist}`, "success", false)
             return
         }
         notify(`Failed to find matching song lyrics in Genius results for: ${
@@ -169,11 +187,15 @@ export const fetchLyrics = async(req, force = false, originalReq = null) => {
             req.title} ${req.artist}`)
         console.warn(error)
     }
+    // Fall back to the cached lyrics or an empty state on failure
+    if (isCurrentRequest()) {
+        showLyricsInPanels(cachedLyrics ?? "")
+    }
     // Retry without text between brackets in song title and single artist
     if (originalReq) {
         return
     }
-    if (currentAndNext().current?.id === req.id) {
+    if (isCurrentRequest()) {
         const reqWithoutExtraText = JSON.parse(JSON.stringify(req))
         reqWithoutExtraText.artist = req.artist.replace(/\(.*\)/g, "")
             .split(" featuring ", 1)[0].split(" feat. ", 1)[0]
@@ -343,6 +365,7 @@ export const showLyrics = async id => {
         }
         if (isHTMLTextAreaElement(lyricsEditEl)) {
             lyricsEditEl.value = song.lyrics ?? ""
+            lyricsEditSongId = id
         }
         if (songInfoEl) {
             songInfoEl.textContent = song.lyrics
@@ -353,6 +376,7 @@ export const showLyrics = async id => {
         }
         if (isHTMLTextAreaElement(lyricsEditEl)) {
             lyricsEditEl.value = ""
+            lyricsEditSongId = id
         }
         await fetchLyrics(song)
     }
@@ -364,8 +388,14 @@ export const saveLyrics = async() => {
     if (!current) {
         return
     }
+    if (lyricsEditSongId && lyricsEditSongId !== current.id) {
+        notify("Not saving lyrics: the editor contents belong to "
+            + "a song that is no longer playing", "info")
+        return
+    }
     await updateLyricsOfSong(
         current.id, current.path, getInputValue("lyrics-edit-field"))
+    lyricsEditSongId = current.id
     showLyrics(current.id)
 }
 
