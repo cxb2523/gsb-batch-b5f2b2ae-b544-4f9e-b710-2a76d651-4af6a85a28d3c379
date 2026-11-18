@@ -203,6 +203,7 @@ These are the reasons behind code that looks odd. Each one cost a bug to learn.
 - **Nothing plays until the page opts in.** The engine chunk is fetched on intent (pointer enter, focus), and the `AudioContext` is made on the first sound.
 - **Sounds asked for before the reader has interacted are dropped, not queued.** The browser holds audio until then.
 - **The context suspends only after the longest scheduled sound, plus a margin, and never sooner than four seconds.** A delayed cascade outlasts four seconds.
+- **The sound switch stops the engine, not just the next request.** Turning it off cancels the idle timer and fades out every sounding bus; turning it on leaves the same graph in place to resume at the current volume.
 - **A stored value other than `on` or `off` means "not chosen yet".** Storage is shared with the host page.
 - **`playSound` honours `delay` only for `cascade`.** Any other sound that lands later needs one timer in a ref.
 

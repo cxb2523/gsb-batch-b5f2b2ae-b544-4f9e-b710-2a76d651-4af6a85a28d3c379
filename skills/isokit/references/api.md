@@ -95,6 +95,7 @@ All input types come from zod schemas in `react-isokit/schema` (`box3Schema`, `v
 - `tick` and `roll` are throttled to one every 30 ms.
 - `playSound("cascade", { count, stagger, delay })` lands `count` rising tocks `stagger` seconds apart starting at `delay`, then a small bell: match it to a staggered CSS animation.
 - Sounds asked for before the reader has interacted with the page are dropped, never queued.
+- The switch is a real gate: turning sound off fades out and stops every sounding instance, and nothing new is scheduled until it is turned back on. Turning it back on resumes the same engine on the next play, at the volume `configureSound` last set.
 
 ## Guided motion, for first-time readers
 
