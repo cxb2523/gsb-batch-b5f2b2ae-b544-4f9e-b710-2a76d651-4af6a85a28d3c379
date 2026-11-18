@@ -8,8 +8,12 @@ var WT_CHAT_PREFIX = 'tvbox-center:chat:';
 var WT_MSG_MAX = 200;
 var WT_TEXT_MAX = 500;
 var WT_ONLINE_TTL = 5 * 60 * 1000;
+var WT_HB_INTERVAL = 60 * 1000;
 
-var WT = { client: null, room: '', hash: '', msgs: [], users: {}, uid: '', nick: '', unread: 0, open: false, topic: '' };
+var WT = {
+  client: null, room: '', hash: '', msgs: [], users: {}, uid: '', nick: '',
+  unread: 0, open: false, topic: '', hbTimer: 0, lastSync: null
+};
 
 function wtHash(str) {
   var h1 = 0x811c9dc5, h2 = 0x01000193;
@@ -34,6 +38,8 @@ function wtRoomOf(item) {
   return wtHash((item._sourceKey || '') + ':' + (item.vod_id || ''));
 }
 
+function wtTopicOf(hash) { return WT_TOPIC_PREFIX + hash; }
+
 function wtLoadChat(hash) {
   try {
     var o = JSON.parse(localStorage.getItem(WT_CHAT_PREFIX + hash) || '{"messages":[]}');
@@ -42,10 +48,13 @@ function wtLoadChat(hash) {
 }
 
 function wtSaveChat(hash, msgs) {
+  if (!hash) return;
   try {
     localStorage.setItem(WT_CHAT_PREFIX + hash, JSON.stringify({ messages: msgs.slice(-WT_MSG_MAX) }));
   } catch (e) {}
 }
+
+/* ---------- 连接 ---------- */
 
 function wtConnect() {
   if (WT.client) return WT.client;
@@ -58,16 +67,24 @@ function wtConnect() {
     clean: true, reconnectPeriod: 4000, connectTimeout: 10000, keepalive: 30
   });
   WT.client.on('connect', function () {
+    // 重连后只重新订阅当前房间主题；旧主题不再订阅
     if (WT.topic) WT.client.subscribe(WT.topic);
     wtPublish({ type: 'hello' });
   });
   WT.client.on('message', function (topic, payload) {
+    // 房间是消息归属的唯一依据：主题不匹配当前房间的一律丢弃，
+    // 不写缓存、不计未读、不更新在线名单（含重连窗口期到达的旧主题消息）
+    if (!topic || topic !== WT.topic) return;
     var m;
     try { m = JSON.parse(payload.toString()); } catch (e) { return; }
     wtRecv(m);
   });
   WT.client.on('error', function () {});
   return WT.client;
+}
+
+function wtConnected() {
+  return !!(WT.client && WT.client.connected && WT.topic);
 }
 
 function wtPublish(msg) {
@@ -78,8 +95,9 @@ function wtPublish(msg) {
 }
 
 function wtRecv(m) {
-  if (!m || !m.type) return;
-  if (m.uid === WT.uid && m.type !== 'hello') return;
+  if (!m || !m.type || !m.uid) return;
+  // 同一用户（含同一账号的另一标签页）不按他人重复计入；自己的回显也忽略
+  if (m.uid === WT.uid) return;
 
   if (m.type === 'hello' || m.type === 'chat' || m.type === 'sync') {
     WT.users[m.uid] = { nick: m.nick || '观众', at: Date.now() };
@@ -109,36 +127,81 @@ function wtPruneUsers() {
   });
 }
 
+/* ---------- 心跳（保活在场 + 定期剔除超时用户） ---------- */
+
+function wtStartHeartbeat() {
+  wtStopHeartbeat();
+  WT.hbTimer = setInterval(function () {
+    if (!WT.topic) { wtStopHeartbeat(); return; }
+    wtPruneUsers();
+    wtPublish({ type: 'hello' });
+    if (WT.open) renderWatch();
+  }, WT_HB_INTERVAL);
+}
+
+function wtStopHeartbeat() {
+  if (WT.hbTimer) { clearInterval(WT.hbTimer); WT.hbTimer = 0; }
+}
+
+/* ---------- 房间进出 ---------- */
+
+// 清空当前房间的全部状态（未读 / 在线名单 / 待处理同步 / 消息列表）
+function wtResetRoom() {
+  WT.hash = '';
+  WT.topic = '';
+  WT.msgs = [];
+  WT.users = {};
+  WT.unread = 0;
+  WT.lastSync = null;
+}
+
+// 退出当前订阅（发 bye + 退订），不动连接与状态
+function wtQuitRoom() {
+  if (!WT.topic) return;
+  wtPublish({ type: 'bye' });
+  if (WT.client) { try { WT.client.unsubscribe(WT.topic); } catch (e) {} }
+}
+
 function wtEnter(item) {
   var hash = wtRoomOf(item);
   if (!hash) return;
   wtIdentity();
+  var topic = wtTopicOf(hash);
+
+  // 切换房间：先退掉旧房间订阅，再清空旧房间的未读 / 在线名单 / 待同步状态
+  if (WT.topic && WT.topic !== topic) wtQuitRoom();
+  wtResetRoom();
+
   WT.hash = hash;
-  WT.topic = WT_TOPIC_PREFIX + hash;
-  WT.msgs = wtLoadChat(hash);
-  WT.users = {};
-  WT.unread = 0;
+  WT.topic = topic;
+  WT.msgs = wtLoadChat(hash); // 聊天缓存按房间哈希隔离
   WT.open = true;
 
   var c = wtConnect();
-  if (c && c.connected) c.subscribe(WT.topic);
+  if (c && c.connected) c.subscribe(topic);
   wtPublish({ type: 'hello' });
+  wtStartHeartbeat();
   renderWatch();
 }
 
 function wtLeave() {
-  wtPublish({ type: 'bye' });
-  if (WT.client && WT.topic) WT.client.unsubscribe(WT.topic);
+  wtQuitRoom();
+  wtStopHeartbeat();
+  wtResetRoom();
   WT.open = false;
-  WT.msgs = [];
-  var p = S.root.querySelector('#wtPanel');
+  // 关闭面板即断开连接，不残留定时器与连接
+  if (WT.client) { try { WT.client.end(true); } catch (e) {} WT.client = null; }
+  var p = S.root && S.root.querySelector('#wtPanel');
   if (p) p.classList.remove('open');
 }
+
+/* ---------- 发送 ---------- */
 
 function wtSend(text) {
   text = (text || '').trim().slice(0, WT_TEXT_MAX);
   if (!text) return;
   if (!WT.topic) { toast('先打开一个作品'); return; }
+  if (!wtConnected()) { toast('未连接到房间，请稍后再试'); return; }
   wtPublish({ type: 'chat', text: text });
   var m = { type: 'chat', uid: WT.uid, nick: WT.nick, text: text, msgId: 'local-' + Date.now(), ts: Date.now() };
   WT.msgs.push(m);
@@ -149,6 +212,7 @@ function wtSend(text) {
 function wtSync() {
   var P = S.player;
   if (!P.item) return;
+  if (!wtConnected()) { toast('未连接到房间，无法同步'); return; }
   var v = S.root.querySelector('#video');
   wtPublish({ type: 'sync', from: P.from, ep: P.ep, time: v ? v.currentTime : 0 });
   toast('已同步当前进度');
@@ -170,6 +234,7 @@ function renderWatch() {
   if (!WT.open) return;
 
   S.root.querySelector('#wtRoom').textContent = WT.hash.slice(0, 8);
+  wtPruneUsers();
   var n = Object.keys(WT.users).length + 1;
   S.root.querySelector('#wtOnline').textContent = n + ' 人在看';
   S.root.querySelector('#wtBadge').textContent = WT.unread > 0 ? String(WT.unread) : '';

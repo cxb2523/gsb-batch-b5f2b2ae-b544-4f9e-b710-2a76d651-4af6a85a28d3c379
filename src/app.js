@@ -504,7 +504,7 @@ function unmount() {
   if (S.player.hls) { try { S.player.hls.destroy(); } catch (e) {} S.player.hls = null; }
   clearInterval(bannerTimer);
   stopAdWatch();
-  if (WT.client) { try { WT.client.end(true); } catch (e) {} WT.client = null; }
+  wtLeave(); // 停止心跳、退订并断开 MQTT，不残留定时器与连接
   document.removeEventListener('keydown', onKey);
   if (S.root.parentNode) S.root.parentNode.removeChild(S.root);
   S.root = null;

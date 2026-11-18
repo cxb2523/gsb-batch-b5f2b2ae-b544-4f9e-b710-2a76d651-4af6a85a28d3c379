@@ -72,6 +72,7 @@ function showPlayer(on) {
     S.player.hls && S.player.hls.destroy();
     S.player.hls = null;
     stopAdWatch();
+    wtLeave(); // 播放器关闭时一并退出一起看房间
     document.removeEventListener('keydown', onKey);
   } else {
     document.addEventListener('keydown', onKey);
