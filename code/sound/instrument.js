@@ -9,10 +9,18 @@
 
 class Instrument extends ModulatorSet {
 
-    #implementation = { sustain: soundDefinitionSet.playControl.minimalSustain, gainCompensation: { }, transposition: 0 };
+    #implementation = {
+        sustain: soundDefinitionSet.playControl.minimalSustain,
+        gainCompensation: { },
+        isGainCompensationEnabled: true,
+        transposition: 0
+    };
 
     constructor(frequencySet, tonalSystem) { // frequencySet = { first, last, startingFrequency }
         super();
+        const safeDisconnect = node => {
+            try { node.disconnect(); } catch (ex) { /* node already disconnected: nothing to tear down */ }
+        }; //safeDisconnect
         const isFrequencySetArray = frequencySet.constructor == Array
         if (isFrequencySetArray && !tonalSystem)
             tonalSystem = frequencySet.length;
@@ -111,17 +119,23 @@ class Instrument extends ModulatorSet {
         } //this.#implementation.setWaveform
         this.#implementation.filterChain = new ChainNode(this.#implementation.masterGain, context.destination);
         this.#implementation.setFilterUsage = enable => this.#implementation.filterChain.isEnabled = enable;
+        // Applies a compensation data set. The values of the current instrument are
+        // always saved when saveValues is set; when compensation is disabled the
+        // neutral default values are applied instead, so no stale gain remains active.
         this.#implementation.setGainCompensation = (gainCompensation, saveValues) => {
+            if (saveValues)
+                this.#implementation.savedGainCompensationValues = gainCompensation;
+            if (!this.#implementation.isGainCompensationEnabled)
+                gainCompensation = defaultInstrument.gainCompensation;
             this.#implementation.gainCompensation = gainCompensation;
             this.#implementation.compensationMasterGainNode.gain.value = gainCompensation.masterGain;
             this.#implementation.compensateToneGains();
-            if (saveValues)
-                this.#implementation.savedGainCompensationValues = gainCompensation;
         } //this.#implementation.setGainCompensation
         this.#implementation.setGainCompensationUsage = enable => {
+            this.#implementation.isGainCompensationEnabled = enable;
             if (enable && this.#implementation.savedGainCompensationValues)
                 this.#implementation.setGainCompensation(this.#implementation.savedGainCompensationValues, false);
-            else // now disable:
+            else // now disabled: neutral values, saved ones are retained for re-enabling
                 this.#implementation.setGainCompensation(defaultInstrument.gainCompensation, false);
         }; //this.#implementation.setGainCompensationUsage
         this.#implementation.setFilterChain = filterData => {
@@ -143,8 +157,8 @@ class Instrument extends ModulatorSet {
                 tone.deactivate();
             super.baseDeactivate();
             this.#implementation.filterChain.deactivate();
-            this.#implementation.compensationMasterGainNode.disconnect();
-            this.#implementation.masterGain.disconnect();
+            safeDisconnect(this.#implementation.compensationMasterGainNode);
+            safeDisconnect(this.#implementation.masterGain);
         }; //this.#implementation.deactivate
         this.#implementation.silence = _ => {
             for (let [_, tone] of this.#implementation.tones)
@@ -189,13 +203,22 @@ class Instrument extends ModulatorSet {
 
     set data(dataset) {
         this.#implementation.lastDataset = dataset;
-        if (dataset.gainCompensation && dataset.gainCompensation.middleFrequency)
-            this.#implementation.setGainCompensation(dataset.gainCompensation, true);
+        // Gain compensation enable state and saved values follow the newly loaded data.
+        // Absent or flag-less data keeps the legacy behavior (compensation enabled).
+        if (dataset.gainCompensation && dataset.gainCompensation.middleFrequency != undefined) {
+            const compensationEnabled = dataset.gainCompensation.enabled != false;
+            this.#implementation.isGainCompensationEnabled = compensationEnabled;
+            this.#implementation.savedGainCompensationValues = dataset.gainCompensation;
+            this.#implementation.setGainCompensation(dataset.gainCompensation, false);
+        } //if
         this.#implementation.setWaveform(dataset.oscillator);
         for (let [_, tone] of this.#implementation.tones) {
-            tone.gainEnvelope = dataset.gainEnvelope;    
-            tone.detuneEnvelope = dataset.detuneEnvelope;    
+            tone.gainEnvelope = dataset.gainEnvelope;
+            tone.detuneEnvelope = dataset.detuneEnvelope;
         } //loop
+        // Modulator sets are rebuilt once per data set: the instrument itself owns
+        // the absolute-frequency modulators (its shared master depth node drives
+        // every tone's target parameter), the tones own the relative-frequency ones.
         super.frequencyModulationData = dataset.frequencyModulation.absoluteFrequency;
         super.amplitudeModulationData = dataset.amplitudeModulation.absoluteFrequency;
         for (let [_, tone] of this.#implementation.tones) {
@@ -205,11 +228,16 @@ class Instrument extends ModulatorSet {
             tone.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
             super.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
         } //loop
+        // The filter chain is fully rebuilt: old BiquadFilterNodes are disconnected
+        // and released inside ChainNode.populate, only present filters survive.
         this.#implementation.setFilterChain(dataset.filter);
     } //set data
 
     get volume() { return this.#implementation.masterGain.gain.value; }
     set volume(value) { this.#implementation.masterGain.gain.value = value; }
+
+    get gainCompensationEnable() { return this.#implementation.isGainCompensationEnabled; }
+    get filterEnable() { return this.#implementation.filterChain.isEnabled; }
 
     get sustain() { return this.#implementation.sustain; }
     set sustain(value) {

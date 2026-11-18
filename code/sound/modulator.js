@@ -20,8 +20,8 @@ class Modulator {
         this.#implementation.output = this.#implementation.depthNode;
         this.#implementation.deactivate = _ => {
             this.#implementation.oscillator.stop();
-            this.#implementation.oscillator.disconnect();
-            this.#implementation.depthNode.disconnect();
+            try { this.#implementation.oscillator.disconnect(); } catch (ex) { /* already disconnected */ }
+            try { this.#implementation.depthNode.disconnect(); } catch (ex) { /* already disconnected */ }
         }; //this.#implementation.deactivate
     } //constructor
 
@@ -35,7 +35,10 @@ class Modulator {
         this.#implementation.output.connect(audioParameter);
         return this;
     } //connect
-    disconnect() { this.#implementation.output.disconnect(); return this; }
+    disconnect() {
+        try { this.#implementation.output.disconnect(); } catch (ex) { /* never connected: nothing to detach */ }
+        return this;
+    }
 
     deactivate() { this.#implementation.deactivate(); }
 

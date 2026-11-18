@@ -75,7 +75,9 @@ window.onload = () => {
                     controls.tables.compensation.masterGain.value = this.model.gainCompensation.masterGain;
                     controls.tables.compensation.middleFrequency.value = this.model.gainCompensation.middleFrequency;
                     controls.tables.compensation.lowFrequencyCompensationGain.value = this.model.gainCompensation.lowFrequencyCompensationGain;
-                    controls.tables.compensation.highFrequencyCompensationGain.value = this.model.gainCompensation.highFrequencyCompensationGain;    
+                    controls.tables.compensation.highFrequencyCompensationGain.value = this.model.gainCompensation.highFrequencyCompensationGain;
+                    // the toggle state follows the newly loaded instrument data
+                    controls.usage.GainCompensation.isDown = this.model.gainCompensation.enabled != false;
                 } //if compensationGain
                 controls.fileIO.instrumentName.value = this.model.header.instrumentName;
                 controls.tables.tableFourier.data = this.model.oscillator;
@@ -106,6 +108,7 @@ window.onload = () => {
                 this.model = {
                     header: this.createHeader(),
                     gainCompensation: {
+                        enabled: controls.usage.GainCompensation.isDown,
                         masterGain: controls.tables.compensation.masterGain.value,
                         middleFrequency: controls.tables.compensation.middleFrequency.value,
                         lowFrequency: keyboardProperties.firstFrequency,

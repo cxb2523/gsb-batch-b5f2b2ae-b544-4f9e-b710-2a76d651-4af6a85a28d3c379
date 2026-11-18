@@ -34,16 +34,19 @@ class Tone extends ModulatorSet {
         this.#implementation.dynamicGainNode.connect(this.#implementation.amplitudeModulationNode);
         this.#implementation.amplitudeModulationNode.connect(this.#implementation.gainEnvelopeNode);
         this.#implementation.mainOscillator.start();
+        const safeDisconnect = node => {
+            try { node.disconnect(); } catch (ex) { /* node already disconnected: nothing to tear down */ }
+        }; //safeDisconnect
         this.#implementation.deactivate = () => {
             super.baseDeactivate();
             this.#implementation.mainOscillator.stop();
-            this.#implementation.mainOscillator.disconnect();
-            this.#implementation.frequencyCompensationGainNode.disconnect();
-            this.#implementation.dynamicGainNode.disconnect();
-            this.#implementation.gainEnvelopeNode.disconnect();
-            this.#implementation.amplitudeModulationNode.disconnect();
-            this.#implementation.frequencyModulationEnvelopeNode.disconnect();
-            this.#implementation.amplitudeModulationEnvelopeNode.disconnect();
+            safeDisconnect(this.#implementation.mainOscillator);
+            safeDisconnect(this.#implementation.frequencyCompensationGainNode);
+            safeDisconnect(this.#implementation.dynamicGainNode);
+            safeDisconnect(this.#implementation.gainEnvelopeNode);
+            safeDisconnect(this.#implementation.amplitudeModulationNode);
+            safeDisconnect(this.#implementation.frequencyModulationEnvelopeNode);
+            safeDisconnect(this.#implementation.amplitudeModulationEnvelopeNode);
         }; //this.#implementation.deactivate
     } //constructor
 
@@ -72,8 +75,8 @@ class Tone extends ModulatorSet {
     set detuneEnvelope(data) { this.#implementation.detuneEnvelope.data = data; }
 
     set data(dataset) {
-        this.frequencyModulationData = dataset.frequencyModulation.relativeFrequency;
-        this.amplitudeModulationData = dataset.amplitudeModulation.relativeFrequency;
+        // Modulator lists are rebuilt by the dedicated data properties;
+        // here only the modulation envelope data is refreshed.
         this.#implementation.frequencyModulationEnvelope.data = dataset.frequencyModulation.envelope;
         this.#implementation.amplitudeModulationEnvelope.data = dataset.amplitudeModulation.envelope;
     } //set data

@@ -9,6 +9,7 @@
 
 const defaultInstrument = {
     gainCompensation: {
+        enabled: true,
         masterGain: 1,
         middleFrequency: 329.628, // middle e', real middle key of the keyboard (#44), between middle C and middle A = 440 Hz
         lowFrequency: 27.5,
