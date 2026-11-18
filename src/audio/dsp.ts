@@ -247,6 +247,10 @@ export function roomImpulse(ctx: BaseAudioContext, o: RoomIrOptions): AudioBuffe
 export class Voice {
   private nodes: AudioNode[] = [];
   private sources: { n: AudioScheduledSourceNode; start: number; stop: number }[] = [];
+  /** True once `run()` has scheduled the sources. */
+  private ran = false;
+  /** True once `cancelPending()` or normal teardown stopped this voice. */
+  private cancelled = false;
 
   constructor(readonly ctx: BaseAudioContext) {}
 
@@ -264,6 +268,7 @@ export class Voice {
 
   /** Schedules everything and frees the whole subgraph once the last one ends. */
   run(): number {
+    this.ran = true;
     let latest = 0;
     for (const s of this.sources) {
       s.n.start(s.start);
@@ -274,18 +279,57 @@ export class Voice {
     for (const s of this.sources) if (s.stop >= latest) tail = s.n;
     if (tail) {
       tail.onended = () => {
-        for (const n of this.nodes) {
-          try {
-            n.disconnect();
-          } catch {
-            /* already gone */
-          }
-        }
-        this.nodes.length = 0;
-        this.sources.length = 0;
+        this.teardown();
       };
     }
     return latest;
+  }
+
+  /**
+   * Silences a voice whose start time has not yet been reached. Voices already
+   * sounding are left to finish naturally: their decay is part of the sound,
+   * and yanking a struck envelope out of the air clicks.
+   *
+   * This is what makes a pump stop authoritative: any metering tick scheduled
+   * inside the look-ahead window but still in the future is stopped before it
+   * ever reaches the bus, so nothing outlives the interaction event. Safe to
+   * call more than once and before `run()`.
+   */
+  cancelPending(now: number): void {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    let sounding = false;
+    for (const s of this.sources) {
+      // A source whose start is still ahead of the clock can be stopped with
+      // no audible artifact. Under an offline context `currentTime` is 0 until
+      // the render advances, so every future event is cancellable there.
+      if (!this.ran || s.start >= now) {
+        try {
+          s.n.onended = null;
+          s.n.stop();
+        } catch {
+          /* never started or already stopped */
+        }
+      } else {
+        sounding = true;
+      }
+    }
+    // Nodes belonging to a still-sounding voice stay connected: its natural
+    // `onended` teardown runs once the decay completes. Only when nothing is
+    // sounding do we pull the graph down immediately.
+    if (!sounding) this.teardown();
+  }
+
+  private teardown(): void {
+    for (const n of this.nodes) {
+      try {
+        n.disconnect();
+      } catch {
+        /* already gone */
+      }
+    }
+    this.nodes.length = 0;
+    this.sources.length = 0;
   }
 }
 

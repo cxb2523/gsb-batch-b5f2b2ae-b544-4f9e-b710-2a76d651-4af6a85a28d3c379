@@ -447,8 +447,13 @@ export function playPumpClunk(kit: AudioKit, out: AudioNode, t0: number, rnd: Ra
  * fixed period reads as a metronome, and a metronome reads as software. The
  * harness asserts the inter-onset intervals have a non-trivial coefficient of
  * variation.
+ *
+ * Returns the owning `Voice` (already scheduled) so a pump that stops, or
+ * changes flow rate, can cancel ticks still waiting in the look-ahead window
+ * before they ever sound. Other one-shots return a finish time; this one is
+ * the only voice whose schedule must be retractable.
  */
-export function playPumpTick(kit: AudioKit, out: AudioNode, t0: number, rnd: Rand, gain = 0.5): number {
+export function playPumpTick(kit: AudioKit, out: AudioNode, t0: number, rnd: Rand, gain = 0.5): Voice {
   const v = new Voice(kit.ctx);
   const ctx = kit.ctx;
   const detune = 0.92 + rnd() * 0.16;
@@ -470,7 +475,7 @@ export function playPumpTick(kit: AudioKit, out: AudioNode, t0: number, rnd: Ran
     end = Math.max(end, e);
   }
   v.run();
-  return end;
+  return v;
 }
 
 /* ------------------------------------------------------------------ */

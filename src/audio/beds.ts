@@ -1,6 +1,6 @@
 import { biquad, chain, gainNode, holdAt, loopSource, Voice } from "./dsp";
 import type { AudioKit } from "./kit";
-import { click, thump, type Rand } from "./oneshots";
+import { click, playPumpClunk, playPumpTick, thump, type Rand } from "./oneshots";
 
 /**
  * Continuous sources. Unlike the one-shots these live for the whole session,
@@ -438,5 +438,188 @@ export class PumpMotor implements Bed {
     }
     this.nodes.length = 0;
     this.sources.length = 0;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* pump sound bed: one motor, one metre, strictly event-owned          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * One tick already handed to the Web Audio clock. `at` is its absolute
+ * scheduled start time; `voice` is the retractable subgraph playing it.
+ */
+interface ScheduledTick {
+  at: number;
+  voice: Voice;
+}
+
+/**
+ * The complete audible state of the pump interaction, owned in one place.
+ *
+ * The failures this class exists to make impossible:
+ *
+ * - **Sound on the wrong pump.** There is exactly one motor bed and one metre,
+ *   and `begin(bay)` is the only thing that connects them. It disconnects the
+ *   previous bay before connecting the new one, so at every instant the motor
+ *   is attached to at most one emitter, and it is always the bay of the most
+ *   recent start event.
+ * - **Clicks after the handle drops.** `end()` cancels every tick whose start
+ *   is still in the future — nothing is merely "flagged off" and left for the
+ *   scheduler to skip. A tick already sounding decays naturally.
+ * - **Old tempo after a flow change.** Any rate change, including to zero,
+ *   cancels the whole pending schedule and starts the next phase fresh, so a
+ *   schedule built at the old rate can never fire.
+ * - **Repeated stops.** `end()` is idempotent; stopping an idle bed is a
+ *   no-op. Every method is also safe to call before `start()` and before the
+ *   graph is wired, and never throws on a benign double call.
+ *
+ * The metre keeps the existing jitter: each onset is one period (derived from
+ * the current rate) multiplied by 0.86–1.14 of randomness. What changed is the
+ * lifecycle of the schedule, not its rhythm.
+ */
+export class PumpSoundBed {
+  private readonly kit: AudioKit;
+  private readonly rnd: Rand;
+  private readonly motor: PumpMotor;
+  private readonly bays: { input: AudioNode }[];
+  /** The bay the motor is currently connected to. -1 when connected nowhere. */
+  private connectedBay = -1;
+  private active = false;
+  private rate = 0;
+  private nextTickAt = 0;
+  private pending: ScheduledTick[] = [];
+
+  constructor(kit: AudioKit, bayInputs: AudioNode[], rnd: Rand) {
+    this.kit = kit;
+    this.rnd = rnd;
+    this.bays = bayInputs.map((input) => ({ input }));
+    this.motor = new PumpMotor(kit, 1);
+  }
+
+  /** Starts the long-lived motor oscillators. The gate stays closed. */
+  start(when: number): void {
+    this.motor.start(when);
+  }
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  private bayCount(): number {
+    return this.bays.length;
+  }
+
+  private normalizeBay(pumpIndex: number): number {
+    if (this.bayCount() === 0) return -1;
+    return Math.max(0, Math.min(Math.round(pumpIndex), this.bayCount() - 1));
+  }
+
+  /**
+   * Routes the motor to `pumpIndex`'s bay and spins it up. Any metre schedule
+   * belonging to the previous transaction is revoked first, so rapid
+   * island-hopping cannot leave clicks landing on the pump just left.
+   */
+  begin(pumpIndex: number, when: number): void {
+    const bay = this.normalizeBay(pumpIndex);
+    // A new transaction always starts from a clean metre, even when the
+    // previous stop's spin-down is still audibly coasting.
+    this.cancelPendingTicks(when);
+    this.rate = 0;
+    this.active = true;
+
+    if (bay >= 0 && bay !== this.connectedBay) {
+      try {
+        this.motor.out.disconnect();
+      } catch {
+        /* not connected yet */
+      }
+      this.motor.out.connect(this.bays[bay].input);
+      this.connectedBay = bay;
+    }
+
+    if (bay >= 0) playPumpClunk(this.kit, this.bays[bay].input, when, this.rnd, 0.5);
+    this.motor.spinUp(when + 0.09);
+  }
+
+  /**
+   * Stops the metre and spins the motor down. Cancels every future tick; a
+   * tick already ringing finishes its short decay. Idempotent: calling it
+   * again, or on a bed that never started, does nothing and never throws.
+   */
+  end(when: number): void {
+    if (!this.active) return;
+    this.active = false;
+    this.rate = 0;
+    this.cancelPendingTicks(when);
+    this.motor.spinDown(when);
+    if (this.connectedBay >= 0) {
+      playPumpClunk(this.kit, this.bays[this.connectedBay].input, when + 0.16, this.rnd, 0.38);
+    }
+  }
+
+  /**
+   * Sets the metering rate in ticks per second (0 = silent). Every change
+   * discards the pending schedule — the look-ahead window is rebuilt at the
+   * new rate rather than allowed to finish the old one, so no onset built from
+   * the old tempo survives a rate change.
+   */
+  setTickRate(ticksPerSecond: number, now: number): void {
+    const r = Math.max(0, Math.min(ticksPerSecond, 40));
+    if (r === this.rate) return;
+    this.rate = r;
+    this.cancelPendingTicks(now);
+    if (r > 0 && this.active) {
+      // Fresh phase at the new tempo. The 0.05 s head keeps the first onset
+      // sample-schedulable rather than landing in the past.
+      this.nextTickAt = now + 0.05;
+    }
+  }
+
+  /**
+   * Per-frame scheduler. Fills a 120 ms look-ahead window at the current rate,
+   * keeping every onset jittered around its period. Returns early unless the
+   * bed is active and metering, so an idle or stopped pump schedules nothing.
+   */
+  update(now: number): void {
+    if (!this.active || this.rate <= 0 || this.connectedBay < 0) return;
+    const period = 1 / this.rate;
+    const dest = this.bays[this.connectedBay].input;
+    while (this.nextTickAt < now + 0.12) {
+      if (this.nextTickAt < now) this.nextTickAt = now + 0.02;
+      const at = this.nextTickAt;
+      const voice = playPumpTick(this.kit, dest, at, this.rnd, 0.5);
+      this.pending.push({ at, voice });
+      // Jitter both ways: a mechanical counter is driven by fuel flow, and
+      // fuel flow is not a clock.
+      this.nextTickAt = at + period * (0.86 + this.rnd() * 0.28);
+    }
+    this.prunePast(now);
+  }
+
+  /** Stops every tick whose start is still ahead of the clock. */
+  private cancelPendingTicks(now: number): void {
+    for (const t of this.pending) t.voice.cancelPending(now);
+    this.pending.length = 0;
+  }
+
+  /** Drops references to ticks that have already sounded and self-freed. */
+  private prunePast(now: number): void {
+    if (this.pending.length && this.pending[0].at <= now) {
+      this.pending = this.pending.filter((t) => t.at > now);
+    }
+  }
+
+  dispose(): void {
+    this.cancelPendingTicks(this.kit.ctx.currentTime);
+    this.active = false;
+    this.rate = 0;
+    try {
+      this.motor.out.disconnect();
+    } catch {
+      /* not connected */
+    }
+    this.connectedBay = -1;
+    this.motor.dispose();
   }
 }

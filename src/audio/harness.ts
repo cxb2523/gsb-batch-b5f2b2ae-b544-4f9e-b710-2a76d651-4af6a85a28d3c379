@@ -1,4 +1,4 @@
-import { CoolerUnit, FluorescentBuzz, HighwayWash, PumpMotor } from "./beds";
+import { CoolerUnit, FluorescentBuzz, HighwayWash, PumpMotor, PumpSoundBed } from "./beds";
 import { biquad, gainNode, makeRng } from "./dsp";
 import { AudioKit } from "./kit";
 import {
@@ -123,6 +123,55 @@ function occluded(ctx: OfflineAudioContext, out: AudioNode, cutoff: number, gain
   const g = gainNode(ctx, gain);
   lp.connect(g).connect(out);
   return lp;
+}
+
+/**
+ * The pump sound bed under a continuous start → meter → stop → switch-pump →
+ * meter → stop transaction, rendered into two bays (stereo channels). The
+ * offline assertions then verify, per bay, where the motor and the metre
+ * actually sounded — which is the property that was broken in the field.
+ *
+ * Timeline, in seconds:
+ *   0.05  begin bay 0, motor spins up
+ *   0.10  metre on bay 0 at 6 ticks/s
+ *   2.00  stop: metre cancelled, motor spins down
+ *   2.40  begin bay 1 (motor re-routes), metre on bay 1 at 6 ticks/s
+ *   4.00  stop again; 4.10 a duplicate stop that must be a no-op
+ */
+function pumpBedScenario(ctx: OfflineAudioContext, kit: AudioKit, out: AudioNode, _observedBay: number): void {
+  // AudioDestinationNode has a single mixed input; landing each bay on its own
+  // speaker channel requires a ChannelMerger. Only the merger reaches the
+  // destination — connecting the bays to the mono `out` as well would feed
+  // every channel everything and destroy the per-bay separation. The merger
+  // itself also feeds `out` so the shared mono analysis chain still works.
+  const merger = ctx.createChannelMerger(2);
+  const bay0 = ctx.createGain();
+  const bay1 = ctx.createGain();
+  bay0.connect(merger, 0, 0);
+  bay1.connect(merger, 0, 1);
+  merger.connect(ctx.destination);
+  merger.connect(out);
+
+  const bed = new PumpSoundBed(kit, [bay0, bay1], makeRng(55));
+  bed.start(0);
+
+  // Events are applied before each scheduler sweep, matching the real frame
+  // order (interaction events land, then AudioSystem.update fills the
+  // look-ahead). Sweeping first would let the meter schedule ticks beyond a
+  // stop that happens on the same tick and never get them cancelled.
+  for (let t = 0; t < 6.0; t += 0.05) {
+    if (Math.abs(t - 0.05) < 1e-6) bed.begin(0, t);
+    if (Math.abs(t - 0.1) < 1e-6) bed.setTickRate(6, t);
+    if (Math.abs(t - 2.0) < 1e-6) bed.end(t);
+    if (Math.abs(t - 2.4) < 1e-6) {
+      bed.begin(1, t);
+      bed.setTickRate(6, t + 0.02);
+    }
+    if (Math.abs(t - 4.0) < 1e-6) bed.end(t);
+    if (Math.abs(t - 4.1) < 1e-6) bed.end(t); // duplicate stop: must no-op
+    bed.update(t);
+  }
+  bed.dispose();
 }
 
 /** Every renderable case. Names are what appear in the report and the plots. */
@@ -272,7 +321,9 @@ export const CASES: Record<string, Case> = {
   pump_ticks: {
     seconds: 6.0,
     build: (_c, kit, out) => {
-      // Exactly the scheduler in AudioSystem.updateTicks, at 4 ticks/second.
+      // Exactly the jittered metre scheduler that PumpSoundBed.update runs,
+      // driven directly here at 4 ticks/second so the timing stats stay
+      // independent of the bed's state machine.
       const rnd = makeRng(53);
       const period = 1 / 4;
       let t = 0.05;
@@ -289,6 +340,41 @@ export const CASES: Record<string, Case> = {
       // to be able to tell these two apart, otherwise it proves nothing.
       const rnd = makeRng(53);
       for (let t = 0.05; t < 5.9; t += 0.25) playPumpTick(kit, out, t, rnd, 0.9);
+    },
+  },
+  pump_bed_bay0: {
+    seconds: 6.0,
+    channels: 2,
+    build: (c, kit, out) => {
+      pumpBedScenario(c, kit, out, 0);
+    },
+  },
+  pump_bed_bay1: {
+    seconds: 6.0,
+    channels: 2,
+    build: (c, kit, out) => {
+      pumpBedScenario(c, kit, out, 1);
+    },
+  },
+  pump_bed_ratechange: {
+    seconds: 6.0,
+    channels: 1,
+    build: (_c, kit, out) => {
+      // One bay, one transaction, two flow-rate changes. The metre must follow
+      // each new rate without any onset left over from the previous tempo.
+      const bed = new PumpSoundBed(kit, [out], makeRng(57));
+      bed.start(0);
+      // Events before the sweep, as in the real frame: a rate change has to
+      // revoke the look-ahead schedule before the sweep rebuilds it.
+      for (let t = 0; t < 6.0; t += 0.05) {
+        if (Math.abs(t - 0.05) < 1e-6) bed.begin(0, t);
+        if (Math.abs(t - 0.1) < 1e-6) bed.setTickRate(3, t);
+        if (Math.abs(t - 2.0) < 1e-6) bed.setTickRate(8, t);
+        if (Math.abs(t - 4.0) < 1e-6) bed.setTickRate(2, t);
+        if (Math.abs(t - 5.0) < 1e-6) bed.end(t);
+        bed.update(t);
+      }
+      bed.dispose();
     },
   },
   bird: {
@@ -349,6 +435,12 @@ export interface RenderResult {
   /** Mono (channel-averaged) samples, base64 little-endian Float32. */
   b64: string;
   /**
+   * Per-channel samples, base64 little-endian Float32, one entry per channel.
+   * Lets the node-side analysis distinguish point sources that were rendered
+   * into separate buses (the pump bays) after the mono downmix.
+   */
+  channelsB64: string[];
+  /**
    * Largest absolute sample across *any* channel, before the downmix. The
    * clipping check has to see this rather than the average, which can hide a
    * hot channel.
@@ -357,7 +449,7 @@ export interface RenderResult {
   channels: number;
 }
 
-export async function renderCase(name: string): Promise<{ data: Float32Array; peak: number; channels: number }> {
+export async function renderCase(name: string): Promise<{ data: Float32Array; peak: number; channels: number; perChannel: Float32Array[] }> {
   const spec = CASES[name];
   if (!spec) throw new Error(`no such audio case: ${name}`);
   const channels = spec.channels ?? 1;
@@ -370,28 +462,33 @@ export async function renderCase(name: string): Promise<{ data: Float32Array; pe
 
   const n = buf.length;
   const data = new Float32Array(n);
+  const perChannel: Float32Array[] = [];
   let peak = 0;
   for (let c = 0; c < buf.numberOfChannels; c++) {
     const ch = buf.getChannelData(c);
+    perChannel.push(new Float32Array(ch));
     for (let i = 0; i < n; i++) {
       data[i] += ch[i] / buf.numberOfChannels;
       const a = Math.abs(ch[i]);
       if (a > peak) peak = a;
     }
   }
-  return { data, peak, channels: buf.numberOfChannels };
+  return { data, peak, channels: buf.numberOfChannels, perChannel };
 }
 
 /** Raw little-endian Float32 samples plus the true peak, for transport to node. */
 export async function renderCaseBase64(name: string): Promise<RenderResult> {
-  const { data, peak, channels } = await renderCase(name);
-  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  let s = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return { b64: btoa(s), peak, channels };
+  const { data, peak, channels, perChannel } = await renderCase(name);
+  const encode = (arr: Float32Array) => {
+    const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+    let s = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(s);
+  };
+  return { b64: encode(data), channelsB64: perChannel.map(encode), peak, channels };
 }
 
 declare global {

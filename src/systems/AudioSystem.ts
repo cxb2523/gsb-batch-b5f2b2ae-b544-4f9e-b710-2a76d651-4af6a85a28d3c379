@@ -2,7 +2,7 @@ import * as THREE from "three";
 import type { GameSystem, SystemContext } from "../core/types";
 import { BUILDING, FORECOURT, ISLANDS, ROAD } from "../site";
 import type { BuildingAudioInfo, BuildingFootprint, StationAudio } from "../audio/api";
-import { CoolerUnit, FluorescentBuzz, HighwayWash, PumpMotor } from "../audio/beds";
+import { CoolerUnit, FluorescentBuzz, HighwayWash, PumpSoundBed } from "../audio/beds";
 import { clamp, clamp01, gainNode, lerp, makeRng } from "../audio/dsp";
 import { Emitter } from "../audio/emitter";
 import { AudioKit } from "../audio/kit";
@@ -15,8 +15,6 @@ import {
   playDoorOpen,
   playFridgeClose,
   playFridgeOpen,
-  playPumpClunk,
-  playPumpTick,
   playTruckPass,
   type Rand,
   type VehicleVoice,
@@ -87,7 +85,8 @@ export class AudioSystem implements GameSystem {
   private cooler: CoolerUnit | null = null;
   private coolerEmitter: Emitter | null = null;
   private fluorescents: FluorescentBuzz[] = [];
-  private pumpMotor: PumpMotor | null = null;
+  /** One motor and one metre, routed to whichever bay the last start named. */
+  private pumpBed: PumpSoundBed | null = null;
   private pumpEmitters: Emitter[] = [];
   private doorEmitter: Emitter | null = null;
   private birdEmitter: Emitter | null = null;
@@ -104,9 +103,6 @@ export class AudioSystem implements GameSystem {
   private nextBird = 0;
   private coolerRunning = true;
   private coolerUntil = 0;
-  private tickRate = 0;
-  private nextTick = 0;
-  private pumpBay = 0;
   private occlusionAccum = 0;
 
   init(sysCtx: SystemContext): void {
@@ -194,7 +190,7 @@ export class AudioSystem implements GameSystem {
     for (const h of this.highway) h.start(t0);
     for (const f of this.fluorescents) f.start(t0);
     this.cooler?.start(t0);
-    this.pumpMotor?.start(t0);
+    this.pumpBed?.start(t0);
 
     // Start the compressor already running, part-way through its cycle, so
     // the first thing the player hears is not a switch-on.
@@ -269,8 +265,8 @@ export class AudioSystem implements GameSystem {
     }
 
     // One motor bed, moved to whichever bay System 7 says is in use. Two
-    // motors could never both run, so one is enough.
-    this.pumpMotor = new PumpMotor(kit, 1);
+    // motors could never both run, so one is enough; the bed itself owns the
+    // connect/disconnect so a new start can never be heard from two bays.
     for (const island of ISLANDS) {
       for (const dx of [-2.7, 2.7]) {
         const e = this.makeEmitter("exterior", 2.2, 1.3, 0.4, 90, 0.4);
@@ -278,7 +274,11 @@ export class AudioSystem implements GameSystem {
         this.pumpEmitters.push(e);
       }
     }
-    this.pumpMotor.out.connect(this.pumpEmitters[0].input);
+    this.pumpBed = new PumpSoundBed(
+      kit,
+      this.pumpEmitters.map((e) => e.input),
+      this.rnd
+    );
 
     const dp = this.building.doorPosition ?? this.doorWorldPosition() ?? DEFAULT_DOOR;
     this.doorEmitter = this.makeEmitter("exterior", 1.6, 1.4, 0.75, 60, 0.45);
@@ -361,7 +361,7 @@ export class AudioSystem implements GameSystem {
     this.updateVehicles(now);
     this.updateCooler(now);
     this.updateBirds(now);
-    this.updateTicks(now);
+    this.pumpBed?.update(now);
   }
 
   /**
@@ -537,20 +537,6 @@ export class AudioSystem implements GameSystem {
     playBird(this.kit!, this.birdEmitter.input, now + 0.03, this.rnd, 0.5);
   }
 
-  private updateTicks(now: number): void {
-    if (this.tickRate <= 0) return;
-    const period = 1 / this.tickRate;
-    // Schedule slightly ahead so the tick lands on a sample-accurate time
-    // rather than on whenever the render loop happened to come round.
-    while (this.nextTick < now + 0.12) {
-      if (this.nextTick < now) this.nextTick = now + 0.02;
-      playPumpTick(this.kit!, this.pumpEmitters[this.pumpBay].input, this.nextTick, this.rnd, 0.5);
-      // Jitter both ways: a mechanical counter is driven by fuel flow, and
-      // fuel flow is not a clock.
-      this.nextTick += period * (0.86 + this.rnd() * 0.28);
-    }
-  }
-
   /* ------------------------------------------------------------------ */
   /* public interface                                                    */
   /* ------------------------------------------------------------------ */
@@ -563,38 +549,25 @@ export class AudioSystem implements GameSystem {
       },
 
       playPumpStart(pumpIndex = 0) {
-        if (!self.ready || !self.pumpMotor) return;
-        const bay = clamp(Math.round(pumpIndex), 0, self.pumpEmitters.length - 1);
-        if (bay !== self.pumpBay) {
-          try {
-            self.pumpMotor.out.disconnect();
-          } catch {
-            /* not connected */
-          }
-          self.pumpMotor.out.connect(self.pumpEmitters[bay].input);
-          self.pumpBay = bay;
-        }
-        const now = self.listener!.context.currentTime + 0.02;
-        playPumpClunk(self.kit!, self.pumpEmitters[bay].input, now, self.rnd, 0.5);
-        self.pumpMotor.spinUp(now + 0.09);
+        // No graph before the first gesture: the call is a silent no-op, never
+        // a throw. Interaction replays the event once the context unlocks.
+        if (!self.ready || !self.pumpBed || !self.listener) return;
+        const now = self.listener.context.currentTime + 0.02;
+        self.pumpBed.begin(pumpIndex, now);
       },
 
       setPumpTickRate(ticksPerSecond: number) {
-        // Clamped: the scheduler fills a look-ahead window, so an accidental
-        // rate of 10000 would build ten thousand voices in one frame.
-        const r = clamp(ticksPerSecond, 0, 40);
-        if (self.tickRate <= 0 && r > 0 && self.listener) {
-          self.nextTick = self.listener.context.currentTime + 0.05;
-        }
-        self.tickRate = r;
+        if (!self.ready || !self.pumpBed || !self.listener) return;
+        // The bed clamps and revokes the old schedule on every real change.
+        self.pumpBed.setTickRate(ticksPerSecond, self.listener.context.currentTime);
       },
 
       playPumpStop() {
-        if (!self.ready || !self.pumpMotor) return;
-        self.tickRate = 0;
-        const now = self.listener!.context.currentTime + 0.02;
-        self.pumpMotor.spinDown(now);
-        playPumpClunk(self.kit!, self.pumpEmitters[self.pumpBay].input, now + 0.16, self.rnd, 0.38);
+        if (!self.ready || !self.pumpBed || !self.listener) return;
+        const now = self.listener.context.currentTime + 0.02;
+        // Idempotent inside the bed: a repeated stop, or a stop with no
+        // transaction, simply does nothing and cannot throw.
+        self.pumpBed.end(now);
       },
 
       playDoorOpen() {
@@ -663,7 +636,7 @@ export class AudioSystem implements GameSystem {
     for (const h of this.highway) h.dispose();
     for (const f of this.fluorescents) f.dispose();
     this.cooler?.dispose();
-    this.pumpMotor?.dispose();
+    this.pumpBed?.dispose();
     for (const e of this.allEmitters) e.dispose();
     this.allEmitters.length = 0;
 

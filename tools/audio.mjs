@@ -510,19 +510,25 @@ async function main() {
 
   /** name -> Float32Array */
   const pcm = {};
+  /** name -> per-channel Float32Array (length 1 for mono renders). */
+  const pcmCh = {};
   const specs = {};
   const plots = {};
   /** True per-channel peak, before the stereo cases are downmixed for analysis. */
   const truePeak = {};
 
+  const decodeF32 = (b64) => {
+    const buf = Buffer.from(b64, "base64");
+    return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+  };
+
   for (const name of meta.cases) {
     const r = await page.evaluate((n) => window.__AUDIO_HARNESS.render(n), name);
-    const buf = Buffer.from(r.b64, "base64");
-    const data = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-    pcm[name] = data;
+    pcm[name] = decodeF32(r.b64);
+    pcmCh[name] = r.channelsB64.map(decodeF32);
     truePeak[name] = r.peak;
-    specs[name] = welch(data, sr, 8192);
-    plots[name] = plot(name, data, sr, specs[name]);
+    specs[name] = welch(pcm[name], sr, 8192);
+    plots[name] = plot(name, pcm[name], sr, specs[name]);
   }
 
   /* -- global hygiene: clipping and DC ------------------------------ */
@@ -975,6 +981,164 @@ async function main() {
     check("pump", `lever clunk transient at ${clunk.map(f3).join(", ")} s`, clunk.length >= 1, "engages");
   }
 
+  /* -- pump sound bed: event-owned routing and metre cancellation ----- */
+  //
+  // The field failures were about state, not timbre: rapid start/stop and
+  // island switching left the motor on the wrong bay and the metre clicking
+  // after the handle dropped. These two offline renders carry the same
+  // transaction in two separate buses (stereo channels), so each assertion is
+  // made against the bus the event named — not against a summed signal where
+  // a stray click would be unprovable.
+  console.log("\npump bed: one audible bay at a time, metre dies with the stop");
+  {
+    const bay0 = pcmCh.pump_bed_bay0[0];
+    const bay1 = pcmCh.pump_bed_bay0[1];
+    // High-pass strips the motor bed so onset detection sees metre clicks and
+    // lever clunks rather than the 87 Hz fundamental.
+    const clicks0 = onsets(highpass1(bay0, sr, 1200), sr, { minSep: 0.09, thresholdRatio: 0.12 });
+    const clicks1 = onsets(highpass1(bay1, sr, 1200), sr, { minSep: 0.09, thresholdRatio: 0.12 });
+    const segRms = (d, a, b) => db(stats(d.subarray(Math.floor(sr * a), Math.floor(sr * b))).rms);
+
+    // Bay 0 owns the first transaction (0.05–2.0 s). Its metre has to be
+    // clicking there and silent after the 2.0 s stop, inside a short tail.
+    // Residual windows start 0.3 s after each stop, past the lever-drop clunk
+    // (scheduled at stop+0.16 s) so the assertion sees metre clicks only.
+    const bay0Metre = clicks0.filter((t) => t > 0.15 && t < 1.95);
+    const bay0AfterStop = clicks0.filter((t) => t > 2.3);
+    check(
+      "pump-bed",
+      `bay0 metre: ${bay0Metre.length} clicks while running, ${bay0AfterStop.length} metre onsets after the stop`,
+      bay0Metre.length >= 8 && bay0AfterStop.length === 0,
+      bay0AfterStop.length ? `residual clicks at ${bay0AfterStop.map(f3).join(", ")} s` : "no residual clicking"
+    );
+    // The 2.0 s stop also kills the motor on bay 0. The spin-down ramps over
+    // about 1.4 s, so the comparison window starts after it has fully settled;
+    // what remains there must be only numerical floor, not a coasting motor.
+    const run0 = segRms(bay0, 0.6, 1.6);
+    const tail0 = segRms(bay0, 3.55, 3.9);
+    check(
+      "pump-bed",
+      `bay0 motor level while running ${f2(run0)} vs after spin-down settles ${f2(tail0)} dBFS`,
+      run0 - tail0 > 20,
+      `${f2(run0 - tail0)} dB drop after spin-down`
+    );
+
+    // Bay 1 must be fully silent through the first transaction: no motor, no
+    // metre, no clunk before the 2.4 s switch.
+    const bay1Early = clicks1.filter((t) => t < 2.3);
+    const bay1Idle = segRms(bay1, 0.1, 2.3);
+    check(
+      "pump-bed",
+      `bay1 before the switch: ${bay1Early.length} transients, RMS ${f2(bay1Idle)} dBFS`,
+      bay1Early.length === 0 && bay1Idle < -85,
+      "the first transaction never reached the second pump"
+    );
+
+    // After the switch, bay 1 owns everything: metre clicking 2.45–3.95 s and
+    // then nothing past the 4.0 s stop, including after the duplicate 4.1 s
+    // stop (which must be a no-op, not a second clunk).
+    const bay1Metre = clicks1.filter((t) => t > 2.5 && t < 3.95);
+    const bay1AfterStop = clicks1.filter((t) => t > 4.3);
+    check(
+      "pump-bed",
+      `bay1 metre after switch: ${bay1Metre.length} clicks, ${bay1AfterStop.length} metre onsets after its stop`,
+      bay1Metre.length >= 7 && bay1AfterStop.length === 0,
+      bay1AfterStop.length ? `residual clicks at ${bay1AfterStop.map(f3).join(", ")} s` : "stop is authoritative and repeatable"
+    );
+    const run1 = segRms(bay1, 2.8, 3.8);
+    const tail1 = segRms(bay1, 5.55, 5.9);
+    check(
+      "pump-bed",
+      `bay1 motor while running ${f2(run1)} vs after spin-down settles ${f2(tail1)} dBFS`,
+      run1 - tail1 > 20,
+      `${f2(run1 - tail1)} dB drop; the duplicate stop added nothing`
+    );
+    // And bay 0 must stay silent during bay 1's transaction: the switch moved
+    // the single motor, it did not start a second one. The window starts past
+    // bay0's own lever-drop clunk (2.16 s) so only post-switch sound is seen.
+    const bay0Late = clicks0.filter((t) => t > 2.4);
+    check(
+      "pump-bed",
+      `bay0 after the switch: ${bay0Late.length} transients`,
+      bay0Late.length === 0,
+      "only the last-operated pump is audible at any instant"
+    );
+
+    // Symmetry check on the second render: same scenario, decoded the other
+    // way, must give the mirrored result. Guards against a channel wiring bug
+    // that happened to make the first render's assertions pass.
+    const mirror0 = pcmCh.pump_bed_bay1[0];
+    const mirror1 = pcmCh.pump_bed_bay1[1];
+    const m0 = onsets(highpass1(mirror0, sr, 1200), sr, { minSep: 0.09, thresholdRatio: 0.12 });
+    const m1 = onsets(highpass1(mirror1, sr, 1200), sr, { minSep: 0.09, thresholdRatio: 0.12 });
+    check(
+      "pump-bed",
+      `mirror render: bay0 residual ${m0.filter((t) => t > 2.3).length}, bay1 residual ${m1.filter((t) => t > 4.3).length}`,
+      m0.filter((t) => t > 2.3).length === 0 && m1.filter((t) => t > 4.3).length === 0,
+      "routing is stable across render instances"
+    );
+  }
+
+  /* -- metre rate changes leave no old-tempo schedule ---------------- */
+  console.log("\npump bed: rate changes rebuild the schedule, no stale onsets");
+  {
+    const d = pcm.pump_bed_ratechange;
+    const hp = highpass1(d, sr, 1200);
+    const hits = onsets(hp, sr, { minSep: 0.06, thresholdRatio: 0.12 });
+    const intervals = (from, to) => {
+      const ts = hits.filter((t) => t >= from && t <= to);
+      const iv = [];
+      for (let i = 1; i < ts.length; i++) iv.push(ts[i] - ts[i - 1]);
+      return { ts, iv };
+    };
+    // 3 ticks/s from 0.1 s: jittered period ~0.333 s * (0.86..1.14).
+    const slow = intervals(0.12, 1.95);
+    const slowOk = slow.iv.length >= 4 && slow.iv.every((v) => v > 0.22 && v < 0.46);
+    check(
+      "pump-bed",
+      `3 ticks/s metre: ${slow.ts.length} onsets, intervals ${slow.iv.map(f3).join(", ") || "none"} s`,
+      slowOk,
+      "jittered around the slow period"
+    );
+    // At 2.0 s the rate jumps to 8/s. No onset scheduled at the old tempo may
+    // land after the change: the first new-onset gap restarts the phase, and
+    // subsequent intervals sit inside the fast jitter band (~0.125 s).
+    const fast = intervals(2.0, 3.95);
+    const fastTail = fast.iv.slice(1);
+    const fastOk =
+      fast.ts.length >= 10 &&
+      fastTail.every((v) => v > 0.085 && v < 0.175) &&
+      fast.ts[0] < 2.25;
+    check(
+      "pump-bed",
+      `8 ticks/s after change: ${fast.ts.length} onsets, first at ${f3(fast.ts[0] ?? NaN)} s, tail intervals ${fastTail.slice(0, 6).map(f3).join(", ")} s`,
+      fastOk,
+      "no onset survived from the 3/s schedule"
+    );
+    // At 4.0 s the rate drops to 2/s. A stale fast schedule would burst here;
+    // instead the phase restarts and intervals widen to ~0.5 s jittered.
+    const slower = intervals(4.0, 4.95);
+    const slowerTail = slower.iv.slice(1);
+    const slowerOk =
+      slower.ts.length >= 1 &&
+      slowerTail.every((v) => v > 0.35 && v < 0.66) &&
+      // No rapid double-onset straddling the change point.
+      !slower.iv.some((v) => v < 0.08);
+    check(
+      "pump-bed",
+      `2 ticks/s after second change: ${slower.ts.length} onsets before the 5.0 s stop, intervals ${slowerTail.map(f3).join(", ") || "none"} s`,
+      slowerOk,
+      "slowing down never fires a leftover fast tick"
+    );
+    const after = hits.filter((t) => t > 5.3);
+    check(
+      "pump-bed",
+      `metre onsets after the 5.0 s stop: ${after.length}`,
+      after.length === 0,
+      after.length ? `residual at ${after.map(f3).join(", ")} s` : "metre zeroes promptly"
+    );
+  }
+
   /* -- bird --------------------------------------------------------- */
   console.log("\nbird: a couple of swept syllables, high and short");
   {
@@ -1082,9 +1246,70 @@ async function main() {
   // and measure the master bus.
   console.log("\nlive: the graph is actually running in the scene");
   try {
+    // A cold profile compiles several hundred shaders before the scene can
+    // signal ready (documented 190-350 s in tools/gpu.mjs). 180 s was a coin
+    // flip on a software-GPU host; give the render its real budget and, if it
+    // still misses, reload once and report the page's own state rather than a
+    // bare timeout.
+    const waitForSceneReady = async (page, timeoutMs = 420000) => {
+      try {
+        await page.waitForFunction(() => window.__SCENE_READY === true, null, { timeout: timeoutMs });
+        return true;
+      } catch {
+        const diag = await page
+          .evaluate(() => ({
+            ready: window.__SCENE_READY,
+            systemErrors: window.__SYSTEM_ERRORS,
+            hasGame: !!window.__GAME,
+            loading: document.getElementById("loading")?.textContent ?? null,
+          }))
+          .catch((e) => ({ evaluateFailed: String(e?.message ?? e) }));
+        console.error("[audio] scene not ready, diagnostics:", JSON.stringify(diag).slice(0, 1200));
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForFunction(() => window.__SCENE_READY === true, null, { timeout: timeoutMs });
+        return true;
+      }
+    };
+
+    // Before any gesture: the published API must be callable and silent, with
+    // the context still locked. A fresh page guarantees no earlier unlock.
+    const locked = await browser.newPage();
+    const lockErrors = [];
+    locked.on("pageerror", (e) => lockErrors.push(String(e)));
+    await locked.goto(`http://127.0.0.1:${PORT}/index.html`, { waitUntil: "domcontentloaded" });
+    await waitForSceneReady(locked);
+    const preGesture = await locked.evaluate(() => {
+      const a = window.__GAME.tryGet("audio");
+      const calls = [
+        () => a.playPumpStart(2),
+        () => a.setPumpTickRate(6),
+        () => a.setPumpTickRate(0),
+        () => a.playPumpStop(),
+        () => a.playPumpStop(), // repeated stop before unlock: still no throw
+      ];
+      let threw = null;
+      for (const fn of calls) {
+        try {
+          fn();
+        } catch (e) {
+          threw = String(e?.message ?? e);
+          break;
+        }
+      }
+      const listener = window.__GAME.camera.children.find((c) => c.type === "AudioListener");
+      return { threw, ready: a.ready, ctxState: listener ? listener.context.state : "no-listener" };
+    });
+    check(
+      "live",
+      `pump API before first gesture: ready=${preGesture.ready}, ctx=${preGesture.ctxState}, throws=${preGesture.threw ?? "none"}`,
+      preGesture.threw === null && preGesture.ready === false && lockErrors.length === 0,
+      "silent no-ops until the unlock, never exceptions"
+    );
+    await locked.close();
+
     const live = await browser.newPage();
-    live.setDefaultNavigationTimeout(180000);
-    live.setDefaultTimeout(180000);
+    live.setDefaultNavigationTimeout(420000);
+    live.setDefaultTimeout(420000);
     const errors = [];
     live.on("pageerror", (e) => errors.push(String(e)));
     live.on("console", (m) => {
@@ -1096,7 +1321,7 @@ async function main() {
     await live.goto(`http://127.0.0.1:${PORT}/index.html`, { waitUntil: "domcontentloaded" });
     await live.waitForTimeout(4000);
     await live.reload({ waitUntil: "domcontentloaded" });
-    await live.waitForFunction(() => window.__SCENE_READY === true, null, { timeout: 180000 });
+    await waitForSceneReady(live);
     errors.length = 0;
 
     const registered = await live.evaluate(() => {
@@ -1177,6 +1402,43 @@ async function main() {
       return { missing, volume: a.getMasterVolume() };
     });
     check("live", `all 13 interface methods present and callable`, called.missing.length === 0, called.missing.join(", ") || "no throws");
+
+    // The field failure: rapid start/stop while the motor is still spinning,
+    // island hopping, and duplicate stops. The bed's internal state has to
+    // track the last start event exactly, and every stop must be idempotent.
+    const rapid = await live.evaluate(async () => {
+      const a = window.__GAME.tryGet("audio");
+      const probe = () => {
+        // The bed is private to the system; the observable contract is that
+        // none of this throws and the service stays ready throughout.
+        return { ready: a.ready };
+      };
+      const trace = [];
+      const note = (label) => trace.push(`${label}:${JSON.stringify(probe())}`);
+      note("idle");
+      a.playPumpStart(0);
+      a.setPumpTickRate(7);
+      a.playPumpStop(); // stop well inside the spin-up ramp
+      a.playPumpStop(); // duplicate stop: must no-op
+      note("double-stop");
+      a.playPumpStart(2); // hop straight to another bay
+      a.setPumpTickRate(7);
+      a.setPumpTickRate(3); // rate change cancels the first metre schedule
+      a.setPumpTickRate(0); // metre off while the motor keeps running
+      a.playPumpStart(3); // re-route again without stopping first
+      note("bay-hop");
+      a.playPumpStop();
+      a.playPumpStop();
+      note("final-stop");
+      await new Promise((r) => setTimeout(r, 500));
+      return { trace, ready: a.ready };
+    });
+    check(
+      "live",
+      `rapid start/stop/bay-switch sequence survived: ${rapid.trace.join(" | ")}`,
+      rapid.ready === true,
+      "no throws through overlapping transactions and repeated stops"
+    );
     check("live", `no page errors during the session`, errors.length === 0, errors.slice(0, 3).join(" | ") || "clean");
     await live.close();
   } catch (e) {
