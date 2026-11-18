@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef, type RefObject } from "react";
 import { useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { MASK_BASE_RADIUS, MASK_PLOT_INSET, MASK_HARMONICS, maskPhases } from "../terrain";
@@ -83,6 +83,46 @@ import { coastWobbleGlsl } from "./townCoast";
  * runs when a frame is already being rendered and has no way to ask for the
  * next one. `App.tsx`'s `useWindowFocused` remains the only thing that
  * chooses `"always"`, and only while the window is genuinely focused.
+ *
+ * ## One material per (mode, palette) — never one per island
+ *
+ * A previous version built a `ShaderMaterial` per island: 152 islands meant
+ * 152 copies of the same uniforms, the same shader source, and 152 material
+ * objects for three.js to track — all so that each island could hold its own
+ * `uPhases`/`uHalf`. That also made the palette a construction-time input,
+ * which is why switching to night used to replace every material wholesale
+ * (rebuilding the shader program's parameter set, re-cloning fog uniforms,
+ * and re-tracking 152 GPU resources on every ⇧M).
+ *
+ * The material is now keyed by (mode, palette) and shared: in a scene there
+ * is ONE open-sea material, ONE material for all island shelves, and ONE for
+ * the town's shelf. The per-island values that genuinely differ —
+ * `uPhases`, `uHalf`, `uQuadHalf`, and the town's shelf geometry — are
+ * written at DRAW TIME from each mesh's `onBeforeRender`, immediately before
+ * three.js binds the material for that mesh (see `applyIslandUniforms` /
+ * `applyTownUniforms`). The uniforms live on the shared material (three.js
+ * uploads `material.uniforms` itself, not a per-object copy), so each draw
+ * writes its own values and forces them through with
+ * `material.uniformsNeedUpdate`; nothing else about the material changes.
+ *
+ * Palette is part of the key, so a mood switch acquires a NEW shared
+ * material per mode (all six colour uniforms — deep/mid/shallow/sandy/foam/
+ * glint — rebuilt from the new palette, so foam, caustics and the surf line
+ * inherit it too), while every already-mounted open-sea/island/town mesh
+ * simply re-renders against that new material on the next frame. No geometry
+ * is rebuilt and no coastline phase is recomputed or lost: the same
+ * `maskPhases(seed)` and the same `width`/`depth` are re-applied to the new
+ * material by the exact same `onBeforeRender`.
+ *
+ * Because materials are shared, ownership is reference-counted
+ * (`acquireWaterMaterial` returns a lease whose `retain`/`release` are paired
+ * from a layout effect): an island unmounting decrements the count and only
+ * the LAST user of a material disposes it. `useDisposableMemo` still owns
+ * the lease's lifetime, so a replaced palette's lease is dropped at exactly
+ * the moment that hook would dispose a per-island material — but because the
+ * release is refcounted, the predecessor material is freed only once the
+ * last mesh has let go, never while a sibling island is still drawing with
+ * it.
  */
 
 // ---------------------------------------------------------------------
@@ -425,6 +465,10 @@ export type WaterColors = {
 export const SUN_OFFSET = new THREE.Vector3(1.3, 0.95, 1.4);
 export const SUN_DIRECTION = SUN_OFFSET.clone().normalize();
 
+// ---------------------------------------------------------------------
+// The material itself, and why it is shared.
+// ---------------------------------------------------------------------
+
 function makeWaterMaterial(colors: WaterColors, mode: number): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
@@ -458,9 +502,219 @@ function makeWaterMaterial(colors: WaterColors, mode: number): THREE.ShaderMater
   });
 }
 
+/** The identity of a shared material: every mode's shelf is a different
+ * shape, and every palette is a different set of six colours. Two callers
+ * asking for the same pair must get the same material; the palette is part
+ * of the key so a mood switch can never silently keep drawing last mood's
+ * foam or caustics. */
+export function waterMaterialKey(colors: WaterColors, mode: number): string {
+  return [mode, colors.deep, colors.mid, colors.shallow, colors.sandy, colors.foam, colors.glint].join("\u0000");
+}
+
+/** A shared material plus the bookkeeping that keeps it alive while any mesh
+ * still draws with it.
+ *
+ * `dispose()` is required because the lease is the value `useDisposableMemo`
+ * owns and may replace/unmount (that is how the material's lifetime follows
+ * the resource-hygiene hook). It is deliberately a NO-OP on the material:
+ * the actual refcount is `retain`/`release`, called in pairs from a layout
+ * effect. Doing the release here too would double-release a material shared
+ * by sibling islands, and a `useMemo`-factory acquire would leak a reference
+ * under React's development-only StrictMode double-invoke. */
+export type WaterMaterialLease = {
+  readonly material: THREE.ShaderMaterial;
+  retain(): void;
+  release(): void;
+  dispose(): void;
+};
+
+type SharedEntry = {
+  material: THREE.ShaderMaterial;
+  /** How many live meshes are drawing with this material right now. */
+  refs: number;
+  /** True between a release-to-zero and the deferred disposal running. It
+   * exists so a StrictMode setup→cleanup→setup replay (synchronous, no await)
+   * cannot dispose a material the second setup is about to retain again. */
+  disposeScheduled: boolean;
+  lease: WaterMaterialLease;
+};
+
+/**
+ * Every water material currently alive, keyed by `waterMaterialKey`. This is
+ * a module-level cache on purpose: sharing is a property of the material,
+ * not of any one mesh, so the 152nd island's shelf must find the material the
+ * first one built. Entries are created on demand and removed by the LAST
+ * holder (`release`), never by whichever island happened to unmount first.
+ *
+ * One assumption this module makes: only ONE water-bearing `<Canvas>` is
+ * mounted at a time. `App.tsx` switches between the sea and a town as a hard
+ * swap (never both), and `townshot.tsx` renders one view; a single
+ * `ShaderMaterial` cannot be correctly driven by two renderers at once, so if
+ * that ever changes, the cache must become per-canvas (e.g. keyed by the r3f
+ * store) rather than module-global.
+ */
+const sharedWaterMaterials = new Map<string, SharedEntry>();
+
+/** Runs `fn` after the current synchronous commit. A microtask is enough:
+ * layout effects (which retain) all run synchronously before it fires, so a
+ * still-live material is never disposed, while a genuinely orphaned one is
+ * cleaned up a tick later. */
+function deferDispose(fn: () => void): void {
+  if (typeof queueMicrotask === "function") queueMicrotask(fn);
+  else Promise.resolve().then(fn);
+}
+
+function disposeEntryWhenUnused(key: string, entry: SharedEntry): void {
+  if (entry.refs > 0 || entry.disposeScheduled) return;
+  entry.disposeScheduled = true;
+  deferDispose(() => {
+    // This callback is now consumed; clear the flag unconditionally. If the
+    // entry survived (see below), a FUTURE release must be able to arm a
+    // fresh disposal — leaving the flag set would strand the material.
+    entry.disposeScheduled = false;
+    // Someone retained it again (StrictMode replay, or a sibling still live):
+    // its later release re-arms this, so leave the entry alone. Layout-effect
+    // retains run synchronously within the commit, before this microtask
+    // fires, so this check alone is what protects a re-acquired material —
+    // no generation counter is needed.
+    if (entry.refs > 0) return;
+    if (sharedWaterMaterials.get(key) === entry) sharedWaterMaterials.delete(key);
+    entry.material.dispose();
+  });
+}
+
+/** The shared lease for (mode, palette), creating the material the first time.
+ * Idempotent and refcount-free: calling it twice for the same key (React
+ * StrictMode does exactly that to a `useMemo` factory) returns the one lease
+ * and creates at most one material. The refcount lives in the paired effect
+ * (`useSharedWaterMaterial`), which React replays setup/cleanup/setup
+ * symmetrically. */
+export function acquireWaterMaterial(colors: WaterColors, mode: number): WaterMaterialLease {
+  const key = waterMaterialKey(colors, mode);
+  const existing = sharedWaterMaterials.get(key);
+  if (existing) {
+    // A prior holder may have released to zero with disposal queued. This
+    // acquisition takes the entry over: clear the flag before its layout
+    // effect retains. (Even without this clear, the queued callback's own
+    // `refs > 0` check would spare it — belt and braces for readability.)
+    existing.disposeScheduled = false;
+    return existing.lease;
+  }
+
+  const entry = { material: makeWaterMaterial(colors, mode), refs: 0, disposeScheduled: false } as SharedEntry;
+  entry.lease = {
+    material: entry.material,
+    retain() {
+      entry.refs += 1;
+    },
+    release() {
+      entry.refs = Math.max(0, entry.refs - 1);
+      disposeEntryWhenUnused(key, entry);
+    },
+    dispose() {
+      // No-op by design — see `WaterMaterialLease`'s own comment. The layout
+      // effect paired with this lease is what releases it; `useDisposableMemo`
+      // only decides when this lease stops being the current one.
+    },
+  };
+  sharedWaterMaterials.set(key, entry);
+  return entry.lease;
+}
+
+/** Test/observability hook: how many distinct shared water materials exist. */
+export function sharedWaterMaterialCount(): number {
+  return sharedWaterMaterials.size;
+}
+
+/** How many live meshes are drawing with the material for this pair. */
+export function waterMaterialRefs(colors: WaterColors, mode: number): number {
+  return sharedWaterMaterials.get(waterMaterialKey(colors, mode))?.refs ?? 0;
+}
+
+/**
+ * Write one island's own coastline parameters onto the SHARED island
+ * material, immediately before that island's mesh is drawn.
+ *
+ * A shared material holds one set of uniform values. Two islands draw with
+ * the same material in the same frame, so each has to stake its own values
+ * onto it just before its own draw — which is exactly what three.js calls
+ * `mesh.onBeforeRender` for. `uniformsNeedUpdate` then forces those values up
+ * to the GPU even though three.js would otherwise skip re-uploading a
+ * material it has already bound earlier in the same frame.
+ *
+ * `phases` and the half-extents come straight from `maskPhases(seed)` and the
+ * island's real `width`/`depth`, so sharing a material across palettes and
+ * islands can never blur one island's coastline into another's.
+ */
+export function applyIslandUniforms(
+  material: THREE.ShaderMaterial,
+  phases: readonly [number, number, number],
+  halfWidth: number,
+  halfDepth: number,
+  quadHalfWidth: number,
+  quadHalfDepth: number,
+): void {
+  (material.uniforms.uPhases.value as THREE.Vector3).set(phases[0], phases[1], phases[2]);
+  (material.uniforms.uHalf.value as THREE.Vector2).set(halfWidth, halfDepth);
+  (material.uniforms.uQuadHalf.value as THREE.Vector2).set(quadHalfWidth, quadHalfDepth);
+  material.uniformsNeedUpdate = true;
+}
+
+/** The town equivalent of `applyIslandUniforms`: the same per-draw stake, for
+ * `MODE_RECT`'s rectangular footprint and (optional) coast. */
+export function applyTownUniforms(
+  material: THREE.ShaderMaterial,
+  halfWidth: number,
+  halfDepth: number,
+  quadHalfWidth: number,
+  quadHalfDepth: number,
+  shelfWidth: number,
+  coast: number,
+  coastT: number,
+): void {
+  (material.uniforms.uHalf.value as THREE.Vector2).set(halfWidth, halfDepth);
+  (material.uniforms.uQuadHalf.value as THREE.Vector2).set(quadHalfWidth, quadHalfDepth);
+  material.uniforms.uShelfWidth.value = shelfWidth;
+  material.uniforms.uCoast.value = coast;
+  material.uniforms.uCoastT.value = coastT;
+  material.uniformsNeedUpdate = true;
+}
+
+/**
+ * The shared material for (mode, palette), acquired through
+ * `useDisposableMemo` so the lease is replaced when the palette (or mode)
+ * genuinely changes and dropped on unmount — and retained/released from a
+ * paired effect so the underlying material outlives any one island and is
+ * only disposed once the LAST holder has let go.
+ */
+function useSharedWaterMaterial(colors: WaterColors, mode: number): WaterMaterialLease {
+  // Keying the dependency on the palette's CONTENT (not the object identity)
+  // means a caller constructing a fresh but identical `WaterColors` literal
+  // each render does not churn the material — while a genuinely different
+  // palette (⇧M) is always a different key.
+  const key = waterMaterialKey(colors, mode);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` already
+  // encodes every field of `colors` and `mode`; the factory closes over them.
+  const lease = useDisposableMemo(() => acquireWaterMaterial(colors, mode), [key]);
+  // Retain while mounted; release on unmount or when the lease changes. A
+  // LAYOUT effect, so retain runs before the renderer's first frame and the
+  // release/re-retain replay StrictMode performs happens entirely within one
+  // synchronous commit — hence a zero-ref disposal is deferred a microtask
+  // (see `disposeEntryWhenUnused`) and never catches a re-retain mid-replay.
+  useLayoutEffect(() => {
+    lease.retain();
+    return () => lease.release();
+  }, [lease]);
+  return lease;
+}
+
 /** Keeps `uTime` and `uViewDir` current. Deliberately contains NO
  * `invalidate()` — see this module's doc comment: that is the exact shape of
- * the bug that once made a `frameloop="demand"` scene never go idle. */
+ * the bug that once made a `frameloop="demand"` scene never go idle.
+ *
+ * Every mounted water mesh registers this, so a shared material's time/view
+ * uniforms are written by all of its holders each frame — idempotent writes
+ * of the same two values, never a request for a new frame. */
 function useWaterFrame(material: THREE.ShaderMaterial | null) {
   useFrame(({ clock, camera }) => {
     if (!material) return;
@@ -469,6 +723,36 @@ function useWaterFrame(material: THREE.ShaderMaterial | null) {
     camera.getWorldDirection(view);
     view.negate();
   });
+}
+
+/**
+ * Assign `mesh.onBeforeRender` so a shared material wears this mesh's own
+ * parameters at its own draw. Kept in a layout effect (rather than the JSX
+ * `onBeforeRender` prop) so the callback is attached to the REAL three.js
+ * mesh, with no event-prop ambiguity and no stray DOM attribute in tests.
+ *
+ * The callback reads the LATEST `apply` through a ref, so a re-render (a
+ * palette switch, a new phase, a resized island) updates what gets written
+ * without tearing down and re-attaching the callback on every render — which
+ * matters at 152 islands. The attach itself only runs when the mesh instance
+ * changes.
+ */
+function useBeforeRender(mesh: RefObject<THREE.Mesh | null>, apply: () => void) {
+  const latest = useRef(apply);
+  useLayoutEffect(() => {
+    latest.current = apply;
+  });
+  useLayoutEffect(() => {
+    const target = mesh.current;
+    if (!target) return;
+    const callback = () => latest.current();
+    target.onBeforeRender = callback;
+    return () => {
+      // Only clear OUR callback: if another render already replaced it, that
+      // newer assignment owns the slot now.
+      if (target.onBeforeRender === callback) target.onBeforeRender = () => {};
+    };
+  }, [mesh]);
 }
 
 /**
@@ -494,9 +778,9 @@ export function OpenWater({
     geo.rotateX(-Math.PI / 2);
     return geo;
   }, [size]);
-  const material = useDisposableMemo(() => makeWaterMaterial(colors, MODE_OPEN), [colors]);
-  useWaterFrame(material);
-  return <mesh geometry={geometry} material={material} position={[center.x, y, center.z]} renderOrder={-1} />;
+  const lease = useSharedWaterMaterial(colors, MODE_OPEN);
+  useWaterFrame(lease.material);
+  return <mesh geometry={geometry} material={lease.material} position={[center.x, y, center.z]} renderOrder={-1} />;
 }
 
 /**
@@ -527,16 +811,20 @@ export function IslandShallows({
     geo.rotateX(-Math.PI / 2);
     return geo;
   }, [quadW, quadD]);
-  const material = useDisposableMemo(() => makeWaterMaterial(colors, MODE_ISLAND), [colors]);
+  const lease = useSharedWaterMaterial(colors, MODE_ISLAND);
   const phases = useMemo(() => maskPhases(seed), [seed]);
-  useMemo(() => {
-    (material.uniforms.uPhases.value as THREE.Vector3).set(phases[0], phases[1], phases[2]);
-    (material.uniforms.uHalf.value as THREE.Vector2).set(width / 2, depth / 2);
-    (material.uniforms.uQuadHalf.value as THREE.Vector2).set(quadW / 2, quadD / 2);
+  // This island's coastline is applied to the SHARED material immediately
+  // before its own draw (see `applyIslandUniforms`), so no island's seed,
+  // half-extent or shelf phase can bleed into a sibling drawn with the same
+  // material later in the frame.
+  const mesh = useRef<THREE.Mesh>(null);
+  const material = lease.material;
+  useBeforeRender(mesh, () => {
+    applyIslandUniforms(material, phases, width / 2, depth / 2, quadW / 2, quadD / 2);
     material.uniforms.uShelfOuter.value = ISLAND_SHELF_OUTER;
-  }, [material, phases, width, depth, quadW, quadD]);
+  });
   useWaterFrame(material);
-  return <mesh geometry={geometry} material={material} position={[0, y, 0]} />;
+  return <mesh ref={mesh} geometry={geometry} material={material} position={[0, y, 0]} />;
 }
 
 /**
@@ -572,14 +860,14 @@ export function TownShallows({
     geo.rotateX(-Math.PI / 2);
     return geo;
   }, [quadW, quadD]);
-  const material = useDisposableMemo(() => makeWaterMaterial(colors, MODE_RECT), [colors]);
-  useMemo(() => {
-    (material.uniforms.uHalf.value as THREE.Vector2).set(width / 2, depth / 2);
-    (material.uniforms.uQuadHalf.value as THREE.Vector2).set(quadW / 2, quadD / 2);
-    material.uniforms.uShelfWidth.value = shelfWidth;
-    material.uniforms.uCoast.value = coast;
-    material.uniforms.uCoastT.value = coastT;
-  }, [material, width, depth, quadW, quadD, shelfWidth, coast, coastT]);
+  const lease = useSharedWaterMaterial(colors, MODE_RECT);
+  const mesh = useRef<THREE.Mesh>(null);
+  const material = lease.material;
+  // Same per-draw stake as an island's shelf: `MODE_RECT` reads its own
+  // footprint/coast/half-extents, applied right before this town's draw.
+  useBeforeRender(mesh, () => {
+    applyTownUniforms(material, width / 2, depth / 2, quadW / 2, quadD / 2, shelfWidth, coast, coastT);
+  });
   useWaterFrame(material);
-  return <mesh geometry={geometry} material={material} position={[0, y, 0]} />;
+  return <mesh ref={mesh} geometry={geometry} material={material} position={[0, y, 0]} />;
 }
