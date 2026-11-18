@@ -168,10 +168,12 @@ export function useVoiceRecorderController(
   const [limits, setLimits] = useState(config);
   const [checkingLimits, setCheckingLimits] = useState(false);
   const reviewLimitsAbortControllerRef = useRef<AbortController | null>(null);
+  const limitsRefreshSequenceRef = useRef(0);
   const [review, setReview] = useState<ReviewRecording | null>(null);
   const uploadAbortControllerRef = useRef<AbortController | null>(null);
   const reviewURLRef = useRef<string | null>(null);
   const reviewSequenceRef = useRef(0);
+  const mountedRef = useRef(true);
 
   const {
     elapsedMs,
@@ -201,7 +203,6 @@ export function useVoiceRecorderController(
     transcriptionError,
     transcriptionProgressLabel,
     setTranscriptionProgressLabel,
-    abortActiveTranscription,
     resetTranscriptionState,
     beginTranscription,
     clearTranscriptionAbortController,
@@ -217,13 +218,21 @@ export function useVoiceRecorderController(
 
   useEffect(() => {
     return () => {
+      mountedRef.current = false;
+      limitsRefreshSequenceRef.current += 1;
+      reviewSequenceRef.current += 1;
       releaseReviewURL();
       uploadAbortControllerRef.current?.abort();
       reviewLimitsAbortControllerRef.current?.abort();
+      setCheckingLimits(false);
     };
   }, [releaseReviewURL]);
 
   function clearReview() {
+    // Invalidating the sequence ensures a limit refresh whose response arrives
+    // after the review was replaced or cancelled can never write its limitError,
+    // waveform, or limits back onto the new state.
+    limitsRefreshSequenceRef.current += 1;
     reviewLimitsAbortControllerRef.current?.abort();
     reviewLimitsAbortControllerRef.current = null;
     setCheckingLimits(false);
@@ -416,16 +425,20 @@ export function useVoiceRecorderController(
   const startTranscription = useCallback(
     async (targetReview?: ReviewRecording) => {
       const activeReview = targetReview ?? review;
-      if (!activeReview || activeReview.limitError) return;
+      if (!activeReview || activeReview.limitError || !mountedRef.current) {
+        return;
+      }
 
       const abortController = beginTranscription();
       const reviewId = activeReview.id;
 
+      const isStale = () =>
+        !mountedRef.current ||
+        abortController.signal.aborted ||
+        reviewSequenceRef.current !== reviewId;
+
       const updateIfCurrent = (callback: () => void) => {
-        if (
-          abortController.signal.aborted ||
-          reviewSequenceRef.current !== reviewId
-        ) {
+        if (isStale()) {
           return;
         }
         callback();
@@ -433,7 +446,7 @@ export function useVoiceRecorderController(
 
       try {
         const currentConfig = await loadClientConfig(abortController.signal);
-        if (abortController.signal.aborted) return;
+        if (isStale()) return;
         setLimits(currentConfig);
         const limitError = recordingLimitError(
           activeReview.blob.size,
@@ -441,15 +454,19 @@ export function useVoiceRecorderController(
           currentConfig,
         );
         if (limitError) {
-          setReview({ ...activeReview, limitError });
-          cancelTranscription();
+          updateIfCurrent(() => setReview({ ...activeReview, limitError }));
+          if (!isStale()) {
+            cancelTranscription();
+          }
           return;
         }
         if (
           !currentConfig.voiceMessagesEnabled ||
           !currentConfig.clientTranscriptionEnabled
         ) {
-          cancelTranscription();
+          if (!isStale()) {
+            cancelTranscription();
+          }
           return;
         }
         const text = await transcribeVoiceMessageBlob(
@@ -473,7 +490,7 @@ export function useVoiceRecorderController(
 
         updateIfCurrent(() => completeTranscription(text));
       } catch (transcriptionError) {
-        if (abortController.signal.aborted) {
+        if (isStale()) {
           return;
         }
 
@@ -501,31 +518,44 @@ export function useVoiceRecorderController(
   );
 
   async function recheckRecordingLimits() {
-    if (!review || checkingLimits) return;
+    const activeReview = review;
+    if (!activeReview) return;
+
+    // Single-flight: a newer refresh (or send/cancel/unmount) invalidates any
+    // refresh already in flight, including its late-arriving responses.
     reviewLimitsAbortControllerRef.current?.abort();
     const controller = new AbortController();
+    const refreshSequence = limitsRefreshSequenceRef.current + 1;
+    limitsRefreshSequenceRef.current = refreshSequence;
     reviewLimitsAbortControllerRef.current = controller;
     setCheckingLimits(true);
     setError("");
+
+    const isStale = () =>
+      !mountedRef.current ||
+      controller.signal.aborted ||
+      limitsRefreshSequenceRef.current !== refreshSequence ||
+      reviewSequenceRef.current !== activeReview.id;
+
     try {
       const currentConfig = await loadClientConfig(controller.signal);
-      if (controller.signal.aborted) return;
-      setLimits(currentConfig);
+      if (isStale()) return;
       const limitError = currentConfig.voiceMessagesEnabled
         ? recordingLimitError(
-            review.blob.size,
-            review.durationMs,
+            activeReview.blob.size,
+            activeReview.durationMs,
             currentConfig,
           )
         : "Voice messages are disabled. Download your recording to keep a copy.";
       const waveform = limitError
-        ? review.waveform
-        : ((await extractWaveformPeaksFromBlob(review.blob)) ??
-          review.waveform);
-      if (controller.signal.aborted) return;
-      setReview({ ...review, limitError, waveform });
+        ? activeReview.waveform
+        : ((await extractWaveformPeaksFromBlob(activeReview.blob)) ??
+          activeReview.waveform);
+      if (isStale()) return;
+      setLimits(currentConfig);
+      setReview({ ...activeReview, limitError, waveform });
     } catch (limitError) {
-      if (controller.signal.aborted) return;
+      if (isStale()) return;
       setError(
         limitError instanceof Error
           ? limitError.message
@@ -534,34 +564,51 @@ export function useVoiceRecorderController(
     } finally {
       if (reviewLimitsAbortControllerRef.current === controller) {
         reviewLimitsAbortControllerRef.current = null;
-        if (!controller.signal.aborted) setCheckingLimits(false);
+      }
+      if (mountedRef.current && !isStale()) {
+        setCheckingLimits(false);
       }
     }
   }
 
   async function sendRecording() {
-    if (!review || uploadAbortControllerRef.current) {
+    const activeReview = review;
+    // An upload in progress cannot be started a second time.
+    if (!activeReview || uploadAbortControllerRef.current) {
       return;
     }
 
-    abortActiveTranscription();
+    // Sending takes ownership of the review: invalidate any limit refresh in
+    // flight and safely stop a transcription so its callbacks can no longer
+    // mutate shared state.
+    limitsRefreshSequenceRef.current += 1;
+    reviewLimitsAbortControllerRef.current?.abort();
+    reviewLimitsAbortControllerRef.current = null;
+    setCheckingLimits(false);
+    cancelTranscription();
+
     const abortController = new AbortController();
     uploadAbortControllerRef.current = abortController;
     setStatus("uploading");
     setError("");
 
+    const isStale = () =>
+      !mountedRef.current ||
+      abortController.signal.aborted ||
+      reviewSequenceRef.current !== activeReview.id;
+
     try {
       const currentConfig = await loadClientConfig(abortController.signal);
-      if (abortController.signal.aborted) return;
+      if (isStale()) return;
       setLimits(currentConfig);
       const currentLimitError = recordingLimitError(
-        review.blob.size,
-        review.durationMs,
+        activeReview.blob.size,
+        activeReview.durationMs,
         currentConfig,
       );
       if (currentLimitError || !currentConfig.voiceMessagesEnabled) {
         setReview({
-          ...review,
+          ...activeReview,
           limitError:
             currentLimitError ||
             "Voice messages are disabled. Download your recording to keep a copy.",
@@ -570,23 +617,23 @@ export function useVoiceRecorderController(
         return;
       }
       await uploadVoiceMessage({
-        blob: review.blob,
+        blob: activeReview.blob,
         channelId: draft.channelId,
         rootId: draft.rootId,
-        durationMs: review.durationMs,
-        mimeType: review.mimeType,
-        waveform: review.waveform,
+        durationMs: activeReview.durationMs,
+        mimeType: activeReview.mimeType,
+        waveform: activeReview.waveform,
         transcript: currentConfig.clientTranscriptionEnabled
           ? transcript
           : undefined,
         signal: abortController.signal,
       });
-      if (abortController.signal.aborted) return;
+      if (isStale()) return;
       clearReview();
       resetTranscriptionState();
       setStatus("idle");
     } catch (uploadError) {
-      if (abortController.signal.aborted) {
+      if (isStale()) {
         return;
       }
       setError(
