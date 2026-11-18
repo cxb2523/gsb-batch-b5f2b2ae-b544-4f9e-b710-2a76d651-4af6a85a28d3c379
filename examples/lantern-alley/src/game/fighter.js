@@ -24,6 +24,7 @@ export class Fighter {
     this.invuln = 0;
     this.kb = null;
     this.damageScale = 1;
+    this.opacity = 1;             // KO fade alpha; the visual re-applies it on every look switch
     this.scene = scene;
     this.node = new THREE.Group();
     scene.add(this.node);
@@ -33,11 +34,22 @@ export class Fighter {
 
   get alive() { return this.state !== 'ko'; }
 
+  // Replaces only the look. The outgoing visual hands over its playback position, hit flash
+  // and fade alpha, so the animation continues from the same frame and every gameplay timer
+  // (attack window, hitstop, invulnerability, knockback) is untouched.
   setVisual(visual) {
+    const state = this.visual ? this.visual.captureState() : null;
     if (this.visual) { this.node.remove(this.visual.root); this.visual.dispose(); }
     this.visual = visual;
     this.node.add(visual.root);
-    if (this.anim) visual.play(this.anim, this.animOpts);
+    if (state) visual.applyState(state);
+    else if (this.anim) visual.play(this.anim, this.animOpts);
+  }
+
+  // Fades the current look without touching gameplay; the alpha is remembered for the next swap.
+  setOpacity(a) {
+    this.opacity = a;
+    this.visual.setOpacity(a);
   }
 
   setState(state, anim, opts = {}) {

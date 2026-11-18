@@ -2,6 +2,9 @@
 // ?seed=123 in the address makes a round repeatable (the test bot uses this).
 let state = (Number(new URLSearchParams(location.search).get('seed')) || Math.floor(Math.random() * 2 ** 31)) >>> 0;
 
+// Tests use this to force a known sequence (e.g. to make two games play identically).
+export function setSeed(seed) { state = (Number(seed) || 1) >>> 0; }
+
 export function random() {                      // mulberry32
   state = (state + 0x6d2b79f5) >>> 0;
   let t = state;

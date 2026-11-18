@@ -98,8 +98,25 @@ function frame(now) {
 // __steps(n) advances only the game logic by n fixed steps (no drawing), for fast test replays.
 if (params.has('manual')) {
   window.__frame = frame;
+  // __steps advances only the game logic (no drawing); __step is one complete fixed frame
+  // (logic plus a visual sync), for tests that read animation/opacity state as it is drawn.
   window.__steps = n => { for (let i = 0; i < n; i++) { game.beforeStep?.(STEP); game.step(STEP); } };
+  window.__step = () => { game.beforeStep?.(STEP); game.step(STEP); game.render(STEP, 1); };
   window.__spawn = (kind, side = 1, z = 0) => game.addEnemy(kind, side, z);
+  window.__switchLook = m => switchVisuals(game, m);
+  const { greyboxBuilders, registerModelBuilders, getVisualMode, createVisual } = await import('./visuals/registry.js');
+  window.__greyboxBuilders = greyboxBuilders;
+  const { setSeed } = await import('./game/random.js');
+  // Modules the in-page acceptance harness builds parallel worlds with.
+  window.__testModules = {
+    THREE: await import('three'),
+    Game: (await import('./game/game.js')).Game,
+    Input: (await import('./input.js')).Input,
+    ModelCharacter: (await import('./visuals/models.js')).ModelCharacter,
+    switchVisuals,
+    createVisual,
+    registerModelBuilders, getVisualMode, setSeed,
+  };
   last = 0;
 }
 else renderer.setAnimationLoop(frame);

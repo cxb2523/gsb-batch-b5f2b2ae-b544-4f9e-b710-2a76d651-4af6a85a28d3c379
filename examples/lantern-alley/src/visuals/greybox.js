@@ -62,6 +62,7 @@ export class GreyCharacter {
     this.animTime = 0;
     this.timeScale = 1;
     this.flashTime = 0;
+    this.opacity = 1;
     this.materials = [];
     this.outlines = [];
     this.root.traverse(o => {
@@ -78,10 +79,32 @@ export class GreyCharacter {
     this.timeScale = timeScale;
   }
 
+  // The playback state another visual of the same character must take over on a look switch,
+  // so the animation keeps playing from the same point instead of restarting.
+  captureState() {
+    const dur = this.duration(this.anim);
+    return {
+      anim: this.anim,
+      opts: { timeScale: this.timeScale },
+      fraction: dur > 0 ? this.animTime / dur : 0,
+      flashTime: this.flashTime,
+      opacity: this.opacity,
+    };
+  }
+
+  applyState(state) {
+    if (!state) return;
+    this.play(state.anim, state.opts ?? {});
+    this.animTime = Math.max(0, state.fraction ?? 0) * this.duration(state.anim);
+    this.flashTime = state.flashTime ?? 0;
+    this.setOpacity(state.opacity ?? 1);
+  }
+
   hitFlash() { this.flashTime = 0.1; }
 
   // The outline material is shared by every placeholder, so hide this one's outlines instead of fading them.
   setOpacity(a) {
+    this.opacity = a;
     for (const o of this.outlines) o.visible = a >= 1;
     for (const m of this.materials) { m.transparent = a < 1; m.opacity = a; }
   }
@@ -134,6 +157,9 @@ export class GreyProp {
   play() {}
   hitFlash() {}
   setOpacity() {}
+  // Static props carry no state worth carrying across a look switch.
+  captureState() { return {}; }
+  applyState() {}
   update() {}
   dispose() {}
 }
@@ -198,6 +224,17 @@ export class FoodVisual extends GreyProp {
     super(g);
     this.spin = spin;
     this.t = 0;
+  }
+  // Spin angle and bob clock travel with the pickup, so a look switch never makes the food
+  // jump to a different rotation or float off its resting height.
+  captureState() {
+    return { spinY: this.spin.rotation.y, t: this.t };
+  }
+  applyState(state) {
+    if (!state) return;
+    this.spin.rotation.y = state.spinY ?? 0;
+    this.t = state.t ?? 0;
+    this.spin.position.y = 0.35 + Math.sin(this.t * 4) * 0.06;
   }
   update(dt) {
     this.t += dt;

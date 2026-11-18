@@ -6,7 +6,7 @@ import { GreyCharacter, FoodVisual, dumpster, crate, trashCan, streetLamp, floor
 // id -> builder(size) returning a Visual:
 //   root: THREE.Object3D (faces +Z, feet/bottom at y = 0)
 //   duration(anim) -> seconds, play(anim, {loop, timeScale}), update(dt, info),
-//   hitFlash(), setOpacity(a), dispose()
+//   hitFlash(), setOpacity(a), captureState() / applyState(state), dispose()
 // To use a 3D model, register a different builder for that id. Gameplay code never changes.
 export const greyboxBuilders = {
   hero:        size => new GreyCharacter({ size, body: 0x1e88e5, head: 0xffcc99, accent: 0xffd23f }),

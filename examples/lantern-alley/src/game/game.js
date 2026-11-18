@@ -142,7 +142,7 @@ export class Game {
     for (const e of this.enemies) {
       if (e.alive) continue;
       const f = (e.stateTime - KO_FADE.delay) / KO_FADE.time;
-      if (f > 0) e.visual.setOpacity(Math.max(0, 1 - f));
+      if (f > 0) e.setOpacity(Math.max(0, 1 - f));
       if (f >= 1) e.remove();
     }
     this.enemies = this.enemies.filter(e => !e.removed);

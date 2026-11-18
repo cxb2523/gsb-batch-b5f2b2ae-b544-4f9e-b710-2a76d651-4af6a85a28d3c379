@@ -373,9 +373,37 @@ export class ModelCharacter {
     this.actions = {};
     this.current = null;
     this.flashTime = 0;
+    this.opacity = 1;
   }
 
   duration(anim) { return this.proto.clips[anim]?.duration ?? 1; }
+
+  // The mixer position (fraction through the current clip), flash and fade the replacement
+  // model must inherit on a look switch, so the pose does not snap back to the clip start.
+  captureState() {
+    const action = this.current;
+    const clip = action?.getClip();
+    return {
+      anim: this.anim,
+      opts: { loop: action ? (action.loop === THREE.LoopRepeat) : undefined, timeScale: this.rawTimeScale, start: this.playStart },
+      fraction: action && clip ? action.time / clip.duration : 0,
+      flashTime: this.flashTime,
+      opacity: this.opacity,
+    };
+  }
+
+  applyState(state) {
+    if (!state) return;
+    this.play(state.anim, state.opts ?? {});
+    const action = this.current, clip = action?.getClip();
+    if (action && clip) {
+      action.time = Math.max(0, state.fraction ?? 0) * clip.duration;
+      this.mixer.update(0);
+    }
+    this.flashTime = state.flashTime ?? 0;
+    this.flashing = this.flashTime > 0;
+    this.setOpacity(state.opacity ?? 1);
+  }
 
   // Missing clip -> stand-in from STAND_INS (e.g. run -> walk at 1.75x).
   resolve(anim, timeScale) {
@@ -392,6 +420,8 @@ export class ModelCharacter {
   // start: begin part-way into the clip (fraction), e.g. a combo follow-up skipping its wind-up.
   play(anim, { loop, timeScale = 1, start } = {}) {
     this.anim = anim;
+    this.rawTimeScale = timeScale;
+    this.playStart = start;
     const looping = loop ?? LOOPING.has(anim);
     [anim, timeScale] = this.resolve(anim, timeScale);
     const next = this.action(anim);
@@ -414,6 +444,7 @@ export class ModelCharacter {
   // Fading: hide the black outline hull (it would show through the see-through body) and keep
   // the body writing depth so only its front surface blends with the scene.
   setOpacity(a) {
+    this.opacity = a;
     for (const o of this.outlines) o.visible = a >= 1;
     for (const m of this.materials) { m.transparent = a < 1; m.opacity = a; }
   }
@@ -442,11 +473,14 @@ export class ModelProp {
     this.look = 'model';
     this.root = new THREE.Group();
     this.root.add(proto.holder.clone());
+    this.opacity = 1;
   }
   duration() { return 1; }
   play() {}
   hitFlash() {}
-  setOpacity() {}
+  setOpacity(a) { this.opacity = a; }
+  captureState() { return {}; }
+  applyState() {}
   update() {}
   dispose() {}
 }
