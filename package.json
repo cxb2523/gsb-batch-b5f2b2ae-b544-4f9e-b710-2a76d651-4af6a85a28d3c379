@@ -1,0 +1,73 @@
+{
+  "name": "canvas-sequencer",
+  "version": "3.1.2",
+  "description": "Store, serialize, parse, and execute sequences of canvas context instructions.",
+  "author": "Michael van der Kamp <michael.vanderkamp@usask.ca>",
+  "source": "index.js",
+  "main": "dist/index.js",
+  "types": "index.d.ts",
+  "files": [
+    "dist/index.js",
+    "index.js",
+    "src/",
+    "index.d.ts"
+  ],
+  "targets": {
+    "types": false,
+    "main": {
+      "optimize": true
+    }
+  },
+  "directories": {
+    "test": "tests"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mvanderkamp/canvas-sequencer.git"
+  },
+  "keywords": [
+    "javascript",
+    "canvas",
+    "context",
+    "sequence",
+    "graphics",
+    "CanvasRenderingContext2D",
+    "art",
+    "network",
+    "socket",
+    "transmit",
+    "JSON",
+    "serializable",
+    "parse"
+  ],
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/mvanderkamp/canvas-sequencer/issues"
+  },
+  "homepage": "https://mvanderkamp.github.io/canvas-sequencer/",
+  "scripts": {
+    "build": "parcel build --no-source-maps",
+    "build:debug": "parcel build --no-optimize",
+    "lint": "eslint index.js src tests",
+    "lint:fix": "eslint index.js src tests --fix",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "test:debug": "node inspect $(npm bin)/jest --runInBand"
+  },
+  "jest": {
+    "testEnvironmentOptions": {
+      "url": "http://localhost/"
+    },
+    "coveragePathIgnorePatterns": [
+      "/node_modules/",
+      "/dist/",
+      "/tests/"
+    ]
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "eslint": "^10.8.1",
+    "jest": "^30.4.2",
+    "parcel": "^2.16.4"
+  }
+}

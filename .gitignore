@@ -1,0 +1,25 @@
+# Dependency Directory
+node_modules
+
+# Personal edit startup script
+edit.sh
+usage.sh
+
+# swap files.
+*.sw[op]
+
+# tag files
+tags
+
+# parcel-bundler cache
+.cache
+
+# test coverage
+coverage
+
+# coveralls tokens
+.coveralls.yml
+.parcel-cache/
+
+# Build artefacts
+dist/

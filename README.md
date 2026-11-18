@@ -1,0 +1,279 @@
+# canvas-sequencer
+
+[![Node.js CI](https://github.com/mvanderkamp/canvas-sequencer/actions/workflows/node.js.yml/badge.svg)](https://github.com/mvanderkamp/canvas-sequencer/actions/workflows/node.js.yml)
+[![Coverage Status](https://coveralls.io/repos/github/mvanderkamp/canvas-sequencer/badge.svg?branch=main)](https://coveralls.io/github/mvanderkamp/canvas-sequencer?branch=main)
+[![Maintainability](https://api.codeclimate.com/v1/badges/777e9d732d4ceece8124/maintainability)](https://codeclimate.com/github/mvanderkamp/canvas-sequencer/maintainability)
+
+Store, serialize, parse, and execute series of canvas context instructions!
+
+## Contents
+
+* [Why](#why)
+* [Installation](#installation)
+* [Importing](#importing)
+* [CanvasSequence API](#canvassequence-api)
+* [CanvasBlueprint](#canvasblueprint-api)
+* [Supported instructions](#supported-instructions)
+* [Limitations](#limitations)
+* [Resources](#resources)
+
+## Why
+
+Normally, if you have a sequence of canvas instructions, you might predefine
+them in a function which will be distributed in a script file to all your
+clients.
+
+Suppose, however, that you wish to be able to dynamically define instructions
+from the server, and have those instructions executed on the canvas contexts of
+your clients. One option would be to wrap the instructions up in a string on the
+server, distribute the string, then have the clients call `eval()` on the
+string.  This is error-prone and risky however, and exposes you to all the
+incumbent problems of the `eval()` function.
+
+With `canvas-sequencer` you can package those instructions up in a sequence and
+transmit them. Once on the client side, you can unpack the instructions and
+execute them on any given context (or even multiple contexts), and all the
+issues with the `eval()` technique fade away.
+
+## Installation
+
+Install via [npm](https://www.npmjs.com/package/canvas-sequencer):
+
+```bash
+npm install canvas-sequencer
+```
+
+## Importing
+
+Server side, or in a Node environment.
+
+```javascript
+const { CanvasSequence, CanvasBlueprint } = require('canvas-sequencer');
+```
+
+## CanvasSequence API
+
+### Creating a sequence
+
+```javascript
+const seq = new CanvasSequence();
+```
+
+### Defining instructions
+
+You have access to a curated, allowlisted subset of
+`CanvasRenderingContext2D` instructions. It includes replayable command methods
+and writable rendering-state properties, but excludes the underlying `canvas`
+object for safety. Each instruction will be added onto the end of the sequence.
+See [Supported instructions](#supported-instructions) for the complete list.
+
+```javascript
+seq.beginPath();
+seq.arc(25,25,42, 0, 2 * Math.PI);
+seq.fillStyle = 'green';
+seq.fill();
+seq.lineWidth = 15;
+seq.closePath();
+seq.stroke();
+```
+
+### Transmitting the sequence
+
+The sequencer exposes a `toJSON()` function, ensuring that with any library
+which uses JSON methods to bundle data into packets for transmission (such as
+`socket.io`) you will not need to do anything fancy for transmission of your
+sequences. Just send the sequence object as you would any other piece of
+serializable data.
+
+```javascript
+emitter.emit('new-sequence', seq);
+```
+
+### Unpacking the sequence
+
+The transmitted sequence needs to be revived in order for the CanvasSequence
+functionality to be available. This can be done by passing the transmitted data
+object to the constructor:
+
+```javascript
+// Assumes that you have recieve the packaged sequence in a 'data' variable.
+const seq = new CanvasSequence(data);
+```
+
+### Executing the sequence
+
+You can execute the sequence on any `CanvasRenderingContext2D` as such:
+
+```javascript
+const ctx1 = document.querySelector('#canvas1').getContext('2d');
+seq.execute(ctx1);
+
+// And again on another context!
+const ctx2 = document.querySelector('#canvas2').getContext('2d');
+seq.execute(ctx2);
+```
+
+## CanvasBlueprint API
+
+Also accessible through this library are sequence 'blueprints'. These allow you
+to define a sequence once using placeholder tags for values, then build
+executable sequences using the blueprint and a set of values to take the place
+of the tags.
+
+### How does it work?
+
+The tags you can pass to a blueprint are strings wrapped in curly braces. The
+string inside the curly braces should be the name of a property on the object
+with which you intend to build the executable sequence.
+
+Don't worry- if you want to pass the name of such a property into an actual
+context function, you can still do that. Strings without curly braces are
+ignored. If you want to pass a string wrapped in curly braces through to a
+context object, just add an extra set of curly braces.
+
+Here's an example that demonstrates the complete system in action:
+
+```javascript
+const { CanvasBlueprint } = require('canvas-sequencer');
+const values = { x: 250, y: 99 };
+const bp = new CanvasBlueprint();
+const ctx = document.querySelector('#canvas1').getContext('2d');
+
+bp.fillText('y',7,8);
+bp.fillText('{{x}}',5,6);
+bp.fillRect('{x}','{y}',30,40);
+
+bp.build(values).execute(ctx);
+
+/*
+ * The result will be the same as if you had done:
+ *
+ * ctx.fillText('y',7,8);
+ * ctx.fillText('{x}',5,6);
+ * ctx.fillRect(250,99,30,40);
+ */
+
+// If you later change the x,y values:
+values.x = 101;
+values.y = 42;
+
+// You can simply rebuild and execute:
+bp.build(values).execute(ctx);
+
+/*
+ * Now the result will be the same as if you had done:
+ *
+ * ctx.fillText('y',7,8);
+ * ctx.fillText('{x}',5,6);
+ * ctx.fillRect(101,42,30,40);
+ */
+```
+
+### Transmitting and unpacking blueprints
+
+You can transmit and unpack a `CanvasBlueprint` just as you would with the
+regular `CanvasSequence` object:
+
+Transmitting:
+
+```javascript
+emitter.emit('new-blueprint', bp);
+```
+
+Unpacking:
+
+```javascript
+const bp = new CanvasBlueprint(data);
+```
+
+## Supported instructions
+
+`CanvasSequence` supports only the methods and writable properties below.
+Methods that return data or canvas-bound resources, such as `measureText()`,
+`getImageData()`, and `createLinearGradient()`, are intentionally unavailable
+because a sequence cannot usefully serialize or replay their return values.
+Query-style APIs and the underlying `canvas` object are also unavailable.
+
+### Supported API
+
+| Type | Instruction |
+| --- | --- |
+| Method | `addHitRegion()` |
+| Method | `arc()` |
+| Method | `arcTo()` |
+| Method | `beginPath()` |
+| Method | `bezierCurveTo()` |
+| Method | `clearHitRegions()` |
+| Method | `clearRect()` |
+| Method | `clip()` |
+| Method | `closePath()` |
+| Method | `drawFocusIfNeeded()` |
+| Method | `drawImage()` |
+| Method | `ellipse()` |
+| Method | `fill()` |
+| Method | `fillRect()` |
+| Method | `fillText()` |
+| Method | `lineTo()` |
+| Method | `moveTo()` |
+| Method | `putImageData()` |
+| Method | `quadraticCurveTo()` |
+| Method | `rect()` |
+| Method | `reset()` |
+| Method | `removeHitRegion()` |
+| Method | `resetTransform()` |
+| Method | `restore()` |
+| Method | `rotate()` |
+| Method | `roundRect()` |
+| Method | `save()` |
+| Method | `scale()` |
+| Method | `scrollPathIntoView()` |
+| Method | `setLineDash()` |
+| Method | `setTransform()` |
+| Method | `stroke()` |
+| Method | `strokeRect()` |
+| Method | `strokeText()` |
+| Method | `transform()` |
+| Method | `translate()` |
+| Writable property | `direction` |
+| Writable property | `fillStyle` |
+| Writable property | `filter` |
+| Writable property | `font` |
+| Writable property | `fontKerning` |
+| Writable property | `fontStretch` |
+| Writable property | `fontVariantCaps` |
+| Writable property | `globalAlpha` |
+| Writable property | `globalCompositeOperation` |
+| Writable property | `imageSmoothingEnabled` |
+| Writable property | `imageSmoothingQuality` |
+| Writable property | `letterSpacing` |
+| Writable property | `lineCap` |
+| Writable property | `lineDashOffset` |
+| Writable property | `lineJoin` |
+| Writable property | `lineWidth` |
+| Writable property | `miterLimit` |
+| Writable property | `shadowBlur` |
+| Writable property | `shadowColor` |
+| Writable property | `shadowOffsetX` |
+| Writable property | `shadowOffsetY` |
+| Writable property | `strokeStyle` |
+| Writable property | `textAlign` |
+| Writable property | `textBaseline` |
+| Writable property | `textRendering` |
+| Writable property | `wordSpacing` |
+
+## Limitations
+
+The canvas sequences will be executed one at a time, in the correct sequence,
+but you cannot retrieve values in a useful manner. Therefore any context method
+which is intended as a getter has been removed and is currently unavailable. If
+you have a good idea for how to make it possible to remotely access these return
+values, let me know!
+
+Also be warned that I have not yet fully tested the API with complex arguments,
+for example Path objects. I suspect the library will need a bit of fine tuning
+to make sure this can happen.
+
+## Resources
+
+* [Contributing guide](./CONTRIBUTING.md) — Development, pull request, and release instructions.
+* [Changelog](./CHANGELOG.md) — Detailed list of changes and version history.
