@@ -1,0 +1,14 @@
+{
+  "name": "@earwurm/mocks",
+  "version": "0.0.0",
+  "private": true,
+  "license": "ISC",
+  "engines": {
+    "node": ">=22.11.0",
+    "pnpm": ">=9.15.0"
+  },
+  "dependencies": {
+    "beeftools": "^0.1.8"
+  },
+  "devDependencies": {}
+}

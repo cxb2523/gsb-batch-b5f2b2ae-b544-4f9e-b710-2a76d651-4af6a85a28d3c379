@@ -1,0 +1,35 @@
+🧰 Dependency:
+  - changed-files:
+      - any-glob-to-any-file: pnpm-lock.yaml
+
+📚 Documentation:
+  - changed-files:
+      - any-glob-to-any-file: [README.md, 'docs/**']
+
+⚖️ Legal:
+  - changed-files:
+      - any-glob-to-any-file: LICENSE
+
+🔖 Release:
+  - changed-files:
+      - any-glob-to-any-file: CHANGELOG.md
+
+🧪 Testing:
+  - changed-files:
+      - any-glob-to-any-file: '**/*.test.ts'
+
+🛠️ Tooling:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - '.vscode/**'
+          - .editorconfig
+          - '.env*'
+          - '.*ignore'
+          - '.*rc'
+          - 'config/**'
+          - '*.config.*'
+          - 'package*.json'
+          - 'tsconfig*.json'
+          - '**/*/env.d.ts'
+          - '**/*/lightningcss-plugins.ts'

@@ -1,0 +1,32 @@
+name: 🤖 Lint
+on: [push]
+
+jobs:
+  lint:
+    name: Lint the codebase
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🗳️ Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🧰 Configure PNPM
+        uses: pnpm/action-setup@v4
+
+      - name: 🔧 Setup Node 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: 📦 Install dependencies
+        run: pnpm i
+
+      - name: 🎨 Lint
+        run: pnpm lint
+
+      - name: 💄 Prettier
+        run: pnpm format
+
+      - name: 🕵️ Type check
+        run: pnpm type-check

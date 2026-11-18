@@ -1,0 +1,26 @@
+name: 🧪 Test
+on: [push]
+
+jobs:
+  test:
+    name: Run test suites
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🗳️ Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🧰 Configure PNPM
+        uses: pnpm/action-setup@v4
+
+      - name: 🔧 Setup Node 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: 📦 Install dependencies
+        run: pnpm i
+
+      - name: 🧑‍🔬 Test
+        run: pnpm test

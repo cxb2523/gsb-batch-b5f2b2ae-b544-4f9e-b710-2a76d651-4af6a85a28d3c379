@@ -1,0 +1,65 @@
+{
+  "name": "earwurm",
+  "type": "module",
+  "version": "0.11.2",
+  "description": "Browser audio for the modern age",
+  "author": "Curtis Dulmage",
+  "license": "ISC",
+  "homepage": "https://github.com/beefchimi/earwurm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beefchimi/earwurm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/beefchimi/earwurm/issues"
+  },
+  "keywords": [
+    "browser",
+    "web",
+    "audio",
+    "sound",
+    "webm"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/earwurm.es.js",
+      "require": "./dist/earwurm.umd.js"
+    }
+  },
+  "main": "./dist/earwurm.umd.js",
+  "module": "./dist/earwurm.es.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.11.0",
+    "pnpm": ">=9.15.0"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build:only": "tsc && vite build",
+    "build": "pnpm clean && pnpm build:only",
+    "start": "pnpm build:only --watch"
+  },
+  "peerDependencies": {
+    "beeftools": "^0.1.8",
+    "emitten": "^0.6.8"
+  },
+  "dependencies": {
+    "beeftools": "^0.1.8",
+    "emitten": "^0.6.8"
+  },
+  "devDependencies": {
+    "@earwurm/helpers": "workspace:*",
+    "@earwurm/mocks": "workspace:*",
+    "@earwurm/types": "workspace:*",
+    "vite": "^6.0.3",
+    "vite-plugin-dts": "^4.3.0"
+  }
+}
