@@ -47,6 +47,11 @@ export class AVPlayback {
       this.video.load();
     });
   }
+  // The encoder shares its monotonic epoch via STARTED after configure. All
+  // delay adjustments converge on this clock, never on chunk arrival times.
+  setOrigin(origin) {
+    this.origin = origin;
+  }
   append(bytes, sequence) {
     if (this.closed) return;
     if (sequence !== this.sequence++) { this.fail("音画数据不连续，已停止播放，请重新启动。"); return; }
@@ -101,14 +106,18 @@ export class AVPlayback {
     if (next === this.delay) return;
     const previous = this.delay;
     this.delay = next;
-    if (this.started) {
+    if (next > previous) {
+      // Longer delay: pause output and wait for the extra buffer on the
+      // shared live clock. Holds before startup, while buffering and while
+      // running; the read head never moves backward to fill the gap.
       this.video.pause();
-      if (next > previous) this.adjusting = true;
-      else {
-        this.adjusting = false;
-        const { start, end } = this.range();
-        this.video.currentTime = this.seekTarget(start, end);
-      }
+      this.adjusting = true;
+    } else {
+      // Shorter or zero delay: skip stale buffer immediately in every phase,
+      // seeking only our own player to the live-clock target.
+      this.adjusting = false;
+      const { start, end } = this.range();
+      if (end > start) this.video.currentTime = this.seekTarget(start, end);
     }
     this.tick();
   }
@@ -125,11 +134,13 @@ export class AVPlayback {
     if (this.closed) return;
     const { start, end } = this.range();
     const desired = this.delay + SAFETY_BUFFER;
-    let remaining = Math.max(0, desired - (this.liveTime() - this.video.currentTime));
     if (!this.started && end - start >= desired) {
       this.video.currentTime = this.seekTarget(start, end);
       this.started = true;
     }
+    // Resume decisions always use the shared live clock, before startup and
+    // while running alike; arrived-chunk times never drive adjustment.
+    const remaining = Math.max(0, desired - (this.liveTime() - this.video.currentTime));
     if (this.started) {
       if (this.adjusting && remaining <= 0.06) this.adjusting = false;
       if (!this.adjusting) {
@@ -142,10 +153,9 @@ export class AVPlayback {
         if (this.video.paused && end - this.video.currentTime > 0.25) void this.play();
       }
     }
-    remaining = Math.max(0, desired - (this.liveTime() - this.video.currentTime));
-    if (!this.started) remaining = Math.max(remaining, desired - (end - start));
+    const bufferRemaining = !this.started ? Math.max(remaining, desired - (end - start)) : 0;
     this.onStatus({ phase: !this.started ? "capturing" : this.video.readyState < 3 ? "interrupted" : "running",
-      bufferRemaining: !this.started ? remaining : 0, pauseRemaining: this.adjusting ? remaining : 0,
+      bufferRemaining, pauseRemaining: this.adjusting ? remaining : 0,
       actualDelay: this.started ? Math.max(0, end - this.video.currentTime) : null,
       bufferedSeconds: end - start, blocked: this.blocked,
       notice: this.blocked ? "请在延迟播放页点击「播放声音与画面」，允许 Chrome 输出。"

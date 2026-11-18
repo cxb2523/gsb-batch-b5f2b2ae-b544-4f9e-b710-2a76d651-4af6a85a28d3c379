@@ -44,7 +44,7 @@ channel.onmessage = async ({ data }) => {
     catch (error) { playback.fail(error.message); }
   }
   if (data.type === "CHUNK") playback.append(data.bytes, data.sequence);
-  if (data.type === "STARTED") playback.origin = data.origin;
+  if (data.type === "STARTED") playback.setOrigin(data.origin);
   if (data.type === "DELAY") { lastReport = 0; playback.setDelay(data.delay); }
   if (data.type === "STOP") {
     ended = true;

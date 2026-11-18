@@ -71,6 +71,51 @@ test('A/V decrease cancels wait and seeks only the extension output, including z
   f.player.close();
 });
 
+test('pre-start increase waits on the live clock without seeking; playback starts at the new target', () => {
+  const f = fixture();
+  f.player.started = false;
+  f.video.currentTime = 0;
+  f.video.paused = true;
+  const time = 41;
+  f.player.liveTime = () => time;
+  f.head(20); // 20s buffered against a 30.75s target: still filling.
+  f.player.setDelay(35);
+  assert.equal(f.video.currentTime, 0); // No seek before startup.
+  assert.equal(f.video.paused, true);
+  assert.equal(f.player.adjusting, true);
+  f.head(36); // Buffer now covers the 35.75s target.
+  f.player.tick();
+  assert.equal(f.player.started, true);
+  assert.equal(f.video.currentTime, time - 35 - SAFETY_BUFFER);
+  f.player.close();
+});
+
+test('pre-start decrease skips stale buffer immediately on the live clock', () => {
+  const f = fixture();
+  f.player.started = false;
+  f.video.currentTime = 0;
+  f.video.paused = true;
+  const time = 41;
+  f.player.liveTime = () => time;
+  f.head(20);
+  f.player.setDelay(25); // Still buffering, but the read head jumps now.
+  assert.equal(f.player.started, false);
+  assert.equal(f.player.adjusting, false);
+  assert.equal(f.video.currentTime, time - 25 - SAFETY_BUFFER);
+  f.player.setDelay(0);
+  assert.equal(f.video.currentTime, 20 - 0.15); // Clamped to the buffered edge.
+  f.player.close();
+});
+
+test('live clock comes from the STARTED origin; without it the chunk clock is used', () => {
+  const f = fixture();
+  f.head(42);
+  assert.equal(f.player.liveTime(), 42); // Chunk-clock fallback before STARTED.
+  f.player.setOrigin(performance.timeOrigin + performance.now() - 12000);
+  assert.ok(Math.abs(f.player.liveTime() - 12) < 0.5);
+  f.player.close();
+});
+
 test('old buffered data is trimmed; sequence gaps fail closed and silence output', () => {
   const f = fixture();
   f.head(160); f.video.currentTime = 129.25;

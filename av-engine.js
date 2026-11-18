@@ -151,8 +151,15 @@ export class AVEngine {
     }
     return this.snapshot();
   }
-  async release(session) {
-    if (!session) return;
+  release(session) {
+    if (!session) return Promise.resolve();
+    // The worker's STOP and the viewer's CLOSED can race. Teardown runs at
+    // most once per session and resolves only after the encoder stop event,
+    // cropper close, track stops and AudioContext close have all finished.
+    if (!session.releasePromise) session.releasePromise = this.teardown(session);
+    return session.releasePromise;
+  }
+  async teardown(session) {
     clearInterval(session.timer);
     session.listeners.forEach(remove => remove());
     let encoderStopped = Promise.resolve();
