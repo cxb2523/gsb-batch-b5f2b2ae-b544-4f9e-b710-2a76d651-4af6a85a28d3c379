@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node web/map-picker.acceptance.mjs"
   },
   "keywords": [],
   "author": "",
@@ -13,5 +13,8 @@
   "dependencies": {
     "playwright": "^1.60.0",
     "xash3d-fwgs": "^1.2.2"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
   }
 }

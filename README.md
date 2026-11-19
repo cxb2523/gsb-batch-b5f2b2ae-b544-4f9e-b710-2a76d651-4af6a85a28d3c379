@@ -86,6 +86,36 @@ lives in `cstrike/server.cfg` and is intentionally public on a LAN.)
 **Default map at boot.** Edit `command:` in `docker-compose.yml`
 (`["+map", "de_dust2", "+maxplayers", "16"]`) and run `./start.sh`.
 
+### How the picker tracks the switch
+
+The panel is driven by one state object (`window.__csMapState`), so its highlight,
+search filter, disabled state and status line always agree — and an in-progress
+switch survives the engine re-injecting the panel when it rebuilds `<body>`.
+
+- **Before sending anything** it checks that `window.__xash` exists, is running and
+  exposes a command entry point. If not, the panel shows a visible error and stays
+  usable instead of pretending to switch.
+- **While switching** the tiles and search box are disabled, so repeat clicks and a
+  reopened panel cannot submit a second `changelevel`.
+- **Completion is decided by the engine**, not a timer: it watches the current map
+  (engine properties, `getCVar('hostmap')`/`mapname`, and console lines such as
+  `Started map "…"` / `rcon status`). A generous timeout (20 s, override with
+  `window.__CS_MAP_SWITCH_TIMEOUT_MS`) is only the fallback — after it the panel
+  becomes operable again with a failure message, and the highlight reverts to the
+  map the engine actually reports.
+- On success the highlight, filter and disabled state reset to the new current map.
+
+Resulting UX: the panel says **“Switching…”** until the level really changes, then
+**“Now playing …”**; if the change can't be confirmed, it says so and lets you retry.
+
+Local acceptance tests (no server or Docker needed — a fake `__xash` covers ready,
+not-ready, delayed and failing engines):
+
+```bash
+npm install     # once; pulls jsdom (dev dependency)
+npm test        # node web/map-picker.acceptance.mjs
+```
+
 ## Custom maps (e.g. cs_mansion)
 
 Stock CS 1.6 maps ship inside `valve.zip`. Custom (non-stock) maps are **bundled in the
@@ -116,7 +146,10 @@ never modified:
   it reaches the engine. The engine's own in-game menu renders as a black screen in this
   build (its TTF fonts are missing), so we suppress it; the browser still releases the
   mouse, which reveals the map picker instead. The picker lives in `<head>` and
-  self-heals, because the engine rebuilds `<body>` on load.
+  self-heals, because the engine rebuilds `<body>` on load; its switch state is kept on
+  `window` so a rebuild never loses a pending map change or duplicates the panel.
+- **`web/map-picker.acceptance.mjs`** — self-contained acceptance checks for the picker
+  (`npm test`); loads `web/index.html` in jsdom against a fake `__xash`.
 - **`web/main.js`** — **generated** by `./prepare-client.sh`; a one-line patch exposing
   the engine instance on `window.__xash` so the picker can call `rcon changelevel`.
 - **`proxy/nginx.conf`** — a small nginx reverse-proxy sidecar (added in `docker-compose.yml`)
@@ -170,6 +203,7 @@ add-maps.sh            # download custom maps into valve.zip + custom-maps/
 proxy/nginx.conf       # caching reverse-proxy (owns :27016, /websocket passthrough)
 cstrike/server.cfg     # full-money arsenal + RCON password for the map picker
 web/index.html         # patched client page: join UI + loading + map picker + Esc handling
+web/map-picker.acceptance.mjs  # picker acceptance tests against a fake __xash (npm test)
 web/main.js            # generated, gitignored (run prepare-client.sh)
 custom-maps/*.bsp      # bundled custom maps, committed (mounted into the server)
 valve.zip              # game content, gitignored (rebuild via SteamCMD)

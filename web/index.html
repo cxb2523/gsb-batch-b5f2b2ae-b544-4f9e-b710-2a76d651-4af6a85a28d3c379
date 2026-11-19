@@ -33,10 +33,30 @@
         // Lives in <head> and self-heals (re-injects on a tick) so it survives
         // any rebuild of <body>. Switches the server map for everyone via
         // `rcon changelevel`, calling the engine instance web/main.js exposes on
-        // window.__xash. Selection + switching state live on `window` so they
-        // survive a re-inject. Simple UX: instant search, current-map highlight,
-        // "switching…" feedback, Esc / backdrop / ✕ to close, touch-friendly.
+        // window.__xash.
+        //
+        // The panel is driven by one state object (window.__csMapState) so a
+        // <body> rebuild can never lose an in-progress switch:
+        //   idle -> submitting -> switching -> idle (confirmed or failed)
+        //
+        // * A click is accepted only when __xash exists, is running, and exposes
+        //   a command entry point (Cmd_ExecuteString, or the raw emscripten
+        //   Module). Otherwise the panel shows a visible error and stays usable;
+        //   it does NOT enter the switching state.
+        // * While switching, the panel is disabled and duplicate submissions are
+        //   ignored (they survive re-injection because the phase lives on window).
+        // * Completion is decided by the engine, not by a fixed delay: the
+        //   current map is read from __xash properties, getCVar('hostmap'), and
+        //   the engine console ("Started map", rcon status replies). The old
+        //   fixed wait is only kept as a last-resort timeout.
+        // * Success/failure re-render highlight, search filter, disabled state
+        //   and the status line from the same state, so they always agree.
+        //
+        // Acceptance/self-check hook for local tests: window.__csMapAPI exposes
+        // { state, tick, open, close }. See map-picker.acceptance.mjs.
         (function () {
+            'use strict';
+
             // Must match rcon_password in cstrike/server.cfg. Public on a LAN by design.
             var RCON_PW = 'cs16lan';
             var MAPS = [
@@ -48,20 +68,281 @@
             ];
             var CUSTOM = ['cs_mansion']; // non-stock maps added via ./add-maps.sh
 
+            var SWITCH_TIMEOUT_MS = 20000; // last resort; override with window.__CS_MAP_SWITCH_TIMEOUT_MS
+            var POLL_MS = 200;             // engine poll cadence while switching
+            var STATUS_PROBE_MS = 1200;    // rcon status cadence while switching
+            var IDLE_SYNC_MS = 4000;       // idle current-map refresh (keeps highlight honest)
+            var CVAR_PROBE_MS = 900;       // minimum gap between getCVar probes
+
+            // ---- persistent state (survives engine rebuilds of <body>) ----
+            var state = window.__csMapState;
+            if (!state || typeof state !== 'object') state = window.__csMapState = {};
+            // Seed from the pre-existing globals / older snapshots.
+            if (state.phase !== 'switching' && state.phase !== 'submitting') state.phase = 'idle';
+            if (state.phase === 'submitting') state.phase = 'switching'; // never spans a re-init
+            if (typeof state.target !== 'string') state.target = '';
+            if (typeof state.selected !== 'string') {
+                state.selected = (typeof window.__csSelectedMap === 'string') ? window.__csSelectedMap : '';
+            }
+            if (typeof state.beforeMap !== 'string') state.beforeMap = '';
+            if (typeof state.revertTo !== 'string') state.revertTo = '';
+            if (typeof state.statusText !== 'string') state.statusText = '';
+            if (state.statusKind !== 'error' && state.statusKind !== 'success') state.statusKind = 'info';
+            if (typeof state.search !== 'string') state.search = '';
+            if (typeof state.startedAt !== 'number') state.startedAt = 0;
+            if (typeof state.deadlineAt !== 'number') state.deadlineAt = 0;
+            if (typeof state.statusSeq !== 'number') state.statusSeq = 0;
+            state.open = !!state.open;
+            state.submitting = false; // never survives a full reload; rebuilt below
+            state.sawNotRunning = !!state.sawNotRunning;
+            state.sawRestartLog = !!state.sawRestartLog;
+            // A switch restored from a previous script instance still gets a deadline.
+            if (state.phase === 'switching' && !(state.deadlineAt > state.startedAt)) {
+                state.deadlineAt = Date.now() + switchTimeoutMs();
+            }
+            window.__csSelectedMap = state.selected || window.__csSelectedMap || null;
+            window.__csSwitching = state.phase === 'switching';
+
+            // ---- runtime-only bookkeeping ----
+            var watchTimer = null;
+            var cvarInFlight = false, cvarValue = '', cvarAt = 0, cvarMisses = 0, cvarBlockedUntil = 0, cvarToken = 0;
+            var engineGoneSince = 0;
+            var lastCvarProbe = 0, lastStatusProbe = 0, lastIdleProbe = -Infinity;
+            var logValue = '', logAt = 0, logTapActive = false;
+            var tappedModules = (typeof WeakMap === 'function') ? new WeakMap() : null;
+
+            function now() { return Date.now(); }
+            function switchTimeoutMs() {
+                var v = Number(window.__CS_MAP_SWITCH_TIMEOUT_MS);
+                return (isFinite(v) && v > 0) ? v : SWITCH_TIMEOUT_MS;
+            }
             function css(el, s) { for (var k in s) el.style[k] = s[k]; }
             function tiles() { return document.querySelectorAll('#cs-mapgrid .cs-maptile'); }
 
-            function closePicker() {
-                var o = document.getElementById('cs-mapmenu');
-                if (o) o.style.display = 'none';
-                var b = document.getElementById('cs-mapbtn');
-                if (b) { try { b.focus(); } catch (e) {} }
+            function removeEl(el) {
+                if (!el) return;
+                if (el.parentNode && el.parentNode.removeChild) el.parentNode.removeChild(el);
+                else if (typeof el.remove === 'function') el.remove();
             }
-            window.__csMapClose = closePicker;
+            // Guard against duplicated panels after a weird rebuild: keep one node.
+            function dedupe(id) {
+                var list = document.querySelectorAll('#' + id);
+                if (!list || !list.length) return document.getElementById(id);
+                for (var i = list.length - 1; i > 0; i--) removeEl(list[i]);
+                return list[0];
+            }
 
-            // Highlight the currently-/last-selected map; reset the rest.
+            // Map names arrive as "de_dust2", "maps/de_dust2.bsp", quoted, etc.
+            function normMap(v) {
+                if (typeof v !== 'string') return '';
+                var s = v.trim().replace(/^["'\s]+|["'\s]+$/g, '').replace(/\\/g, '/');
+                var slash = s.lastIndexOf('/');
+                if (slash >= 0) s = s.slice(slash + 1);
+                s = s.replace(/\.bsp$/i, '');
+                return s.toLowerCase();
+            }
+
+            // ---- engine probes -------------------------------------------------
+            function readRunning(x) {
+                try { return (x && ('running' in x)) ? !!x.running : undefined; } catch (e) { return undefined; }
+            }
+
+            // Returns a command executor, or null when the engine isn't usable.
+            // Requiring `running` is what stops a click during engine boot from
+            // being silently dropped while the UI claims "switching".
+            function engineExecutor(x) {
+                if (!x || (typeof x !== 'object' && typeof x !== 'function')) return null;
+                try {
+                    if (x.exited === true) return null;
+                    if ('running' in x && !x.running) return null;
+                } catch (e) { return null; }
+                if (typeof x.Cmd_ExecuteString === 'function') {
+                    return function (cmd) { return x.Cmd_ExecuteString(cmd); };
+                }
+                try {
+                    if (x.em && x.em.Module && typeof x.em.Module.ccall === 'function') {
+                        return function (cmd) {
+                            return x.em.Module.ccall('Cmd_ExecuteString', null, ['string'], [cmd]);
+                        };
+                    }
+                } catch (e) {}
+                return null;
+            }
+
+            function engineProblem(x) {
+                if (!x) return "Can't switch maps yet — the game engine isn't running. Start the game, then try again.";
+                try {
+                    if (x.exited === true) return "Can't switch maps — the game engine has stopped. Reload the page to play again.";
+                    if ('running' in x && !x.running) return "Can't switch maps yet — the game engine is still loading. Wait a moment, then try again.";
+                } catch (e) { return "Can't switch maps — the game engine isn't responding. Reload the page and try again."; }
+                return "Can't switch maps — this build doesn't expose an engine command entry point. Reload the page and try again.";
+            }
+
+            function readMapProp(x) {
+                if (!x) return '';
+                var keys = ['map', 'mapname', 'currentMap', 'curMap', 'level'];
+                for (var i = 0; i < keys.length; i++) {
+                    try {
+                        var v = x[keys[i]];
+                        if (typeof v === 'string') {
+                            var m = normMap(v);
+                            if (m) return m;
+                        }
+                    } catch (e) {}
+                }
+                return '';
+            }
+
+            // Freshest engine-observed map name from any available source.
+            function observedMap(x) {
+                var direct = readMapProp(x);
+                if (direct) return direct;
+                var best = '', bestAt = -1;
+                if (cvarValue && cvarAt > bestAt) { best = cvarValue; bestAt = cvarAt; }
+                if (logValue && logAt > bestAt) { best = logValue; bestAt = logAt; }
+                if (best && now() - bestAt < 120000) return best;
+                return '';
+            }
+
+            // The wrapper's getCVar() asks the engine to print `"name" is "value"`.
+            // `hostmap` is Xash's current-map cvar; `mapname` covers other builds.
+            // Probe adaptively: if neither exists, stop pestering the console.
+            function probeCvar(x) {
+                if (!x || typeof x.getCVar !== 'function' || cvarInFlight) return;
+                if (now() < cvarBlockedUntil) return;
+                if (now() - lastCvarProbe < CVAR_PROBE_MS) return;
+                lastCvarProbe = now();
+                cvarInFlight = true;
+                var token = ++cvarToken;
+                var names = ['hostmap', 'mapname'], i = 0, gotValue = false;
+                function done() {
+                    // Only the probe that is still current may clear the flag, so a
+                    // stale promise can't unlock (or wedge) a newer probe.
+                    if (cvarToken === token) cvarInFlight = false;
+                }
+                function step() {
+                    if (cvarToken !== token) return;
+                    if (i >= names.length) {
+                        done();
+                        if (!gotValue) {
+                            cvarMisses++;
+                            if (cvarMisses >= 2) cvarBlockedUntil = now() + 30000;
+                        }
+                        return;
+                    }
+                    var name = names[i++], p;
+                    try { p = x.getCVar(name, 350); } catch (e) { done(); return; }
+                    if (!p || typeof p.then !== 'function') { step(); return; }
+                    p.then(function (v) {
+                        if (cvarToken !== token) return; // superseded probe
+                        var m = normMap(v);
+                        if (m) { gotValue = true; cvarValue = m; cvarAt = now(); done(); }
+                        else step();
+                    }, function () { step(); });
+                }
+                step();
+                // The wrapper only rejects waitLog on the next console line; never
+                // let a lost probe wedge us.
+                setTimeout(done, 1500);
+            }
+
+            // Ask the server for `status`; its reply (map: de_dust2) is echoed to
+            // this client's console, which noteEngineLog() reads. Only useful when
+            // we managed to hook the console.
+            function probeStatus(x) {
+                if (!logTapActive || !x || typeof x.Cmd_ExecuteString !== 'function') return;
+                if (state.phase !== 'switching') return;
+                if (now() - lastStatusProbe < STATUS_PROBE_MS) return;
+                lastStatusProbe = now();
+                try { x.Cmd_ExecuteString('rcon status'); } catch (e) {}
+            }
+
+            // The engine wrapper forwards every console line to
+            // this.opts.module.print/printErr, looked up lazily at call time, so
+            // wrapping them here lets us observe engine output ("Started map",
+            // rcon replies) without patching the bundle. opts.module may be
+            // absent — create it, the wrapper reads it lazily.
+            function attachLogTap(x) {
+                if (!x || typeof x !== 'object') return;
+                var opts, mod;
+                try { opts = x.opts; } catch (e) { return; }
+                if (!opts || typeof opts !== 'object') return;
+                try {
+                    mod = opts.module;
+                    if (!mod || typeof mod !== 'object') { mod = opts.module = {}; }
+                } catch (e) { return; }
+                if (tappedModules) {
+                    if (tappedModules.get(mod)) { logTapActive = true; return; }
+                } else if (mod.__csMapTapped) { logTapActive = true; return; }
+                try {
+                    var origPrint = mod.print, origErr = mod.printErr;
+                    mod.print = function (line) {
+                        noteEngineLog(line);
+                        if (typeof origPrint === 'function') { try { origPrint.apply(mod, arguments); } catch (e) {} }
+                    };
+                    mod.printErr = function (line) {
+                        noteEngineLog(line);
+                        if (typeof origErr === 'function') { try { origErr.apply(mod, arguments); } catch (e) {} }
+                    };
+                    if (tappedModules) tappedModules.set(mod, true);
+                    else mod.__csMapTapped = true;
+                    logTapActive = true;
+                } catch (e) {}
+            }
+
+            // Belt-and-braces: the wrapper routes every console line through its
+            // own waitLog machinery, which a harness can rely on even if the log
+            // tap above is unavailable. Resolves when the engine reports the
+            // level having started; rejections/timeouts are ignored.
+            function watchStartedMap(x, timeoutMs) {
+                if (!x || typeof x.waitLog !== 'function') return;
+                try {
+                    var p = x.waitLog('Started map', undefined, timeoutMs);
+                    if (p && typeof p.then === 'function') {
+                        p.then(function (line) { noteEngineLog(line); }, function () {});
+                    }
+                } catch (e) {}
+            }
+
+            function noteMap(raw, source) {
+                var m = normMap(raw);
+                if (!m) return;
+                // Console text can look like a map key without being one
+                // (e.g. 'run the map: "%s"'). Real map names are plain names.
+                if (!/^[a-z0-9_-]+$/.test(m)) return;
+                if (source === 'log') { logValue = m; logAt = now(); }
+            }
+
+            function noteEngineLog(line) {
+                if (line == null) return;
+                var s = String(line)
+                    .replace(/\x1b\[[0-9;]*m/g, '') // ANSI colours
+                    .replace(/\^[0-9]/g, '');        // Xash ^1..^9 colour codes
+                var m;
+                if ((m = /Started map "([^"]+)"/i.exec(s)) ||
+                    (m = /(?:Spawn|Started) Server:\s*([^\s\[\]]+)/i.exec(s))) {
+                    noteMap(m[1], 'log'); return;
+                }
+                // rcon status reply is exactly "map: <name>".
+                if ((m = /^map\s*:\s*([^\s,;]+)/i.exec(s))) {
+                    noteMap(m[1], 'log'); return;
+                }
+                // Client side of a server changelevel: the engine tears the level
+                // down and reconnects. Proof the switch is happening, even though
+                // this client never prints the server's "Started map" line. (A
+                // plain "Server disconnected" is a network blip, not evidence.)
+                if (state.phase === 'switching' && /Server changing, reconnecting/i.test(s)) {
+                    state.sawRestartLog = true;
+                    return;
+                }
+                if (state.phase === 'switching' && /\bbad rcon\b|invalid rcon|rcon password/i.test(s)) {
+                    failSwitch("The server rejected the map change (rcon failed). Try again.");
+                }
+            }
+
+            // ---- rendering (all from `state`) --------------------------------
             function applyHighlight() {
-                var sel = window.__csSelectedMap, t = tiles();
+                var sel = state.selected, t = tiles();
                 for (var i = 0; i < t.length; i++) {
                     var el = t[i], name = el.getAttribute('data-map'), custom = el.getAttribute('data-custom') === '1';
                     if (name === sel) {
@@ -74,60 +355,299 @@
                 }
             }
 
-            function setSwitching(on) {
+            function setSwitchingUI(on) {
                 var t = tiles();
                 for (var i = 0; i < t.length; i++) {
-                    t[i].disabled = on; t[i].style.opacity = on ? '.45' : '1'; t[i].style.pointerEvents = on ? 'none' : 'auto';
+                    t[i].disabled = on;
+                    t[i].style.opacity = on ? '.45' : '1';
+                    t[i].style.pointerEvents = on ? 'none' : 'auto';
                 }
-                var s = document.getElementById('cs-mapsearch'); if (s) s.disabled = on;
+                var s = document.getElementById('cs-mapsearch');
+                if (s) s.disabled = on;
             }
 
-            function switchMap(name) {
-                if (window.__csSwitching) return; // guard against double-fire
-                window.__csSelectedMap = name;
-                applyHighlight();
-                var x = window.__xash;
-                if (x && x.Cmd_ExecuteString) {
-                    x.Cmd_ExecuteString('rcon_password ' + RCON_PW);
-                    x.Cmd_ExecuteString('rcon changelevel ' + name);
+            function renderStatus() {
+                var el = document.getElementById('cs-mapstatus');
+                if (!el) return;
+                if (!state.statusText) {
+                    el.textContent = '';
+                    el.style.display = 'none';
+                    return;
                 }
-                window.__csSwitching = true;
-                setSwitching(true);
-                var status = document.getElementById('cs-mapstatus');
-                if (status) { status.textContent = 'Switching to ' + name + '…  (takes a few seconds)'; status.style.display = 'block'; }
-                setTimeout(function () {
-                    window.__csSwitching = false;
-                    setSwitching(false);
-                    var st = document.getElementById('cs-mapstatus'); if (st) st.style.display = 'none';
-                    closePicker();
-                }, 4000);
+                el.textContent = state.statusText;
+                el.style.display = 'block';
+                el.style.color = state.statusKind === 'error' ? '#ff8a80'
+                    : (state.statusKind === 'success' ? '#8fd18f' : '#f6b265');
+                el.setAttribute('role', state.statusKind === 'error' ? 'alert' : 'status');
+                el.setAttribute('aria-live', state.statusKind === 'error' ? 'assertive' : 'polite');
             }
 
             function filterMaps() {
                 var s = document.getElementById('cs-mapsearch');
-                var q = s ? s.value.toLowerCase().trim() : '';
+                var q = s ? s.value.toLowerCase().trim() : state.search;
                 var t = tiles(), visible = 0;
                 for (var i = 0; i < t.length; i++) {
                     var show = t[i].getAttribute('data-map').indexOf(q) > -1;
                     t[i].style.display = show ? '' : 'none';
                     if (show) visible++;
                 }
-                var none = document.getElementById('cs-mapnone'); if (none) none.style.display = visible ? 'none' : 'block';
+                var none = document.getElementById('cs-mapnone');
+                if (none) none.style.display = visible ? 'none' : 'block';
             }
+
+            // Single render path: highlight + disabled + search + status + open.
+            function render() {
+                applyHighlight();
+                setSwitchingUI(state.phase === 'switching' || state.submitting);
+                var o = document.getElementById('cs-mapmenu');
+                if (o) o.style.display = state.open ? 'flex' : 'none';
+                var s = document.getElementById('cs-mapsearch');
+                if (s && s.value !== state.search) s.value = state.search;
+                filterMaps();
+                renderStatus();
+            }
+
+            function updateStatus(kind, text) {
+                state.statusKind = kind;
+                state.statusText = text;
+                state.statusSeq++;
+                renderStatus();
+                return state.statusSeq;
+            }
+
+            function clearStatusLater(seq, ms) {
+                setTimeout(function () {
+                    if (state.statusSeq !== seq || state.phase !== 'idle') return;
+                    state.statusText = '';
+                    state.statusKind = 'info';
+                    renderStatus();
+                }, ms);
+            }
+
+            // ---- switching lifecycle ------------------------------------------
+            function stopWatcher() {
+                if (watchTimer) { clearTimeout(watchTimer); watchTimer = null; }
+            }
+            function ensureWatcher() {
+                if (watchTimer || state.phase !== 'switching') return;
+                watchTimer = setTimeout(watchStep, POLL_MS);
+            }
+
+            function failSwitch(message) {
+                // A click that got past validation already moved the highlight to
+                // the target; on failure put it back so the panel never shows a
+                // map the engine did not actually load.
+                var wasAccepted = (state.phase === 'switching' || state.submitting);
+                if (wasAccepted && state.selected !== state.revertTo) {
+                    state.selected = state.revertTo || '';
+                    window.__csSelectedMap = state.selected || null;
+                }
+                state.phase = 'idle';
+                state.submitting = false;
+                state.sawNotRunning = false;
+                state.sawRestartLog = false;
+                state.beforeMap = '';
+                state.revertTo = '';
+                state.search = '';
+                window.__csSwitching = false;
+                engineGoneSince = 0;
+                stopWatcher();
+                updateStatus('error', message);
+                render();
+            }
+
+            function finishSwitch(observed) {
+                // Trust what the engine reported; only fall back to the clicked
+                // name when the engine gave us no readable map at all.
+                var played = observed || state.target;
+                state.phase = 'idle';
+                state.submitting = false;
+                state.sawNotRunning = false;
+                state.sawRestartLog = false;
+                state.selected = played;
+                state.beforeMap = '';
+                state.revertTo = '';
+                state.search = '';
+                window.__csSelectedMap = played;
+                window.__csSwitching = false;
+                engineGoneSince = 0;
+                stopWatcher();
+                var seq = updateStatus('success', 'Now playing ' + played + '.');
+                render();
+                clearStatusLater(seq, 2500);
+            }
+
+            // Returns the map name to report on success, or '' when the engine
+            // hasn't (yet) shown a real change. Requiring evidence is what keeps
+            // a stale cvar read from finishing the switch instantly.
+            function confirmedMap(map) {
+                var sawRestart = state.sawNotRunning || state.sawRestartLog;
+                if (map) {
+                    // The engine's own "Started map" line, recorded post-command.
+                    if (logValue === map && logAt >= state.startedAt) return map;
+                    // A reading that differs from the pre-click baseline.
+                    if (state.beforeMap && map !== state.beforeMap) return map;
+                }
+                // A stop/restart cycle or the client's changelevel notice proves
+                // the level reloaded; report the map we asked for when the
+                // engine's own reading is absent or still stale.
+                if (sawRestart) return state.target || map || '';
+                return '';
+            }
+
+            function watchStep() {
+                watchTimer = null;
+                if (state.phase !== 'switching') return;
+                var x = window.__xash;
+                // The engine object still being there but not running is exactly
+                // what a level reload looks like; remember it as transition
+                // evidence (a fully absent __xash is treated the same, below).
+                if (readRunning(x) === false) state.sawNotRunning = true;
+                if (!engineExecutor(x)) {
+                    // A changelevel briefly tears the client down; give the engine
+                    // a grace window to come back before declaring failure.
+                    if (!engineGoneSince) engineGoneSince = now();
+                    if (now() - engineGoneSince > 5000) {
+                        failSwitch("Lost the game engine while switching maps. Reload the page and try again.");
+                        return;
+                    }
+                    if (now() >= state.deadlineAt) {
+                        failSwitch("Couldn't confirm the map change to " + state.target +
+                            " — the server didn't report a new map in time. It may still change; check the game and try again.");
+                        return;
+                    }
+                    ensureWatcher();
+                    return;
+                }
+                engineGoneSince = 0;
+                probeCvar(x);
+                probeStatus(x);
+                var map = observedMap(x);
+                var done = confirmedMap(map);
+                if (done) { finishSwitch(done); return; }
+                if (now() >= state.deadlineAt) {
+                    failSwitch("Couldn't confirm the map change to " + state.target +
+                        " — the server didn't report a new map in time. It may still change; check the game and try again.");
+                    return;
+                }
+                ensureWatcher();
+            }
+
+            function switchMap(name) {
+                // Accept a real click (an event), a map name, or a tile element.
+                if (name && typeof name === 'object') {
+                    if (name.currentTarget && name.currentTarget.getAttribute) {
+                        name = name.currentTarget.getAttribute('data-map');
+                    } else if (name.getAttribute) {
+                        name = name.getAttribute('data-map');
+                    } else if (name.target && name.target.getAttribute) {
+                        name = name.target.getAttribute('data-map');
+                    }
+                }
+                name = String(name == null ? '' : name).trim();
+                if (!name) return;
+                // Duplicate submission: already switching (or commands in flight).
+                if (state.phase === 'switching' || state.submitting) {
+                    if (state.phase === 'switching') {
+                        updateStatus('info', 'Still switching to ' + state.target + '…');
+                    }
+                    return;
+                }
+
+                var x = window.__xash;
+                var exec = engineExecutor(x);
+                if (!exec) {
+                    // Visible failure, no switching state, panel stays usable.
+                    updateStatus('error', engineProblem(x));
+                    render();
+                    return;
+                }
+
+                // Baseline for "did the map really change?": prefer the value
+                // the engine exposes directly, else the last map we observed
+                // (cvar/log during idle sync), else our own last confirmation.
+                // Read it BEFORE the observation buffers are cleared below.
+                state.revertTo = readMapProp(x) || observedMap(x) || state.selected || '';
+                state.beforeMap = state.revertTo;
+                state.target = normMap(name) || name;
+                state.selected = state.target;
+                state.search = '';
+                state.submitting = true;
+                state.startedAt = now();
+                state.deadlineAt = state.startedAt + switchTimeoutMs();
+                // Drop pre-click observations so only post-command evidence can
+                // confirm the switch (a stale reading must not fake success).
+                logValue = ''; logAt = 0; cvarValue = ''; cvarAt = 0;
+                lastCvarProbe = 0; lastStatusProbe = 0;
+                window.__csSelectedMap = state.target;
+                updateStatus('info', 'Switching to ' + state.target + '…');
+                render(); // disables tiles synchronously: no window for a double click
+
+                attachLogTap(x);
+                watchStartedMap(x, switchTimeoutMs());
+                var r1, r2;
+                try {
+                    r1 = exec('rcon_password ' + RCON_PW);
+                    r2 = exec('rcon changelevel ' + name);
+                    if (r1 === false || r2 === false) throw new Error('command rejected');
+                } catch (e) {
+                    // Still in the `submitting` phase, so failSwitch reverts the
+                    // optimistic highlight.
+                    failSwitch("Couldn't send the map change to the game engine. Try again.");
+                    return;
+                }
+
+                state.submitting = false;
+                state.phase = 'switching';
+                state.sawNotRunning = false;
+                state.sawRestartLog = false;
+                engineGoneSince = 0;
+                window.__csSwitching = true;
+                render();
+                ensureWatcher();
+            }
+
+            // ---- panel UI ------------------------------------------------------
+            function closePicker() {
+                state.open = false;
+                var o = document.getElementById('cs-mapmenu');
+                if (o) o.style.display = 'none';
+                var b = document.getElementById('cs-mapbtn');
+                if (b) { try { b.focus(); } catch (e) {} }
+            }
+            window.__csMapClose = closePicker;
 
             function openPicker() {
                 var o = document.getElementById('cs-mapmenu');
                 if (!o) return;
-                o.style.display = 'flex';
+                state.open = true;
+                if (state.phase !== 'switching') state.search = ''; // fresh pick; keep it while switching
+                render();
+                if (state.phase !== 'switching') {
+                    // Learn the current map now, so a later click has a baseline
+                    // to compare against even on builds that only expose cvars.
+                    attachLogTap(window.__xash);
+                    lastIdleProbe = -Infinity;
+                    probeCvar(window.__xash);
+                    try { o.querySelector('#cs-mapsearch').focus(); } catch (e) {
+                        var s = document.getElementById('cs-mapsearch');
+                        if (s) { try { s.focus(); } catch (e2) {} }
+                    }
+                }
                 if (document.exitPointerLock) { try { document.exitPointerLock(); } catch (e) {} }
-                setTimeout(function () {
-                    var s = document.getElementById('cs-mapsearch');
-                    if (s) { s.value = ''; filterMaps(); try { s.focus(); } catch (e) {} }
-                }, 0);
             }
 
             function build() {
-                if (!document.body || document.getElementById('cs-mapbtn')) return;
+                if (!document.body) return;
+                // One panel, always: a rebuild plus a late tick can leave stray
+                // duplicates, and a half-wiped state can leave the button behind.
+                dedupe('cs-mapbtn');
+                dedupe('cs-mapmenu');
+                var haveBtn = document.getElementById('cs-mapbtn');
+                var haveMenu = document.getElementById('cs-mapmenu');
+                if (haveBtn && haveMenu) return;
+                if (haveBtn) removeEl(haveBtn);
+                if (haveMenu) removeEl(haveMenu);
 
                 var btn = document.createElement('button');
                 btn.id = 'cs-mapbtn';
@@ -188,7 +708,10 @@
                     font: '14px Arial, sans-serif', outline: 'none' });
                 search.onfocus = function () { search.style.borderColor = '#f6b265'; };
                 search.onblur = function () { search.style.borderColor = '#444'; };
-                search.oninput = filterMaps;
+                search.oninput = function () {
+                    state.search = search.value;
+                    filterMaps();
+                };
                 search.onkeydown = function (e) {
                     if (e.key === 'Enter') {
                         var vis = [], t = tiles();
@@ -216,7 +739,8 @@
                         borderRadius: '8px', padding: '11px 8px', cursor: 'pointer', fontSize: '13px',
                         transition: 'background .12s, border-color .12s' });
                     m.onmouseover = function () {
-                        if (m.getAttribute('data-map') !== window.__csSelectedMap) { m.style.background = '#383838'; m.style.borderColor = '#f6b265'; }
+                        if (state.phase === 'switching' || state.submitting) return;
+                        if (m.getAttribute('data-map') !== state.selected) { m.style.background = '#383838'; m.style.borderColor = '#f6b265'; }
                     };
                     m.onmouseout = function () { applyHighlight(); };
                     m.onclick = function () { switchMap(name); };
@@ -240,21 +764,86 @@
 
                 document.body.appendChild(btn);
                 document.body.appendChild(overlay);
-                applyHighlight();
+
+                // A <body> rebuild must not drop an in-progress switch: the tick
+                // below re-attaches the engine tap and re-arms the watcher, and
+                // render() paints the restored phase (disabled tiles, status).
+                attachLogTap(window.__xash);
+                render();
+                if (state.phase === 'switching') ensureWatcher();
+            }
+
+            // Idle current-map sync: keep the highlight honest if the server map
+            // changed for another reason (previous map ended, someone else picked).
+            function idleSync(x) {
+                if (state.phase !== 'idle') return;
+                if (!engineExecutor(x)) return;
+                var map = observedMap(x);
+                if (map && map !== state.selected) {
+                    state.selected = map;
+                    window.__csSelectedMap = map;
+                    applyHighlight();
+                }
+                if (now() - lastIdleProbe >= IDLE_SYNC_MS) {
+                    lastIdleProbe = now();
+                    probeCvar(x);
+                }
             }
 
             function tick() {
                 build(); // re-inject if the engine wiped <body>
                 var btn = document.getElementById('cs-mapbtn');
                 if (!btn) return;
-                var running = !!(window.__xash && window.__xash.running);
+                var x = window.__xash;
+                var running = !!(x && x.running);
                 var free = !document.pointerLockElement;
                 // Show the button when the game is running and the mouse is free.
                 // On desktop the player presses Esc (released pointer-lock) to reach
                 // it; on touch there is no pointer-lock so `free` is always true and
                 // the button is simply available while playing.
                 btn.style.display = (running && free) ? 'block' : 'none';
+
+                if (state.phase === 'switching') {
+                    // Re-arm after a full <body> rebuild wiped our timer.
+                    attachLogTap(x);
+                    ensureWatcher();
+                    renderStatus();
+                } else {
+                    idleSync(x);
+                }
             }
+
+            // Exposed for the local acceptance script (map-picker.acceptance.mjs).
+            window.__csMapAPI = {
+                state: state,
+                tick: tick,
+                open: openPicker,
+                close: closePicker,
+                noteLog: noteEngineLog,
+                reset: function () {
+                    stopWatcher();
+                    state.phase = 'idle';
+                    state.submitting = false;
+                    state.target = '';
+                    state.beforeMap = '';
+                    state.revertTo = '';
+                    state.statusText = '';
+                    state.statusKind = 'info';
+                    state.search = '';
+                    state.startedAt = state.deadlineAt = 0;
+                    state.statusSeq = 0;
+                    state.sawNotRunning = false;
+                    state.sawRestartLog = false;
+                    state.selected = '';
+                    window.__csSelectedMap = null;
+                    window.__csSwitching = false;
+                    cvarValue = cvarAt = cvarMisses = 0;
+                    cvarInFlight = false;
+                    cvarBlockedUntil = 0;
+                    logValue = ''; logAt = 0;
+                    render();
+                }
+            };
 
             document.addEventListener('pointerlockchange', tick, false);
             setInterval(tick, 800);
