@@ -6,7 +6,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import { clampPt, needsTidy, nearestInDirection, type Dir } from "../../lib/geometry.ts";
 import { safeAreaInsets } from "../../lib/safeArea.ts";
 import { KEYS, readString } from "../../lib/storage.ts";
-import { canUndo, isSettled, placeTile, pruneTiles, pushUndo, setBounds, setFocus, useCanvas } from "../../state/canvas.ts";
+import { canUndo, isSettled, mergePending, placeTile, pruneTiles, pushUndo, setBounds, setFocus, useCanvas } from "../../state/canvas.ts";
 import { useGame } from "../../state/game.ts";
 import { useUi } from "../../state/ui.ts";
 import { BroomIcon, CloseIcon, MoreIcon, TidyIcon, UndoIcon } from "../../components/Icons.tsx";
@@ -114,8 +114,9 @@ function SelectionPill() {
 
 function Toolbar({ empty }: { empty: boolean }) {
   const undoable = useCanvas((s) => canUndo(s));
+  const busy = useCanvas((s) => mergePending(s));
   const suggestTidy = useCanvas((s) => {
-    if (!s.bounds || s.tiles.length < 6) return false;
+    if (!s.bounds || mergePending(s) || s.tiles.length < 6) return false;
     return needsTidy(s.tiles.filter((t) => !t.leaving), s.bounds, s.T);
   });
   return (
@@ -137,10 +138,10 @@ function Toolbar({ empty }: { empty: boolean }) {
       <button type="button" className="tool" aria-label="Undo" title="Undo (Ctrl+Z)" data-testid="canvas-undo" disabled={!undoable} onClick={doUndo}>
         <UndoIcon />
       </button>
-      <button type="button" className="tool" aria-label="Tidy workbench" title="Tidy (T)" data-testid="canvas-tidy" disabled={empty} onClick={tidyCanvas}>
+      <button type="button" className="tool" aria-label="Tidy workbench" title="Tidy (T)" data-testid="canvas-tidy" disabled={empty || busy} onClick={tidyCanvas}>
         <TidyIcon />
       </button>
-      <button type="button" className="tool" aria-label="Clear workbench" title="Clear (C)" data-testid="canvas-clear" disabled={empty} onClick={clearCanvas}>
+      <button type="button" className="tool" aria-label="Clear workbench" title="Clear (C)" data-testid="canvas-clear" disabled={empty || busy} onClick={clearCanvas}>
         <BroomIcon />
       </button>
     </div>
@@ -232,6 +233,7 @@ export function Workbench() {
     }
     if (e.key === "m" || e.key === "M") {
       e.preventDefault();
+      if (mergePending(s)) return; // the layout is frozen until the combine lands
       if (!moveMode) pushUndo();
       setMoveMode((v) => !v);
       return;

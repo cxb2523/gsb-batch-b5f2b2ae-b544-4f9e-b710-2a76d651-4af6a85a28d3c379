@@ -16,6 +16,7 @@ import {
   isSettled,
   markLeaving,
   MAX_CANVAS_TILES,
+  mergePending,
   newUid,
   nextFxKey,
   patchTile,
@@ -79,6 +80,18 @@ export function doRedo(): void {
 
 // ------------------------------------------------------------------ spawning
 
+/**
+ * The workbench is frozen while a combine is in flight: spawning, merging, removing,
+ * clearing and tidying are all rejected so the layout, the undo stack and the persisted
+ * snapshot stay consistent with the pre-merge state until the result lands.
+ */
+function busyMerging(): boolean {
+  if (!mergePending()) return false;
+  showToast({ kind: "info", text: "One mix at a time — wait for the combine to finish.", duration: 2_000 });
+  announce("A combine is already in progress. Wait for it to finish.");
+  return true;
+}
+
 function liveCount(): number {
   return useCanvas.getState().tiles.filter((t) => !t.leaving).length;
 }
@@ -129,7 +142,7 @@ function spawnPoint(near?: Pt): Pt | null {
  * combines it with the selection in one step (or adds it to a multi-selection).
  */
 export function spawnElement(elementId: ElementId, opts: { focus?: boolean } = {}): string | null {
-  if (canvasFull()) return null;
+  if (busyMerging() || canvasFull()) return null;
   const { selection, multi, tiles } = useCanvas.getState();
   const selected = selection.map((u) => tiles.find((t) => t.uid === u)).filter((t) => !!t && isSettled(t));
   const anchor = selected[selected.length - 1];
@@ -157,7 +170,7 @@ export function spawnElement(elementId: ElementId, opts: { focus?: boolean } = {
 
 /** A library ghost dropped on empty canvas. Returns the new tile uid. */
 export function dropNewTile(elementId: ElementId, at: Pt, from: Pt, snapshot = true): string | null {
-  if (canvasFull()) return null;
+  if (busyMerging() || canvasFull()) return null;
   if (snapshot) commit();
   const uid = addTile({ elementId, x: at.x, y: at.y, enterFrom: from, fx: "drop", fxKey: nextFxKey() });
   trackOncePerSession("first_tile", { via: "drag" });
@@ -251,6 +264,8 @@ interface MergeOpts {
  * cache) answers. On failure the inputs spring back to where they were.
  */
 export async function mergeTiles(uids: readonly string[], at: Pt, opts: MergeOpts = {}): Promise<void> {
+  // One combine at a time: a second merge would interleave undo entries and pending tiles.
+  if (busyMerging()) return;
   const { tiles } = useCanvas.getState();
   const inputs = uids
     .map((u) => tiles.find((t) => t.uid === u))
@@ -367,6 +382,7 @@ function succeedMerge(pendingUid: string, ids: ElementId[], res: CombineResponse
 // ------------------------------------------------------------------ remove / clear / tidy
 
 export function removeTile(uid: string, toLibrary = false): void {
+  if (busyMerging()) return;
   const t = useCanvas.getState().tiles.find((x) => x.uid === uid);
   if (!t || !isSettled(t)) return;
   commit();
@@ -375,6 +391,7 @@ export function removeTile(uid: string, toLibrary = false): void {
 }
 
 export function clearCanvas(): void {
+  if (busyMerging()) return;
   const live = useCanvas.getState().tiles.filter(isSettled);
   if (live.length === 0) return;
   commit();
@@ -385,6 +402,7 @@ export function clearCanvas(): void {
 }
 
 export function tidyCanvas(): void {
+  if (busyMerging()) return;
   const live = useCanvas.getState().tiles.filter((t) => !t.leaving);
   if (live.length === 0) return;
   commit();

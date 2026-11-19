@@ -14,7 +14,7 @@ import { clampPt, dist, magnetOffset, MERGE_RADIUS, trackTarget, type Candidate,
 import { haptic } from "../../lib/haptics.ts";
 import { playSound } from "../../lib/sound.ts";
 import { SPRING } from "../../lib/spring.ts";
-import { bringToFront, isSettled, placeTile, pushUndo, setSelection, useCanvas } from "../../state/canvas.ts";
+import { bringToFront, isSettled, mergePending, placeTile, pushUndo, setSelection, useCanvas } from "../../state/canvas.ts";
 import { openDetails, useUi } from "../../state/ui.ts";
 import { collapseShelf, dropNewTile, mergeTiles, removeTile, spawnElement, tapTile } from "./actions.ts";
 import { canvasRect, overLibrary, toCanvas } from "./layout.ts";
@@ -79,7 +79,8 @@ export function installTouchGuard(): void {
 // ------------------------------------------------------------------ press entry points
 
 export function pressLibraryTile(e: React.PointerEvent<HTMLElement>, elementId: ElementId, mode: PressMode): void {
-  if (s || (e.pointerType === "mouse" && e.button !== 0) || !e.isPrimary) return;
+  // The workbench is frozen while a combine is in flight: no new drags.
+  if (s || mergePending() || (e.pointerType === "mouse" && e.button !== 0) || !e.isPrimary) return;
   const r = e.currentTarget.getBoundingClientRect();
   const T = useCanvas.getState().T;
   const k = T / r.width;
@@ -90,7 +91,7 @@ export function pressLibraryTile(e: React.PointerEvent<HTMLElement>, elementId: 
 }
 
 export function pressCanvasTile(e: React.PointerEvent<HTMLElement>, uid: string): void {
-  if (s || (e.pointerType === "mouse" && e.button !== 0) || !e.isPrimary) return;
+  if (s || mergePending() || (e.pointerType === "mouse" && e.button !== 0) || !e.isPrimary) return;
   const tile = useCanvas.getState().tiles.find((t) => t.uid === uid);
   if (!tile || !isSettled(tile)) return;
   const rect = canvasRect();
@@ -438,6 +439,12 @@ function abort(sess: Session): void {
 }
 
 function drop(sess: Session): void {
+  // A combine started while this drag was airborne (e.g. a tap-merge on another tile):
+  // the layout is frozen until it resolves, so cancel the drop instead of placing.
+  if (mergePending()) {
+    abort(sess);
+    return;
+  }
   const { T, tiles, bounds } = useCanvas.getState();
   const rect = sess.rect;
   const raw = toCanvas(sess.x + sess.grab.x, sess.y + sess.grab.y, rect);

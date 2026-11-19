@@ -142,8 +142,11 @@ export function pushUndo(): void {
   set((s) => ({ undo: [...s.undo, snap].slice(-UNDO_DEPTH), redo: [] }));
 }
 
-export const canUndo = (s: CanvasState = get()) => s.undo.length > 0 && !s.tiles.some((t) => t.pending);
-export const canRedo = (s: CanvasState = get()) => s.redo.length > 0 && !s.tiles.some((t) => t.pending);
+/** True while a combine is in flight (a pending crucible tile is on the canvas). */
+export const mergePending = (s: CanvasState = get()) => s.tiles.some((t) => t.pending);
+
+export const canUndo = (s: CanvasState = get()) => s.undo.length > 0 && !mergePending(s);
+export const canRedo = (s: CanvasState = get()) => s.redo.length > 0 && !mergePending(s);
 
 function restoreSnapshot(snap: SavedTile[]): void {
   set((s) => {
@@ -219,7 +222,8 @@ export function markLeaving(uids: readonly string[], to?: Pt): void {
 /** Move a tile, then let overlapping neighbours make room (the moved tile stays put). */
 export function placeTile(uid: string, p: Pt): void {
   const { tiles, bounds, T } = get();
-  if (!bounds) return;
+  // The layout is frozen while a combine is in flight: nothing may move until it lands.
+  if (!bounds || tiles.some((t) => t.pending)) return;
   const settled = tiles.filter((t) => t.uid === uid || (!t.leaving && (t.elementId || t.pending)));
   const pts = settled.map((t) => (t.uid === uid ? clampPt(p, bounds, T) : { x: t.x, y: t.y }));
   const idx = settled.findIndex((t) => t.uid === uid);
