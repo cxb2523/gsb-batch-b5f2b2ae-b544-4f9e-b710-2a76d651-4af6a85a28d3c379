@@ -5,7 +5,7 @@ import {
   Position,
 } from '../../types';
 import getShipSpeed from './shipSpeed';
-import state, { Velocity } from '../../state/state';
+import state from '../../state/state';
 import { directionMap } from '../../input';
 import updateInterface from '../../state/updateInterface';
 import { calculateDestination } from './worldUtils';
@@ -26,16 +26,7 @@ const createWorldPlayer = (
   let heading: Direction | '' = '';
   let speed = 0;
 
-  let lastHeading: Direction | '' = '';
-  let lastWind: Velocity = {
-    direction: 0,
-    speed: 0,
-  };
-
   updateInterface.playerFleetDirection(directionMap[heading]);
-
-  const windUnchanged = (wind: Velocity) =>
-    wind.direction === lastWind.direction && wind.speed === lastWind.speed;
 
   const animate = () => {
     frameAlternate = frameAlternate === 0 ? 1 : 0;
@@ -118,18 +109,29 @@ const createWorldPlayer = (
     },
     heading: () => heading,
     updateSpeed: () => {
-      if (heading === lastHeading && windUnchanged(state.wind)) {
+      /*
+        Always recalculate from the wind and current currently in state.
+        These are refreshed on sea area changes, seasonal changes, and when
+        setting sail, so the speed must never be skipped just because the
+        heading is unchanged.
+       */
+      const ship = state.fleets[1].ships[0];
+
+      const newSpeed = heading
+        ? getShipSpeed(
+            ship,
+            getCaptain(0),
+            directionMap[heading],
+            state.wind,
+            state.current,
+          )
+        : 0;
+
+      if (newSpeed === speed) {
         return;
       }
 
-      const ship = state.fleets[1].ships[0];
-
-      speed = heading
-        ? getShipSpeed(ship, getCaptain(0), directionMap[heading], state.wind)
-        : 0;
-
-      lastHeading = heading;
-      lastWind = state.wind;
+      speed = newSpeed;
       updateInterface.playerFleetSpeed(speed);
     },
     frame: () => startFrame + frameOffset + frameAlternate,

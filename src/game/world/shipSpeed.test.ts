@@ -173,4 +173,85 @@ describe('getShipSpeed', () => {
       }).toFixed(2),
     ).toEqual('14.78');
   });
+
+  describe('current', () => {
+    const wind = { direction: 0, speed: 3 };
+
+    const byCurrent = (current: { direction: number; speed: number }) =>
+      getShipSpeed({ id: '1', cargo: [], crew: 5 }, sailor, 0, wind, current);
+
+    test('a following current increases speed, an opposing current decreases it', () => {
+      const noCurrent = byCurrent({ direction: 0, speed: 0 });
+
+      expect(byCurrent({ direction: 0, speed: 4 })).toBeGreaterThan(noCurrent);
+      expect(byCurrent({ direction: 4, speed: 4 })).toBeLessThan(noCurrent);
+    });
+
+    test('the effect scales with the 8-way direction delta', () => {
+      const noCurrent = byCurrent({ direction: 0, speed: 0 });
+
+      const full = byCurrent({ direction: 0, speed: 4 }) - noCurrent;
+      const half = byCurrent({ direction: 1, speed: 4 }) - noCurrent;
+      const side = byCurrent({ direction: 2, speed: 4 }) - noCurrent;
+
+      expect(full).toBeCloseTo(4);
+      expect(half).toBeCloseTo(full / 2);
+      expect(side).toBeCloseTo(0);
+      expect(byCurrent({ direction: 3, speed: 4 })).toBeLessThan(noCurrent);
+    });
+
+    test('a current with speed 0 does not affect speed', () => {
+      expect(byCurrent({ direction: 0, speed: 0 })).toEqual(
+        getShipSpeed({ id: '1', cargo: [], crew: 5 }, sailor, 0, wind),
+      );
+      expect(byCurrent({ direction: 4, speed: 0 })).toEqual(
+        byCurrent({ direction: 0, speed: 0 }),
+      );
+    });
+
+    test('check against known values with a following current', () => {
+      expect(
+        getShipSpeed({ id: '1', cargo: [], crew: 5 }, sailor, 0, wind, {
+          direction: 0,
+          speed: 2,
+        }).toFixed(2),
+      ).toEqual('9.04');
+    });
+
+    test('speed never drops below 0 against a strong opposing current', () => {
+      expect(
+        getShipSpeed(
+          { id: '1', cargo: [], crew: 5 },
+          sailor,
+          0,
+          { direction: 0, speed: 0 },
+          { direction: 4, speed: 7 },
+        ),
+      ).toEqual(0);
+    });
+
+    test('ships with oars keep a minimum propulsion without wind', () => {
+      expect(
+        getShipSpeed(
+          { id: '19', cargo: [], crew: 5 },
+          sailor,
+          0,
+          { direction: 0, speed: 0 },
+          { direction: 0, speed: 0 },
+        ),
+      ).toBeGreaterThan(0);
+    });
+
+    test('the speed cap still applies with a following current', () => {
+      const fast = getShipSpeed(
+        { id: '1', cargo: [], crew: 5 },
+        { navigationLevel: 90, stats: { seamanship: 100 } } as Sailor,
+        0,
+        { direction: 0, speed: 7 },
+        { direction: 0, speed: 7 },
+      );
+
+      expect(fast).toEqual(40);
+    });
+  });
 });

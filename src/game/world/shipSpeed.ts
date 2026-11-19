@@ -18,11 +18,22 @@ import { Sailor } from '../../data/sailorData';
   It’s also worth looking into requiring higher sailor stats to handle
   end-game ships so mid-tier ships have their uses outside exploration.
  */
+
+/*
+  How much each point of current speed adds to (or subtracts from) the
+  ship’s speed, based on the 8-way direction delta between the heading and
+  the current. A side current neither helps nor hinders.
+ */
+const currentFactorMap = [1, 0.5, 0, -0.5, -1];
+
+const noCurrent: Velocity = { direction: 0, speed: 0 };
+
 const getShipSpeed = (
   ship: Pick<Ship, 'id' | 'crew' | 'cargo'>,
   sailor: Pick<Sailor, 'navigationLevel' | 'stats'>,
   heading: number,
   wind: Velocity,
+  current: Velocity = noCurrent,
 ) => {
   const { power, tacking, sailType, minimumCrew, capacity } = shipData[ship.id];
   const directionDelta = getHeadingWindDelta(heading, wind.direction);
@@ -59,7 +70,13 @@ const getShipSpeed = (
       navigationLevelFactor,
   );
 
-  return (baseSpeed * tackingFactor * sailor.stats.seamanship) / 75;
+  const sailingSpeed =
+    (baseSpeed * tackingFactor * sailor.stats.seamanship) / 75;
+
+  const currentDelta = getHeadingWindDelta(heading, current.direction);
+  const currentAdjustment = currentFactorMap[currentDelta] * current.speed;
+
+  return Math.min(40, Math.max(0, sailingSpeed + currentAdjustment));
 };
 
 export default getShipSpeed;

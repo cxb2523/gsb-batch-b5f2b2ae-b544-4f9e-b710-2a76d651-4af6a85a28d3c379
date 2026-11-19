@@ -1,17 +1,20 @@
-import { describe, expect, test, vi } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 import createWorldPlayer from './worldPlayer';
+import getShipSpeed from './shipSpeed';
+import updateInterface from '../../state/updateInterface';
+import state from '../../state/state';
 import { Position } from '../../types';
 
 vi.mock('../../state/updateInterface', () => ({
   default: {
-    playerFleetDirection: () => {},
-    playerFleetSpeed: () => {},
+    playerFleetDirection: vi.fn(),
+    playerFleetSpeed: vi.fn(),
   },
 }));
 
 vi.mock('../../state/selectors');
 
-vi.mock('./shipSpeed', () => ({ default: () => 40 }));
+vi.mock('./shipSpeed', () => ({ default: vi.fn(() => 40) }));
 
 const collisionAt = (collisionTiles: Position[]) => (position: Position) =>
   collisionTiles.some(
@@ -255,5 +258,94 @@ describe('worldPlayer', () => {
     player.move('n', collisionAt(collisionTiles));
     player.update();
     expectPositionToBeCloseTo(player.position(), { x: 3, y: 0.9 });
+  });
+});
+
+describe('updateSpeed', () => {
+  beforeEach(() => {
+    vi.mocked(getShipSpeed).mockReset().mockReturnValue(40);
+    vi.mocked(updateInterface.playerFleetSpeed).mockClear();
+
+    state.wind = { direction: 0, speed: 3 };
+    state.current = { direction: 0, speed: 0 };
+  });
+
+  test('uses the wind and current currently in state', () => {
+    state.current = { direction: 2, speed: 5 };
+
+    const player = createWorldPlayer({ x: 0, y: 0 }, 0, 'n');
+    player.setHeading('n');
+    player.updateSpeed();
+
+    expect(getShipSpeed).toHaveBeenCalledWith(
+      undefined,
+      undefined,
+      0,
+      { direction: 0, speed: 3 },
+      { direction: 2, speed: 5 },
+    );
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(40);
+  });
+
+  test('recalculates when the wind changes even if the heading is unchanged', () => {
+    const player = createWorldPlayer({ x: 0, y: 0 }, 0, 'n');
+    player.setHeading('n');
+    player.updateSpeed();
+
+    vi.mocked(getShipSpeed).mockReturnValue(30);
+    state.wind = { direction: 4, speed: 5 };
+    player.updateSpeed();
+
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(30);
+  });
+
+  test('recalculates when the current changes even if the heading is unchanged', () => {
+    const player = createWorldPlayer({ x: 0, y: 0 }, 0, 'n');
+    player.setHeading('n');
+    player.updateSpeed();
+
+    vi.mocked(getShipSpeed).mockReturnValue(35);
+    state.current = { direction: 4, speed: 2 };
+    player.updateSpeed();
+
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(35);
+  });
+
+  test('does not update the interface while the speed is unchanged', () => {
+    const player = createWorldPlayer({ x: 0, y: 0 }, 0, 'n');
+    player.setHeading('n');
+    player.updateSpeed();
+    player.updateSpeed();
+
+    expect(updateInterface.playerFleetSpeed).toHaveBeenCalledTimes(1);
+  });
+
+  test('speed is recalculated after docking and setting sail again', () => {
+    const player = createWorldPlayer({ x: 0, y: 0 }, 0, 'n');
+    player.setHeading('n');
+    player.updateSpeed();
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(40);
+
+    // docking clears the heading and stops the fleet
+    player.setHeading('');
+    player.updateSpeed();
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(0);
+
+    // setting sail again refreshes the wind and current in state
+    state.wind = { direction: 4, speed: 7 };
+    state.current = { direction: 0, speed: 2 };
+    vi.mocked(getShipSpeed).mockReturnValue(25);
+
+    player.setHeading('n');
+    player.updateSpeed();
+
+    expect(getShipSpeed).toHaveBeenLastCalledWith(
+      undefined,
+      undefined,
+      0,
+      { direction: 4, speed: 7 },
+      { direction: 0, speed: 2 },
+    );
+    expect(updateInterface.playerFleetSpeed).toHaveBeenLastCalledWith(25);
   });
 });

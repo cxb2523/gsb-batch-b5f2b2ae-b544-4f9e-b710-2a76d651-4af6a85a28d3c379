@@ -34,6 +34,7 @@ export interface State {
   world: World;
   fleets: Fleets;
   seaArea: number | undefined;
+  isSummer: boolean | undefined;
   wind: Velocity;
   current: Velocity;
   playerFleet: Velocity;

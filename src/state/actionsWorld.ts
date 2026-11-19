@@ -74,10 +74,13 @@ export const updateWorldStatus = () => {
   }
 
   const seaArea = getSeaArea(position);
+  const isSummer = getIsSummer(START_DATE, state.timePassed);
 
-  const wind = getWind(seaArea, getIsSummer(START_DATE, state.timePassed));
+  const wind = getWind(seaArea, isSummer);
   const current = getCurrent(seaArea);
 
+  state.seaArea = seaArea;
+  state.isSummer = isSummer;
   state.wind = wind;
   state.current = current;
 
@@ -87,10 +90,27 @@ export const updateWorldStatus = () => {
   });
 };
 
+/*
+  Wind and current must be refetched when the player enters another sea area
+  or a new day brings another season, even between the regular updates.
+ */
+const worldStatusStale = () => {
+  const { position } = state.fleets['1'];
+
+  if (!position) {
+    return false;
+  }
+
+  return (
+    state.seaArea !== getSeaArea(position) ||
+    state.isSummer !== getIsSummer(START_DATE, state.timePassed)
+  );
+};
+
 export const worldTimeTick = () => {
   state.timePassed += 20;
 
-  if (shouldUpdateWorldStatus()) {
+  if (shouldUpdateWorldStatus() || worldStatusStale()) {
     updateWorldStatus();
   }
 
