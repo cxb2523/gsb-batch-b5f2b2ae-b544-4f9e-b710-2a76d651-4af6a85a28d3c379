@@ -32,7 +32,8 @@ export default function Shilian() {
 
   const {
     isGuaji,
-    setGuaji,
+    handleStartGuaji,
+    handleStopGuaji,
     guajiStats,
     YaoShouInstance,
     ActorInstance,
@@ -206,12 +207,12 @@ export default function Shilian() {
         </JXButton>
         <JXButton
           disabled={isGuaji || HuiheState.can}
-          onClick={() => setGuaji(true)}
+          onClick={handleStartGuaji}
         >
           挂机
         </JXButton>
         <JXButton onClick={handleSeeGuajiDetail}>挂机详情</JXButton>
-        <JXButton disabled={!isGuaji} onClick={() => setGuaji(false)}>
+        <JXButton disabled={!isGuaji} onClick={handleStopGuaji}>
           停挂
         </JXButton>
         <JXButton

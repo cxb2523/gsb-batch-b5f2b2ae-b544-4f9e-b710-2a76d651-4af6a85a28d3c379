@@ -72,7 +72,7 @@ export function useBattle(
   get: (key: string, defaultValue?: unknown) => any,
   set: (key: string, val: any) => void
 ) {
-  const [isGuaji, setGuaji] = useState(false);
+  const [isGuaji, setGuajiState] = useState(false);
   const {
     setCombatTimer,
     setGuajiTimer,
@@ -211,11 +211,25 @@ export function useBattle(
   });
   const MAX_LOG_SIZE = 100;
   const MAX_HISTORY_SIZE = 50;
-  const endRef = useRef(HuiheState.end);
+  /**
+   * 当前对局的引用快照。
+   * 定时器回调一律从这里读取战斗状态，避免闭包里的旧状态把上一场的数据
+   * 带进下一场。
+   */
+  const actorRef = useRef<ActorZDType | null>(null);
+  const yaoshouRef = useRef<YaoShouZDType | null>(null);
+  const targetRef = useRef(0);
+  const canRef = useRef(false);
+  const endRef = useRef(true);
   const guajiLockRef = useRef(false);
+  /** 对局序号：每次开始或终止对局都会自增，用于作废上一场遗留的回调 */
+  const fightSeqRef = useRef(0);
+  /** 当前对局是否已经结算，保证每场妖兽只结算一次 */
+  const settledRef = useRef(true);
+  /** 当前对局真实发生的回合数 */
+  const fightRoundsRef = useRef(0);
   const [sessionLoot, setSessionLoot] = useState<Record<string, number>>({});
   useEffect(() => () => setSessionLoot({}), []);
-  const fightSeqRef = useRef(0);
   const [yaoshouMaxQixue, setYaoshouMaxQixue] = useState(0);
   const [actorDamage, setActorDamage] = useState<{
     value: number;
@@ -228,7 +242,6 @@ export function useBattle(
     isCrit: boolean;
   } | null>(null);
   const isGuajiRef = useRef(isGuaji);
-  const currentGuajiFightRoundsRef = useRef(0);
   useEffect(() => {
     isGuajiRef.current = isGuaji;
   }, [isGuaji]);
@@ -249,12 +262,26 @@ export function useBattle(
     }));
   }, []);
   const endHuiheState = useCallback(() => {
+    canRef.current = false;
+    targetRef.current = 0;
+    endRef.current = true;
     setHuiheState((v) => ({ ...v, can: false, end: true, target: 0 }));
   }, []);
-  const endBattle = useCallback(
-    (result: 'win' | 'lose', rounds: number, ys: YaoShouZDType | null) => {
+  /**
+   * 结束当前对局并清场。调用方必须已确认本场尚未结算（settledRef），
+   * 胜利、失败两条路径各自只会走到这里一次，回合数取本场累计值。
+   */
+  const finalizeBattle = useCallback(
+    (result: 'win' | 'lose', ys: YaoShouZDType | null) => {
+      const rounds = fightRoundsRef.current;
+      fightRoundsRef.current = 0;
       clearCombatTimer();
+      clearAutoBattleTimer();
       endHuiheState();
+      actorRef.current = null;
+      setActorInstance(null);
+      setActorDamage(null);
+      setEnemyDamage(null);
       if (isGuajiRef.current) {
         setGuajiStats((s) => ({
           totalRounds: s.totalRounds + rounds,
@@ -270,16 +297,36 @@ export function useBattle(
             }
           ].slice(-MAX_HISTORY_SIZE)
         }));
-        currentGuajiFightRoundsRef.current = 0;
       }
-      guardClear(fightSeqRef.current, () => {
+      const seq = fightSeqRef.current;
+      guardClear(seq, () => {
+        yaoshouRef.current = null;
         setYaoShouInstance(null);
         setYaoshouMaxQixue(0);
       });
-      setActorInstance(null);
     },
-    [endHuiheState, guardClear, clearCombatTimer]
+    [endHuiheState, guardClear, clearCombatTimer, clearAutoBattleTimer]
   );
+  /**
+   * 立即终止当前对局（停挂 / 遁逃）。作废对局序号，正在等待的回合回调
+   * 不会再把战斗推进下去；本次不产生胜负结算。
+   */
+  const abortFight = useCallback(() => {
+    fightSeqRef.current += 1;
+    settledRef.current = true;
+    fightRoundsRef.current = 0;
+    guajiLockRef.current = false;
+    clearCombatTimer();
+    clearAutoBattleTimer();
+    endHuiheState();
+    actorRef.current = null;
+    yaoshouRef.current = null;
+    setActorInstance(null);
+    setYaoShouInstance(null);
+    setYaoshouMaxQixue(0);
+    setActorDamage(null);
+    setEnemyDamage(null);
+  }, [clearCombatTimer, clearAutoBattleTimer, endHuiheState]);
   const syncBattleAchievements = useCallback(
     (winStreak: number) => {
       const currentAchievementData = get('chengjiu') || {
@@ -302,6 +349,8 @@ export function useBattle(
   );
   const applyWinReward = useCallback(
     (ys: YaoShouZDType) => {
+      if (settledRef.current) return;
+      settledRef.current = true;
       const clData = {
         name: ys.cl,
         isPile: true,
@@ -421,7 +470,7 @@ export function useBattle(
         ...prev,
         [clData.name]: (prev[clData.name] || 0) + clData.num!
       }));
-      endBattle('win', currentGuajiFightRoundsRef.current, ys);
+      finalizeBattle('win', ys);
       const newWinStreak = (get('winStreak') || 0) + 1;
       syncBattleAchievements(newWinStreak);
       checkShilianAchievements(
@@ -435,7 +484,7 @@ export function useBattle(
         jingjie: get('jingjie')
       });
     },
-    [get, set, pushLog, endBattle, syncBattleAchievements, df.name]
+    [get, set, pushLog, finalizeBattle, syncBattleAchievements, df.name]
   );
   const zhandouLogic = useCallback(
     (zd1: YaoShouZDType | ActorZDType, zd2: YaoShouZDType | ActorZDType) => {
@@ -509,36 +558,39 @@ export function useBattle(
   );
 
   const zhandou = useCallback(() => {
-    if (ActorInstance && YaoShouInstance) {
-      if (ActorInstance.qixue <= 0) {
-        pushLog(<>势尽力竭，你踉跄后退终究倒下。眼前一黑，此战以败收场…</>);
-        endBattle('lose', currentGuajiFightRoundsRef.current, YaoShouInstance);
-        syncBattleAchievements(0);
-        return;
-      }
-      if (YaoShouInstance.qixue <= 0) {
-        applyWinReward(YaoShouInstance);
-        return;
-      }
-      if (!HuiheState.target) {
-        const ys = zhandouLogic(ActorInstance, YaoShouInstance);
-        setYaoShouInstance(ys as YaoShouZDType);
-        setHuiheState((v) => ({ ...v, target: 1, huihe: v.huihe + 1 }));
-      } else {
-        const ac = zhandouLogic(YaoShouInstance, ActorInstance);
-        setActorInstance(ac as ActorZDType);
-        setHuiheState((v) => ({ ...v, target: 0, huihe: v.huihe + 1 }));
-      }
-      if (isGuajiRef.current) {
-        currentGuajiFightRoundsRef.current += 1;
-      }
+    if (settledRef.current) return;
+    if (!canRef.current) return;
+    const actor = actorRef.current;
+    const yaoshou = yaoshouRef.current;
+    if (!actor || !yaoshou) return;
+    if (actor.qixue <= 0) {
+      settledRef.current = true;
+      pushLog(<>势尽力竭，你踉跄后退终究倒下。眼前一黑，此战以败收场…</>);
+      finalizeBattle('lose', yaoshou);
+      syncBattleAchievements(0);
+      return;
     }
+    if (yaoshou.qixue <= 0) {
+      applyWinReward(yaoshou);
+      return;
+    }
+    if (!targetRef.current) {
+      const ys = zhandouLogic(actor, yaoshou);
+      yaoshouRef.current = ys as YaoShouZDType;
+      setYaoShouInstance(ys as YaoShouZDType);
+      targetRef.current = 1;
+      setHuiheState((v) => ({ ...v, target: 1, huihe: v.huihe + 1 }));
+    } else {
+      const ac = zhandouLogic(yaoshou, actor);
+      actorRef.current = ac as ActorZDType;
+      setActorInstance(ac as ActorZDType);
+      targetRef.current = 0;
+      setHuiheState((v) => ({ ...v, target: 0, huihe: v.huihe + 1 }));
+    }
+    fightRoundsRef.current += 1;
   }, [
-    ActorInstance,
-    HuiheState.target,
-    YaoShouInstance,
     pushLog,
-    endBattle,
+    finalizeBattle,
     zhandouLogic,
     syncBattleAchievements,
     applyWinReward
@@ -549,7 +601,7 @@ export function useBattle(
       JXToast('你没有足够的精神！').show();
       return;
     }
-    if (!HuiheState.end) {
+    if (!endRef.current) {
       JXToast('请先解决当前的妖兽！').show();
       return;
     }
@@ -557,6 +609,12 @@ export function useBattle(
     const newYaoShou = genYaoShou();
 
     fightSeqRef.current += 1;
+    settledRef.current = false;
+    fightRoundsRef.current = 0;
+    canRef.current = false;
+    targetRef.current = 0;
+    endRef.current = false;
+    yaoshouRef.current = newYaoShou;
     setYaoShouInstance(newYaoShou);
     setYaoshouMaxQixue(newYaoShou.qixue);
     const ls = get('lingShou');
@@ -564,7 +622,7 @@ export function useBattle(
       ? getLingShouBonus(ls)
       : { gongji: 0, fangyu: 0, qixue: 0 };
     const total = getTotalAttr(get);
-    setActorInstance({
+    const newActor: ActorZDType = {
       name: get('daohao'),
       qixue: total.qixue + lsBonus.qixue,
       gongji: total.gongji + lsBonus.gongji,
@@ -572,38 +630,73 @@ export function useBattle(
       sudu: total.sudu,
       baoji: Math.min(90, total.baoji),
       fashu: total.fashu
-    });
+    };
+    actorRef.current = newActor;
+    setActorInstance(newActor);
+    // 新一场开始：上一场的伤害飘字与临时战利品不带到本场
+    setActorDamage(null);
+    setEnemyDamage(null);
+    setSessionLoot({});
 
     setHuiheState((prev) => ({
       ...prev,
       can: false,
-      logs: [{ text: `你发现了${newYaoShou.name}，它似乎也发现了你` }],
-      end: false
+      end: false,
+      target: 0,
+      logs: [{ text: `你发现了${newYaoShou.name}，它似乎也发现了你` }]
     }));
     set('shenshi', get('shenshi') - 1);
-  }, [HuiheState.end, genYaoShou, get, set]);
+  }, [genYaoShou, get, set]);
 
   const handleStartZD = useCallback(() => {
-    if (!ActorInstance || !YaoShouInstance) {
+    if (!actorRef.current || !yaoshouRef.current) {
       JXToast('请先探索妖兽！').show();
       return;
     }
-    if (!HuiheState.can) {
-      const first =
-        (ActorInstance?.sudu || 0) >= (YaoShouInstance?.sudu || 0) ? 0 : 1;
-      setHuiheState({
-        ...HuiheState,
-        can: true,
-        target: first
-      });
-      zhandou();
-    } else {
+    if (canRef.current) {
       JXToast('战斗进行中，请稍候！').show();
+      return;
     }
-  }, [ActorInstance, YaoShouInstance, HuiheState, zhandou]);
+    const first =
+      (actorRef.current.sudu || 0) >= (yaoshouRef.current.sudu || 0) ? 0 : 1;
+    canRef.current = true;
+    targetRef.current = first;
+    setHuiheState((v) => ({ ...v, can: true, target: first }));
+    zhandou();
+  }, [zhandou]);
+
+  const handleStartGuaji = useCallback(() => {
+    isGuajiRef.current = true;
+    setGuajiState(true);
+  }, []);
+
+  /**
+   * 停挂：先停掉所有挂机相关定时器并立即终止当前对局，再关闭挂机开关，
+   * 保证停止后不会再补开一场。
+   */
+  const handleStopGuaji = useCallback(() => {
+    isGuajiRef.current = false;
+    clearGuajiTimer();
+    clearAutoBattleTimer();
+    abortFight();
+    setGuajiState(false);
+  }, [abortFight, clearGuajiTimer, clearAutoBattleTimer]);
+
+  /** 兼容旧调用方式：统一走开始 / 停止挂机的完整流程 */
+  const setGuaji = useCallback(
+    (next: boolean) => {
+      if (next) {
+        handleStartGuaji();
+      } else {
+        handleStopGuaji();
+      }
+    },
+    [handleStartGuaji, handleStopGuaji]
+  );
 
   const handleEscape = useCallback(() => {
-    const noBattle = HuiheState.end || (!ActorInstance && !YaoShouInstance);
+    const noBattle =
+      endRef.current || (!actorRef.current && !yaoshouRef.current);
     if (noBattle) {
       JXToast('当前未与妖兽交手，无需遁逃').show();
       return;
@@ -613,10 +706,9 @@ export function useBattle(
       JXToast('神识不足，无法遁逃').show();
       return;
     }
-    clearCombatTimer();
     const baseCost = Math.max(
       2,
-      Math.min(10, Math.round(((YaoShouInstance?.xw || 0) as number) / 150))
+      Math.min(10, Math.round(((yaoshouRef.current?.xw || 0) as number) / 150))
     );
     const cost = Math.min(baseCost, shen);
     set('shenshi', shen - cost);
@@ -632,30 +724,9 @@ export function useBattle(
         ）
       </>
     );
-    endHuiheState();
-    guardClear(
-      fightSeqRef.current,
-      () => {
-        setYaoShouInstance(null);
-        setYaoshouMaxQixue(0);
-      },
-      800
-    );
-    setActorInstance(null);
-    if (isGuajiRef.current) {
-      setGuaji(false);
-    }
-  }, [
-    ActorInstance,
-    HuiheState.end,
-    YaoShouInstance,
-    get,
-    set,
-    guardClear,
-    pushLog,
-    endHuiheState,
-    clearCombatTimer
-  ]);
+    // 遁逃同样终止当前对局并停挂，等待中的回合回调随之失效
+    handleStopGuaji();
+  }, [get, set, pushLog, handleStopGuaji]);
 
   const handleSearchYaoShouRef = useRef(handleSearchYaoShou);
   const getRef = useRef(get);
@@ -684,10 +755,6 @@ export function useBattle(
   ]);
 
   useEffect(() => {
-    endRef.current = HuiheState.end;
-  }, [HuiheState.end]);
-
-  useEffect(() => {
     if (!ActorInstance) {
       setActorDamage(null);
     }
@@ -699,19 +766,23 @@ export function useBattle(
   useEffect(() => {
     if (!isGuaji) {
       clearGuajiTimer();
-      return clearGuajiTimer;
+      clearAutoBattleTimer();
+      return () => {
+        clearGuajiTimer();
+        clearAutoBattleTimer();
+      };
     }
     const run = () => {
+      if (!isGuajiRef.current) return;
       if (guajiLockRef.current) return;
       if (!endRef.current) return;
       const shen = getRef.current('shenshi');
       if (shen <= 0) {
-        setGuaji(false);
+        handleStopGuaji();
         JXToast('神识不足，已停止挂机').show();
         return;
       }
       guajiLockRef.current = true;
-      endRef.current = false;
       handleSearchYaoShouRef.current();
       setTimeout(() => {
         guajiLockRef.current = false;
@@ -719,8 +790,17 @@ export function useBattle(
     };
     run();
     setGuajiTimer(run, 1500);
-    return clearGuajiTimer;
-  }, [isGuaji, clearGuajiTimer, setGuajiTimer]);
+    return () => {
+      clearGuajiTimer();
+      clearAutoBattleTimer();
+    };
+  }, [
+    isGuaji,
+    clearGuajiTimer,
+    clearAutoBattleTimer,
+    setGuajiTimer,
+    handleStopGuaji
+  ]);
 
   useEffect(() => {
     if (
@@ -749,6 +829,8 @@ export function useBattle(
   return {
     isGuaji,
     setGuaji,
+    handleStartGuaji,
+    handleStopGuaji,
     guajiStats,
     YaoShouInstance,
     ActorInstance,
