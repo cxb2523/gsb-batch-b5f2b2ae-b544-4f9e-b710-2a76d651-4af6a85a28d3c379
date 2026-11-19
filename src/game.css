@@ -174,12 +174,37 @@ body {
 }
 
 .board-meta {
+  position: relative;
   display: flex;
   width: var(--board-size);
   min-height: 74px;
   align-items: center;
   justify-content: center;
   margin-bottom: 14px;
+}
+
+.board-timer {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  color: rgb(231 244 255 / 88%);
+  font-style: normal;
+  text-shadow: 0 2px 1px rgb(10 34 84 / 45%);
+}
+
+.board-timer[data-paused="true"] {
+  opacity: 0.55;
+}
+
+.board-timer small {
+  font-size: 8px;
+}
+
+.board-timer strong {
+  margin-top: 2px;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 .board-stat {
@@ -1470,6 +1495,10 @@ body {
 
 .exit-confirmation-modal .modal-hero-icon {
   color: #e76f3c;
+}
+
+.session-expired-modal .modal-hero-icon {
+  color: #d9822b;
 }
 
 .game-modal h2 {

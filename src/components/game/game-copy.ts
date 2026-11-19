@@ -70,6 +70,8 @@ export interface GameCopy {
   score: string;
   scoreRules: string;
   selectSquare: (row: number, column: number, state: string) => string;
+  sessionExpiredDescription: (date: string) => string;
+  sessionExpiredTitle: string;
   settings: string;
   settingsDescription: string;
   sound: string;
@@ -162,7 +164,7 @@ export const GAME_COPY: Record<GameLanguage, GameCopy> = {
     playNow: 'Play now',
     preferences: 'Preferences',
     ranking: 'Best Scores',
-    rankingDescription: 'View your best score for each mode',
+    rankingDescription: 'View your best score for each mode.',
     readyToBlast: 'Ready to blast?',
     reduceMotion: 'Reduced motion',
     reduceMotionDescription: 'Minimize movement and transition effects.',
@@ -175,6 +177,9 @@ export const GAME_COPY: Record<GameLanguage, GameCopy> = {
     scoreRules: 'Scoring',
     selectSquare: (row, column, state) =>
       `Row ${row}, column ${column}, ${state}`,
+    sessionExpiredDescription: (date) =>
+      `Your daily challenge from ${date} has expired and was cleared. A fresh board is ready.`,
+    sessionExpiredTitle: 'Daily challenge expired',
     settings: 'Settings',
     settingsDescription: 'Adjust sound, feedback, and accessibility.',
     sixPlusLineBonus: 'Clear 6+ lines at once: +300',
@@ -276,6 +281,9 @@ export const GAME_COPY: Record<GameLanguage, GameCopy> = {
     scoreRules: '计分规则',
     selectSquare: (row, column, state) =>
       `第 ${row} 行，第 ${column} 列，${state}`,
+    sessionExpiredDescription: (date) =>
+      `${date} 的每日挑战已过期并被清理，已为你准备新的棋盘。`,
+    sessionExpiredTitle: '每日挑战已过期',
     settings: '游戏设置',
     settingsDescription: '调整声音、反馈效果和辅助功能。',
     sixPlusLineBonus: '单次消除 6 条及以上：+300 分',

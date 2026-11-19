@@ -6,6 +6,7 @@ import {
   type GameBoard,
   type GamePiece,
   type GameRound,
+  hasPlayablePiece,
   placeGamePiece,
 } from '../../src/components/game/game-engine';
 
@@ -180,5 +181,35 @@ describe('game engine', () => {
 
     assert.ok(resolution);
     assert.equal(resolution.gameOver, true);
+  });
+
+  it('detects a restored unplayable round as already over', () => {
+    // A checkerboard leaves only isolated holes: single cells fit, anything
+    // larger does not. This mirrors a saved round whose game-over transition
+    // was interrupted before it could be persisted.
+    const board = Array.from({ length: BOARD_SIZE }, (_, row) =>
+      Array.from({ length: BOARD_SIZE }, (_, column) =>
+        (row + column) % 2 === 0 ? 'blue' : null
+      )
+    ) satisfies GameBoard;
+    const blockedRound = createRound(board, [
+      createPiece('line', [
+        [0, 0],
+        [0, 1],
+      ]),
+      null,
+      null,
+    ]);
+    assert.equal(hasPlayablePiece(blockedRound), false);
+
+    const playableRound = createRound(board, [
+      createPiece('single'),
+      createPiece('line', [
+        [0, 0],
+        [0, 1],
+      ]),
+      null,
+    ]);
+    assert.equal(hasPlayablePiece(playableRound), true);
   });
 });

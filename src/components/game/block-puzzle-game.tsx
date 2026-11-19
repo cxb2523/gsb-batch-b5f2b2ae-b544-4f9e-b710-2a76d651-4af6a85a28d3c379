@@ -1,6 +1,6 @@
 import {
-  IconArrowLeft,
   IconAlertTriangle,
+  IconArrowLeft,
   IconCrown,
   IconFlag,
   IconHome,
@@ -26,12 +26,17 @@ import { GAME_COPY, type GameCopy } from '@/components/game/game-copy';
 import {
   createGameRound,
   type GameRound,
+  hasPlayablePiece,
   placeGamePiece,
 } from '@/components/game/game-engine';
 import { GAME_MODE_TARGETS } from '@/components/game/game-mode-config';
 import { GameMenu } from '@/components/game/game-menu';
 import { useGamePreferences } from '@/components/game/game-preferences';
+import { createRoundId } from '@/components/game/game-round-id';
+import { createGameSettlementGate } from '@/components/game/game-settlement';
 import {
+  type ActiveGameSession,
+  ACTIVE_GAME_SESSION_VERSION,
   clearActiveGameSession,
   readActiveGameSession,
   writeActiveGameSession,
@@ -49,6 +54,16 @@ import {
 import { triggerHapticFeedback } from '@/lib/haptics';
 
 const DEFAULT_BEST_SCORE = 0;
+
+interface GameSessionNotice {
+  kind: 'expired';
+  date: string;
+}
+
+interface RoundIdentity {
+  dailyDate: string | null;
+  id: string;
+}
 
 const CELEBRATION_COLORS = [
   '#ffcf32',
@@ -83,6 +98,28 @@ function getModeLabel(copy: GameCopy, mode: GameMode) {
   return mode === 'classic' ? copy.classic : copy.daily;
 }
 
+function createRoundIdentity(
+  mode: GameMode,
+  anchorDate: string
+): RoundIdentity {
+  return {
+    dailyDate: mode === 'daily' ? anchorDate : null,
+    id: createRoundId(),
+  };
+}
+
+function roundFromSession(session: ActiveGameSession): GameRound {
+  return {
+    board: session.board,
+    combo: session.combo,
+    generation: session.generation,
+    movesWithoutClear: session.movesWithoutClear,
+    pieces: session.pieces,
+    score: session.score,
+    seed: session.seed,
+  };
+}
+
 export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   const navigate = useNavigate();
   const { isHydrated, preferences } = useGamePreferences();
@@ -91,17 +128,37 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   );
   const [mode, setMode] = useState<GameMode>(routeMode ?? 'classic');
   const [round, setRound] = useState<GameRound>(() =>
-    createGameRound('classic', getLocalDateKey())
+    createGameRound(routeMode ?? 'classic', getLocalDateKey())
   );
   const [bestScore, setBestScore] = useState(DEFAULT_BEST_SCORE);
   const [gameOver, setGameOver] = useState(false);
   const [challengeComplete, setChallengeComplete] = useState(false);
   const [exitConfirmationOpen, setExitConfirmationOpen] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState<GameSessionNotice | null>(
+    null
+  );
   const [clearEffect, setClearEffect] = useState<GameClearEffect | null>(null);
   const [isSessionReady, setIsSessionReady] = useState(false);
   const [, setScoreHistory] = useState<ScoreRecord[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const dailyDateRef = useRef<string | null>(null);
+  const roundIdentityRef = useRef<RoundIdentity>(
+    createRoundIdentity(routeMode ?? 'classic', getLocalDateKey())
+  );
+  // Mirror of the live round. State updates are asynchronous, so rapid
+  // duplicate clicks must resolve against this synchronous copy to avoid
+  // placing (and scoring) the same turn twice.
+  const roundRef = useRef(round);
+  const settlementGateRef = useRef(createGameSettlementGate());
+  const bestScoreRef = useRef(DEFAULT_BEST_SCORE);
+  // A round restored from storage may already be unplayable or past its goal
+  // even though the game-over transition was never persisted. The restore path
+  // records the pending settlement here and it is applied once below.
+  const pendingRestoreSettlementRef = useRef<{
+    outcome: 'challengeComplete' | 'gameOver';
+    roundId: string;
+    score: number;
+  } | null>(null);
+  const finishTimerRef = useRef<number | null>(null);
   const clearEffectIdRef = useRef(0);
   const clearEffectTimerRef = useRef<number | null>(null);
   const isResolvingRef = useRef(false);
@@ -129,13 +186,24 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     enableBeforeUnload: true,
     withResolver: true,
   });
+  const dialogOpen =
+    exitConfirmationOpen ||
+    navigationBlocker.status === 'blocked' ||
+    sessionNotice !== null;
   const isExitConfirmationOpen =
     exitConfirmationOpen || navigationBlocker.status === 'blocked';
+  const isRoundSettled = gameOver || challengeComplete;
+  // Inputs and the clock are frozen while any blocking dialog is visible, and
+  // until the saved round has been restored so early clicks cannot land on the
+  // throwaway initial round.
+  const isInteractionPaused = dialogOpen || isRoundSettled || !isSessionReady;
 
   useEffect(() => {
     try {
       ensureScoreStorageVersion();
-      setBestScore(readBestScore());
+      const storedBest = readBestScore();
+      bestScoreRef.current = storedBest;
+      setBestScore(storedBest);
       setScoreHistory(readScoreHistory());
     } catch {
       // The game remains fully playable when storage is unavailable.
@@ -147,58 +215,109 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       if (clearEffectTimerRef.current !== null) {
         window.clearTimeout(clearEffectTimerRef.current);
       }
+      if (finishTimerRef.current !== null) {
+        window.clearTimeout(finishTimerRef.current);
+      }
     },
     []
   );
 
+  const applyRound = useCallback((nextRound: GameRound) => {
+    roundRef.current = nextRound;
+    setRound(nextRound);
+  }, []);
+
+  useEffect(() => {
+    roundRef.current = round;
+  }, [round]);
+
+  const startFreshRound = useCallback(
+    (nextMode: GameMode, anchorDate: string) => {
+      pendingRestoreSettlementRef.current = null;
+      roundIdentityRef.current = createRoundIdentity(nextMode, anchorDate);
+      applyRound(createGameRound(nextMode, anchorDate));
+      setElapsedSeconds(0);
+      setGameOver(false);
+      setChallengeComplete(false);
+    },
+    [applyRound]
+  );
+
   useEffect(() => {
     const today = getLocalDateKey();
-    const activeSession = readActiveGameSession(today);
+    const lookup = readActiveGameSession(today);
+    // A fresh navigation into a mode always resumes persistence, even if the
+    // player had just returned to the menu from an earlier round.
+    isReturningHomeRef.current = false;
 
     if (routeMode === undefined) {
       setScreen('menu');
       setIsSessionReady(true);
-      if (activeSession) {
+      setSessionNotice(null);
+      // Only a resumable session redirects back into the game. An expired or
+      // invalid save is reported on the mode screen instead of disappearing.
+      if (lookup.status === 'expired') {
+        setSessionNotice({
+          date: lookup.session.dailyDate ?? today,
+          kind: 'expired',
+        });
+      } else if (lookup.status === 'active') {
         void navigate({
           to: '/play/$mode',
-          params: { mode: activeSession.mode },
+          params: { mode: lookup.session.mode },
           replace: true,
         });
       }
       return;
     }
 
-    if (activeSession?.mode === routeMode) {
-      setMode(activeSession.mode);
-      setRound({
-        board: activeSession.board,
-        combo: activeSession.combo,
-        generation: activeSession.generation,
-        movesWithoutClear: activeSession.movesWithoutClear,
-        pieces: activeSession.pieces,
-        score: activeSession.score,
-        seed: activeSession.seed,
-      });
-      setElapsedSeconds(activeSession.elapsedSeconds);
-      setGameOver(activeSession.gameOver);
-      setChallengeComplete(activeSession.challengeComplete);
-      dailyDateRef.current = activeSession.dailyDate;
+    setSessionNotice(
+      lookup.status === 'expired'
+        ? { date: lookup.session.dailyDate ?? today, kind: 'expired' }
+        : null
+    );
+
+    if (lookup.status === 'active' && lookup.session.mode === routeMode) {
+      const session = lookup.session;
+      setMode(session.mode);
+      roundIdentityRef.current = {
+        dailyDate: session.dailyDate,
+        id: session.roundId,
+      };
+      const restoredRound = roundFromSession(session);
+      applyRound(restoredRound);
+      setElapsedSeconds(session.elapsedSeconds);
+      setGameOver(session.gameOver);
+      setChallengeComplete(session.challengeComplete);
+      if (session.gameOver || session.challengeComplete) {
+        // A settled round should never settle a second time after a refresh.
+        settlementGateRef.current.trySettle(session.roundId);
+      } else {
+        const target = GAME_MODE_TARGETS[session.mode];
+        if (target !== null && session.score >= target) {
+          pendingRestoreSettlementRef.current = {
+            outcome: 'challengeComplete',
+            roundId: session.roundId,
+            score: session.score,
+          };
+        } else if (!hasPlayablePiece(restoredRound)) {
+          pendingRestoreSettlementRef.current = {
+            outcome: 'gameOver',
+            roundId: session.roundId,
+            score: session.score,
+          };
+        }
+      }
     } else {
       clearActiveGameSession();
-      const dailyDate = routeMode === 'daily' ? today : null;
-      dailyDateRef.current = dailyDate;
-      setMode(routeMode);
-      setRound(createGameRound(routeMode, dailyDate ?? today));
-      setElapsedSeconds(0);
-      setGameOver(false);
-      setChallengeComplete(false);
+      startFreshRound(routeMode, today);
     }
 
     setExitConfirmationOpen(false);
     setClearEffect(null);
     setScreen('game');
     setIsSessionReady(true);
-  }, [navigate, routeMode]);
+  }, [applyRound, navigate, routeMode, startFreshRound]);
 
   const persistActiveGame = useCallback(() => {
     if (isReturningHomeRef.current || !isSessionReady || screen !== 'game') {
@@ -212,16 +331,17 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       board,
       challengeComplete,
       combo: round.combo,
-      dailyDate: dailyDateRef.current,
+      dailyDate: roundIdentityRef.current.dailyDate,
       elapsedSeconds,
       gameOver,
       generation: round.generation,
       mode,
       movesWithoutClear: round.movesWithoutClear,
       pieces,
+      roundId: roundIdentityRef.current.id,
       score,
       seed: round.seed,
-      version: 4,
+      version: ACTIVE_GAME_SESSION_VERSION,
     });
   }, [
     board,
@@ -240,12 +360,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   }, [persistActiveGame]);
 
   useEffect(() => {
-    if (
-      screen !== 'game' ||
-      gameOver ||
-      challengeComplete ||
-      isExitConfirmationOpen
-    ) {
+    if (screen !== 'game' || isInteractionPaused) {
       return;
     }
 
@@ -254,15 +369,15 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [challengeComplete, gameOver, isExitConfirmationOpen, screen]);
+  }, [isInteractionPaused, screen]);
 
   useEffect(() => {
-    if (screen !== 'game' || gameOver || challengeComplete) {
+    if (screen !== 'game' || isRoundSettled) {
       stopMusic();
       return;
     }
     startMusic();
-  }, [challengeComplete, gameOver, screen, startMusic, stopMusic]);
+  }, [isRoundSettled, screen, startMusic, stopMusic]);
 
   const vibrate = useCallback(
     (pattern: number | number[]) => {
@@ -280,41 +395,65 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     setClearEffect(null);
   }, []);
 
-  const recordScore = useCallback((finalScore: number, finalMode: GameMode) => {
-    if (finalScore <= 0) return;
-
-    setScoreHistory((current) => {
-      const nextHistory = [
-        ...current,
-        {
-          id: `${Date.now()}-${finalMode}-${finalScore}`,
-          mode: finalMode,
-          score: finalScore,
-        },
-      ]
-        .sort((left, right) => right.score - left.score)
-        .slice(0, 10);
-
-      try {
-        window.localStorage.setItem(
-          SCORE_HISTORY_KEY,
-          JSON.stringify(nextHistory)
-        );
-      } catch {
-        // Keep the in-memory score history when storage is unavailable.
-      }
-      return nextHistory;
-    });
+  const clearFinishTimer = useCallback(() => {
+    if (finishTimerRef.current !== null) {
+      window.clearTimeout(finishTimerRef.current);
+      finishTimerRef.current = null;
+    }
   }, []);
 
-  const finishGame = useCallback(
-    (finalScore: number) => {
-      const nextBest = Math.max(bestScore, finalScore);
+  const recordScore = useCallback(
+    (roundId: string, finalScore: number, finalMode: GameMode) => {
+      if (finalScore <= 0) return;
+
+      setScoreHistory((current) => {
+        const nextHistory = [
+          ...current,
+          {
+            id: `${roundId}-${finalMode}-${finalScore}`,
+            mode: finalMode,
+            score: finalScore,
+          },
+        ]
+          .sort((left, right) => right.score - left.score)
+          .slice(0, 10);
+
+        try {
+          window.localStorage.setItem(
+            SCORE_HISTORY_KEY,
+            JSON.stringify(nextHistory)
+          );
+        } catch {
+          // Keep the in-memory score history when storage is unavailable.
+        }
+        return nextHistory;
+      });
+    },
+    []
+  );
+
+  const settleRound = useCallback(
+    (
+      roundId: string,
+      finalScore: number,
+      outcome: 'challengeComplete' | 'gameOver'
+    ) => {
+      // Timeouts and duplicate inputs can race to settle the same round. Only
+      // the first settlement for a round may record a score or open a dialog.
+      if (!settlementGateRef.current.trySettle(roundId)) return;
+
+      const nextBest = Math.max(bestScoreRef.current, finalScore);
+      bestScoreRef.current = nextBest;
       setBestScore(nextBest);
-      setGameOver(true);
-      recordScore(finalScore, mode);
+      if (outcome === 'challengeComplete') {
+        setChallengeComplete(true);
+        playSound('challengeComplete');
+      } else {
+        setGameOver(true);
+        playSound('gameOver');
+      }
+      recordScore(roundId, finalScore, mode);
       stopMusic();
-      playSound('gameOver');
       vibrate([50, 40, 90]);
 
       try {
@@ -323,15 +462,68 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         // Keep the in-memory best score when storage is unavailable.
       }
     },
-    [bestScore, mode, playSound, recordScore, stopMusic, vibrate]
+    [mode, playSound, recordScore, stopMusic, vibrate]
   );
+
+  const scheduleSettlement = useCallback(
+    (
+      resolution: {
+        gameOver: boolean;
+        nextRound: GameRound;
+      },
+      lineCount: number
+    ) => {
+      const roundId = roundIdentityRef.current.id;
+      const target = GAME_MODE_TARGETS[mode];
+      const reachedChallenge =
+        target !== null && resolution.nextRound.score >= target;
+      const delay =
+        lineCount > 0 && !preferences.reducedMotion ? CLEAR_EFFECT_DURATION : 0;
+
+      if (!reachedChallenge && !resolution.gameOver) return;
+
+      const settle = () =>
+        settleRound(
+          roundId,
+          resolution.nextRound.score,
+          reachedChallenge ? 'challengeComplete' : 'gameOver'
+        );
+
+      if (delay > 0) {
+        clearFinishTimer();
+        finishTimerRef.current = window.setTimeout(() => {
+          finishTimerRef.current = null;
+          settle();
+        }, delay);
+        return;
+      }
+      settle();
+    },
+    [clearFinishTimer, mode, preferences.reducedMotion, settleRound]
+  );
+
+  useEffect(() => {
+    if (!isSessionReady || screen !== 'game') return;
+    const pending = pendingRestoreSettlementRef.current;
+    if (!pending) return;
+    pendingRestoreSettlementRef.current = null;
+    settleRound(pending.roundId, pending.score, pending.outcome);
+  }, [isSessionReady, screen, settleRound]);
 
   const placePiece = useCallback(
     (pieceIndex: number, row: number, column: number) => {
-      if (isResolvingRef.current) return false;
-      const resolution = gameOver
-        ? null
-        : placeGamePiece(round, { column, pieceIndex, row });
+      if (
+        isResolvingRef.current ||
+        isInteractionPaused ||
+        settlementGateRef.current.isSettled(roundIdentityRef.current.id)
+      ) {
+        return false;
+      }
+      const resolution = placeGamePiece(roundRef.current, {
+        column,
+        pieceIndex,
+        row,
+      });
       if (!resolution) {
         playSound('invalidMove');
         vibrate(20);
@@ -371,8 +563,9 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         );
       }
 
-      setRound(nextRound);
-      if (nextRound.score > bestScore) {
+      applyRound(nextRound);
+      if (nextRound.score > bestScoreRef.current) {
+        bestScoreRef.current = nextRound.score;
         setBestScore(nextRound.score);
         try {
           window.localStorage.setItem(BEST_SCORE_KEY, String(nextRound.score));
@@ -388,65 +581,43 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       }
       vibrate(lineCount > 0 ? [20, 30, 35] : 12);
 
-      const target = GAME_MODE_TARGETS[mode];
-      if (target !== null && nextRound.score >= target) {
-        const completeChallenge = () => {
-          setChallengeComplete(true);
-          recordScore(nextRound.score, mode);
-          stopMusic();
-          playSound('challengeComplete');
-        };
-        if (lineCount > 0 && !preferences.reducedMotion) {
-          window.setTimeout(completeChallenge, CLEAR_EFFECT_DURATION);
-        } else {
-          completeChallenge();
-        }
-        return true;
-      }
-
-      if (nextGameOver) {
-        window.setTimeout(
-          () => finishGame(nextRound.score),
-          lineCount > 0 && !preferences.reducedMotion
-            ? CLEAR_EFFECT_DURATION
-            : 220
-        );
-      }
+      scheduleSettlement({ gameOver: nextGameOver, nextRound }, lineCount);
       return true;
     },
     [
-      bestScore,
-      finishGame,
-      gameOver,
-      mode,
+      applyRound,
+      isInteractionPaused,
       playSound,
       preferences.reducedMotion,
-      recordScore,
-      round,
-      stopMusic,
+      scheduleSettlement,
       vibrate,
     ]
   );
 
   const restartGame = useCallback(() => {
     isReturningHomeRef.current = false;
+    clearFinishTimer();
     dismissClearEffect();
-    const dailyDate = mode === 'daily' ? getLocalDateKey() : null;
-    dailyDateRef.current = dailyDate;
-    setRound(createGameRound(mode, dailyDate ?? getLocalDateKey()));
-    setElapsedSeconds(0);
-    setGameOver(false);
-    setChallengeComplete(false);
+    startFreshRound(mode, getLocalDateKey());
     setExitConfirmationOpen(false);
     startMusic();
     playSound('gameStart');
-  }, [dismissClearEffect, mode, playSound, startMusic]);
+  }, [
+    clearFinishTimer,
+    dismissClearEffect,
+    mode,
+    playSound,
+    startFreshRound,
+    startMusic,
+  ]);
 
   const returnToMenu = useCallback(() => {
     isReturningHomeRef.current = true;
+    clearFinishTimer();
     dismissClearEffect();
     clearActiveGameSession();
-    dailyDateRef.current = null;
+    roundIdentityRef.current = createRoundIdentity(mode, getLocalDateKey());
+    setSessionNotice(null);
     setChallengeComplete(false);
     setGameOver(false);
     setExitConfirmationOpen(false);
@@ -457,7 +628,19 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       return;
     }
     void navigate({ to: '/', ignoreBlocker: true });
-  }, [dismissClearEffect, navigate, navigationBlocker, stopMusic]);
+  }, [
+    clearFinishTimer,
+    dismissClearEffect,
+    mode,
+    navigate,
+    navigationBlocker,
+    stopMusic,
+  ]);
+
+  const startNewDailyFromNotice = useCallback(() => {
+    setSessionNotice(null);
+    startFreshRound('daily', getLocalDateKey());
+  }, [startFreshRound]);
 
   const keepPlaying = useCallback(() => {
     setExitConfirmationOpen(false);
@@ -467,18 +650,34 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   }, [navigationBlocker]);
 
   const requestExit = useCallback(() => {
-    if (hasActiveGame) {
+    if (hasActiveGame && !isRoundSettled) {
       setExitConfirmationOpen(true);
       return;
     }
     returnToMenu();
-  }, [hasActiveGame, returnToMenu]);
+  }, [hasActiveGame, isRoundSettled, returnToMenu]);
 
   const gameClassName = joinClasses(
     'block-game',
     preferences.reducedMotion && 'reduce-game-motion'
   );
   const challengeFailed = gameOver && mode === 'daily';
+
+  if (screen === 'game' && !isSessionReady) {
+    // The board cannot be rendered before the saved session has been read:
+    // the restore may swap in a different round, and rendering the throwaway
+    // initial round would both flash the wrong board and break hydration when
+    // the client date differs from the server render date across midnight.
+    return (
+      <div
+        className={gameClassName}
+        data-ready={false}
+        data-testid="block-game"
+      >
+        <div className="game-backdrop" aria-hidden="true" />
+      </div>
+    );
+  }
 
   if (screen === 'menu') {
     return (
@@ -494,6 +693,28 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
           <span className="backdrop-block backdrop-block-four" />
         </div>
         <GameMenu bestScore={bestScore} copy={copy} />
+        {sessionNotice && (
+          <div className="game-modal-backdrop">
+            <section
+              className="game-modal session-expired-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="session-expired-title"
+              data-testid="session-expired-modal"
+            >
+              <IconFlag className="modal-hero-icon" aria-hidden="true" />
+              <h2 id="session-expired-title">{copy.sessionExpiredTitle}</h2>
+              <p>{copy.sessionExpiredDescription(sessionNotice.date)}</p>
+              <button
+                type="button"
+                className="restart-button"
+                onClick={() => setSessionNotice(null)}
+              >
+                {copy.close}
+              </button>
+            </section>
+          </div>
+        )}
       </div>
     );
   }
@@ -514,8 +735,10 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       <GameBoardView
         clearEffect={clearEffect}
         copy={copy}
+        elapsedSeconds={elapsedSeconds}
         gameOver={gameOver}
         hintsEnabled={preferences.hints}
+        interactionPaused={isInteractionPaused}
         mode={mode}
         onPersist={persistActiveGame}
         onPlace={placePiece}
@@ -523,13 +746,51 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         round={round}
       />
 
-      {isExitConfirmationOpen && !gameOver && !challengeComplete && (
+      {sessionNotice && (
+        <div className="game-modal-backdrop">
+          <section
+            className="game-modal session-expired-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="session-expired-title"
+            data-testid="session-expired-modal"
+          >
+            <IconFlag className="modal-hero-icon" aria-hidden="true" />
+            <h2 id="session-expired-title">{copy.sessionExpiredTitle}</h2>
+            <p>{copy.sessionExpiredDescription(sessionNotice.date)}</p>
+            {mode === 'daily' && (
+              <button
+                type="button"
+                className="restart-button"
+                onClick={startNewDailyFromNotice}
+              >
+                <IconRefresh aria-hidden="true" />
+                {copy.restartGame}
+              </button>
+            )}
+            <button
+              type="button"
+              className={joinClasses(
+                'restart-button',
+                mode === 'daily' && 'result-home-button'
+              )}
+              onClick={returnToMenu}
+            >
+              <IconHome aria-hidden="true" />
+              {copy.backHome}
+            </button>
+          </section>
+        </div>
+      )}
+
+      {isExitConfirmationOpen && !isRoundSettled && !sessionNotice && (
         <div className="game-modal-backdrop">
           <section
             className="game-modal exit-confirmation-modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="exit-game-title"
+            data-testid="exit-confirmation-modal"
           >
             <IconAlertTriangle className="modal-hero-icon" aria-hidden="true" />
             <h2 id="exit-game-title">{copy.exitGameTitle}</h2>
@@ -554,7 +815,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         </div>
       )}
 
-      {gameOver && (
+      {gameOver && !sessionNotice && (
         <div className="game-modal-backdrop">
           <section
             className={joinClasses(
@@ -564,6 +825,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
             role="dialog"
             aria-modal="true"
             aria-labelledby="game-over-title"
+            data-testid="game-over-modal"
           >
             {challengeFailed ? (
               <IconFlag className="modal-hero-icon" aria-hidden="true" />
@@ -614,13 +876,14 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         </div>
       )}
 
-      {challengeComplete && (
+      {challengeComplete && !sessionNotice && (
         <div className="game-modal-backdrop">
           <section
             className="game-modal game-over-modal challenge-complete-modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="challenge-complete-title"
+            data-testid="challenge-complete-modal"
           >
             <div className="celebration-confetti" aria-hidden="true">
               {CHALLENGE_CONFETTI.map((piece) => (
@@ -657,10 +920,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
             <button
               type="button"
               className="restart-button challenge-home-button"
-              onClick={() => {
-                setChallengeComplete(false);
-                returnToMenu();
-              }}
+              onClick={returnToMenu}
             >
               <IconHome aria-hidden="true" />
               {copy.backHome}

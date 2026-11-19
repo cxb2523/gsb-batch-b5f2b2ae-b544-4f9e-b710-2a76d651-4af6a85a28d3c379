@@ -5,7 +5,7 @@ import {
 } from '@tabler/icons-react';
 import { Link } from '@tanstack/react-router';
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { GameCopy } from '@/components/game/game-copy';
 import {
   BOARD_SIZE,
@@ -44,8 +44,14 @@ interface DragState {
 interface GameBoardViewProps {
   clearEffect: GameClearEffect | null;
   copy: GameCopy;
+  elapsedSeconds: number;
   gameOver: boolean;
   hintsEnabled: boolean;
+  /**
+   * True while a blocking dialog (exit confirmation, results, expired session)
+   * is open. Inputs are ignored and any in-flight drag is cancelled.
+   */
+  interactionPaused: boolean;
   mode: GameMode;
   onPersist: () => void;
   onPlace: (pieceIndex: number, row: number, column: number) => boolean;
@@ -76,11 +82,19 @@ function joinClasses(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(' ');
 }
 
+function formatElapsed(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
 export function GameBoardView({
   clearEffect,
   copy,
+  elapsedSeconds,
   gameOver,
   hintsEnabled,
+  interactionPaused,
   mode,
   onPersist,
   onPlace,
@@ -93,6 +107,16 @@ export function GameBoardView({
   const { board, pieces, score } = round;
   const selected =
     selectedPiece === null ? null : (pieces[selectedPiece] ?? null);
+  const inputsBlocked = gameOver || interactionPaused;
+
+  useEffect(() => {
+    if (!interactionPaused) return;
+    // A dialog can open mid-drag (for example the exit confirmation). Drop the
+    // stale selection so no piece is placed from the frozen board.
+    setSelectedPiece(null);
+    setPreview(null);
+    setDrag(null);
+  }, [interactionPaused]);
 
   const clearInteraction = () => {
     setSelectedPiece(null);
@@ -126,7 +150,7 @@ export function GameBoardView({
     pieceIndex: number
   ) => {
     const piece = pieces[pieceIndex];
-    if (!piece || gameOver) return;
+    if (!piece || inputsBlocked) return;
 
     const shapeCell = (event.target as HTMLElement).closest<HTMLElement>(
       '[data-shape-cell]'
@@ -149,7 +173,9 @@ export function GameBoardView({
     pieceIndex: number
   ) => {
     const piece = pieces[pieceIndex];
-    if (!piece || !drag || drag.pieceIndex !== pieceIndex) return;
+    if (!piece || inputsBlocked || !drag || drag.pieceIndex !== pieceIndex) {
+      return;
+    }
     setDrag((current) =>
       current
         ? { ...current, clientX: event.clientX, clientY: event.clientY }
@@ -164,7 +190,9 @@ export function GameBoardView({
     pieceIndex: number
   ) => {
     const piece = pieces[pieceIndex];
-    if (!piece || !drag || drag.pieceIndex !== pieceIndex) return;
+    if (!piece || inputsBlocked || !drag || drag.pieceIndex !== pieceIndex) {
+      return;
+    }
     const placement = getPointerPlacement(event, piece, drag);
     if (
       placement?.isValid &&
@@ -178,7 +206,7 @@ export function GameBoardView({
   };
 
   const handleBoardCellClick = (row: number, column: number) => {
-    if (selectedPiece === null) return;
+    if (inputsBlocked || selectedPiece === null) return;
     if (onPlace(selectedPiece, row, column)) clearInteraction();
   };
 
@@ -200,6 +228,7 @@ export function GameBoardView({
           type="button"
           className="game-round-link game-back-button"
           aria-label={copy.backToModes}
+          data-testid="request-exit"
           onClick={onRequestExit}
         >
           <IconArrowLeft aria-hidden="true" />
@@ -228,6 +257,18 @@ export function GameBoardView({
         >
           <span>
             <strong data-testid="game-score">{score}</strong>
+          </span>
+        </output>
+        <output
+          className="board-stat board-timer"
+          aria-label={`${copy.time} ${formatElapsed(elapsedSeconds)}`}
+          data-elapsed={elapsedSeconds}
+          data-testid="game-timer"
+          data-paused={interactionPaused}
+        >
+          <span>
+            <small>{copy.time}</small>
+            <strong>{formatElapsed(elapsedSeconds)}</strong>
           </span>
         </output>
       </div>
@@ -288,9 +329,14 @@ export function GameBoardView({
                       ? `${displayedCell} ${copy.block}`
                       : copy.empty
                   )}
-                  disabled={clearEffect !== null}
+                  disabled={clearEffect !== null || inputsBlocked}
                   onPointerEnter={() => {
-                    if (!hintsEnabled || selectedPiece === null || !selected) {
+                    if (
+                      !hintsEnabled ||
+                      inputsBlocked ||
+                      selectedPiece === null ||
+                      !selected
+                    ) {
                       return;
                     }
                     setPreview({
@@ -423,8 +469,11 @@ export function GameBoardView({
               data-testid={`game-piece-${pieceIndex}`}
               key={piece.id}
               aria-label={`${copy.start}: ${piece.key}`}
-              disabled={clearEffect !== null}
-              onClick={() => setSelectedPiece(pieceIndex)}
+              disabled={clearEffect !== null || inputsBlocked}
+              onClick={() => {
+                if (inputsBlocked) return;
+                setSelectedPiece(pieceIndex);
+              }}
               onPointerDown={(event) =>
                 handlePiecePointerDown(event, pieceIndex)
               }

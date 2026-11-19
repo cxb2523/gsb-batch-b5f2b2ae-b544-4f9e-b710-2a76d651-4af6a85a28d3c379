@@ -299,6 +299,17 @@ function pieceHasPlacement(board: GameBoard, piece: GamePiece) {
   return false;
 }
 
+/**
+ * True while at least one piece still in the tray can be placed. A restored
+ * round with no playable piece is already over, even if the game-over
+ * transition had not been saved before the refresh.
+ */
+export function hasPlayablePiece(round: GameRound) {
+  return round.pieces.some(
+    (piece) => piece !== null && pieceHasPlacement(round.board, piece)
+  );
+}
+
 export function getGamePieceBounds(piece: GamePiece) {
   return piece.cells.reduce(
     (bounds, [row, column]) => ({
@@ -432,9 +443,7 @@ export function placeGamePiece(
     score: round.score + earned,
     seed: round.seed,
   };
-  const gameOver = !pieces.some(
-    (nextPiece) => nextPiece && pieceHasPlacement(board, nextPiece)
-  );
+  const gameOver = !hasPlayablePiece(nextRound);
 
   return { clear, earned, gameOver, round: nextRound };
 }
