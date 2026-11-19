@@ -31,6 +31,8 @@ export class ClusterRenderer {
         this.namespaceColorIndex = 0;
         this.running = false;
         this.frameId = null;
+        this._tweenFrameId = null;
+        this._disposed = false;
         this.lastFrameTime = 0;
         this.onSelect = null;
         this.onHover = null;
@@ -432,6 +434,7 @@ export class ClusterRenderer {
 
         group.userData.resourceId = resource.id;
         group.userData.resourceType = resource.type;
+        group.userData.namespace = resource.namespace || '';
         group.position.set(resource.x || 0, resource.y || 0, resource.z || 0);
 
         group.traverse((child) => {
@@ -460,17 +463,13 @@ export class ClusterRenderer {
         const group = this.resourceMeshes.get(resourceId);
         if (!group) return;
 
+        // 级联清理引用该资源的连线与流量路由，避免残留
+        this.connectionLines.removeConnectionsForResource(resourceId);
+        this.particleTraffic.removeRoutesForResource(resourceId);
+
         this.scene.remove(group);
-        group.traverse((child) => {
-            if (child.geometry) child.geometry.dispose();
-            if (child.material) {
-                if (Array.isArray(child.material)) {
-                    child.material.forEach(m => m.dispose());
-                } else {
-                    child.material.dispose();
-                }
-            }
-        });
+        // 经由工厂销毁：共享的标签纹理只做引用计数释放，不会误删其他资源的标签
+        this.meshFactory.dispose(group);
 
         this.resourceMeshes.delete(resourceId);
         this._rebuildPickableList();
@@ -567,11 +566,18 @@ export class ClusterRenderer {
         const stateIds = new Set();
 
         if (clusterState.resources) {
-            for (const resource of clusterState.resources.values()) {
+            const resources = clusterState.resources instanceof Map
+                ? clusterState.resources.values()
+                : Object.values(clusterState.resources);
+
+            for (const resource of resources) {
                 stateIds.add(resource.id);
-                if (currentIds.has(resource.id)) {
+                const existing = this.resourceMeshes.get(resource.id);
+                if (existing && existing.userData.resourceType === resource.type) {
                     this.updateResource(resource);
                 } else {
+                    // 同 id 但已是不同资源（同帧先删后加/整体替换）：先移除再按新状态重建
+                    if (existing) this.removeResource(resource.id);
                     this.addResource(resource);
                 }
             }
@@ -583,17 +589,41 @@ export class ClusterRenderer {
             }
         }
 
+        // 连线与流量路由必须收敛到当前资源集合：状态里有的按状态同步，
+        // 状态未提供的也要把端点已缺失的条目清掉
         if (clusterState.connections) {
             this.connectionLines.sync(clusterState.connections, this.resourceMeshes);
+        } else {
+            this.connectionLines.pruneMissingEndpoints(this.resourceMeshes);
         }
 
         if (clusterState.trafficRoutes) {
-            this.particleTraffic.syncRoutes(clusterState.trafficRoutes);
+            this.particleTraffic.syncRoutes(clusterState.trafficRoutes, this.resourceMeshes);
+        } else {
+            this.particleTraffic.pruneMissingEndpoints(this.resourceMeshes);
+        }
+
+        this._pruneNamespacePlanes();
+    }
+
+    _pruneNamespacePlanes() {
+        const inUse = new Set();
+        for (const group of this.resourceMeshes.values()) {
+            if (group.userData.namespace) inUse.add(group.userData.namespace);
+        }
+
+        for (const [namespace, entry] of [...this.namespacePlanes]) {
+            if (!inUse.has(namespace)) {
+                this.scene.remove(entry.mesh);
+                entry.mesh.geometry.dispose();
+                entry.mesh.material.dispose();
+                this.namespacePlanes.delete(namespace);
+            }
         }
     }
 
     start() {
-        if (this.running) return;
+        if (this.running || this._disposed) return;
         this.running = true;
         this.lastFrameTime = performance.now();
         this._animate();
@@ -605,10 +635,14 @@ export class ClusterRenderer {
             cancelAnimationFrame(this.frameId);
             this.frameId = null;
         }
+        if (this._tweenFrameId) {
+            cancelAnimationFrame(this._tweenFrameId);
+            this._tweenFrameId = null;
+        }
     }
 
     _animate() {
-        if (!this.running) return;
+        if (!this.running || this._disposed) return;
         this.frameId = requestAnimationFrame(() => this._animate());
 
         const now = performance.now();
@@ -679,6 +713,11 @@ export class ClusterRenderer {
     }
 
     animateToPositions(targets, duration = 800) {
+        if (this._tweenFrameId) {
+            cancelAnimationFrame(this._tweenFrameId);
+            this._tweenFrameId = null;
+        }
+
         const startTime = performance.now();
         const startPositions = new Map();
 
@@ -694,6 +733,11 @@ export class ClusterRenderer {
         }
 
         const animate = () => {
+            if (this._disposed) {
+                this._tweenFrameId = null;
+                return;
+            }
+
             const elapsed = performance.now() - startTime;
             const t = Math.min(elapsed / duration, 1);
             const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -711,11 +755,13 @@ export class ClusterRenderer {
             this.connectionLines.updatePositions(this.resourceMeshes);
 
             if (t < 1) {
-                requestAnimationFrame(animate);
+                this._tweenFrameId = requestAnimationFrame(animate);
+            } else {
+                this._tweenFrameId = null;
             }
         };
 
-        requestAnimationFrame(animate);
+        this._tweenFrameId = requestAnimationFrame(animate);
     }
 
     resetCamera() {
@@ -725,6 +771,9 @@ export class ClusterRenderer {
     }
 
     dispose() {
+        if (this._disposed) return;
+        this._disposed = true;
+
         this.stop();
 
         this.controls.dispose();

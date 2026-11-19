@@ -86,6 +86,24 @@ export class ConnectionLineManager {
         this.connections.delete(connectionId);
     }
 
+    removeConnectionsForResource(resourceId) {
+        for (const [id, entry] of [...this.connections]) {
+            if (entry.connection.sourceId === resourceId ||
+                entry.connection.targetId === resourceId) {
+                this.removeConnection(id);
+            }
+        }
+    }
+
+    pruneMissingEndpoints(resourceMeshes) {
+        for (const [id, entry] of [...this.connections]) {
+            if (!resourceMeshes.has(entry.connection.sourceId) ||
+                !resourceMeshes.has(entry.connection.targetId)) {
+                this.removeConnection(id);
+            }
+        }
+    }
+
     updatePositions(resourceMeshes) {
         for (const [id, entry] of this.connections) {
             const sourceGroup = resourceMeshes.get(entry.connection.sourceId);
@@ -149,6 +167,9 @@ export class ConnectionLineManager {
                 this.removeConnection(id);
             }
         }
+
+        // 端点资源已不存在的连线必须移除，而不是静默保留
+        this.pruneMissingEndpoints(resourceMeshes);
 
         this.updatePositions(resourceMeshes);
     }

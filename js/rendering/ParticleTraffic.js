@@ -158,6 +158,24 @@ export class ParticleTrafficSystem {
         }
     }
 
+    removeRoutesForResource(resourceId) {
+        for (const [id, route] of [...this.routes]) {
+            if (route.sourceId === resourceId || route.targetId === resourceId) {
+                this.removeRoute(id);
+            }
+        }
+    }
+
+    pruneMissingEndpoints(resourceIds) {
+        for (const [id, route] of [...this.routes]) {
+            const sourceMissing = route.sourceId && !resourceIds.has(route.sourceId);
+            const targetMissing = route.targetId && !resourceIds.has(route.targetId);
+            if (sourceMissing || targetMissing) {
+                this.removeRoute(id);
+            }
+        }
+    }
+
     updateRoute(routeId, updates) {
         const route = this.routes.get(routeId);
         if (!route) return;
@@ -271,6 +289,8 @@ export class ParticleTrafficSystem {
                     this.colors[trailIdx * 3] = route.color.r * (1 - t * 0.2);
                     this.colors[trailIdx * 3 + 1] = route.color.g * (1 - t * 0.2);
                     this.colors[trailIdx * 3 + 2] = route.color.b * (1 - t * 0.2);
+
+                    this.activeCount++;
                 }
             }
 
@@ -326,7 +346,7 @@ export class ParticleTrafficSystem {
         this.geometry.attributes.alpha.needsUpdate = true;
     }
 
-    syncRoutes(routesMap) {
+    syncRoutes(routesMap, resourceIds) {
         const newIds = new Set();
 
         for (const [id, route] of routesMap) {
@@ -342,6 +362,11 @@ export class ParticleTrafficSystem {
             if (!newIds.has(id)) {
                 this.removeRoute(id);
             }
+        }
+
+        // 源或目标资源已不存在的路由必须移除，而不是静默保留
+        if (resourceIds) {
+            this.pruneMissingEndpoints(resourceIds);
         }
     }
 

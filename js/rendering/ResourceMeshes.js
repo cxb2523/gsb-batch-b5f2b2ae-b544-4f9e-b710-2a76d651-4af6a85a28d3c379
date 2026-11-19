@@ -49,23 +49,59 @@ function createGlowRing(color, radius) {
     return ring;
 }
 
+const LABEL_TEXTURE_CACHE_LIMIT = 128;
+// text -> { texture, refs }。refs > 0 表示仍有存活标签在使用，不得销毁；
+// refs === 0 的条目是 LRU 淘汰候选，缓存总量受 LABEL_TEXTURE_CACHE_LIMIT 约束。
 const _labelTextureCache = new Map();
 
-function createLabelSprite(text) {
-    const cached = _labelTextureCache.get(text);
+export function acquireLabelTexture(text) {
+    const key = String(text);
+    const cached = _labelTextureCache.get(key);
     if (cached) {
-        const spriteMat = new THREE.SpriteMaterial({
-            map: cached,
-            transparent: true,
-            depthTest: false,
-            sizeAttenuation: true
-        });
-        const sprite = new THREE.Sprite(spriteMat);
-        sprite.scale.set(3.5, 0.9, 1);
-        sprite.userData.isLabel = true;
-        return sprite;
+        cached.refs++;
+        // 刷新 LRU 顺序
+        _labelTextureCache.delete(key);
+        _labelTextureCache.set(key, cached);
+        return cached.texture;
     }
 
+    const texture = _renderLabelTexture(key);
+    texture.userData.isCachedLabelTexture = true;
+    _labelTextureCache.set(key, { texture, refs: 1 });
+    _evictLabelTextureCache();
+    return texture;
+}
+
+export function releaseLabelTexture(text) {
+    const key = String(text);
+    const entry = _labelTextureCache.get(key);
+    if (!entry) return;
+    entry.refs = Math.max(0, entry.refs - 1);
+    _evictLabelTextureCache();
+}
+
+function _evictLabelTextureCache() {
+    if (_labelTextureCache.size <= LABEL_TEXTURE_CACHE_LIMIT) return;
+    for (const [key, entry] of _labelTextureCache) {
+        if (_labelTextureCache.size <= LABEL_TEXTURE_CACHE_LIMIT) break;
+        if (entry.refs > 0) continue; // 仍被存活标签引用，跳过
+        entry.texture.dispose();
+        _labelTextureCache.delete(key);
+    }
+}
+
+export function getLabelTextureCacheSize() {
+    return _labelTextureCache.size;
+}
+
+export function disposeLabelTextureCache() {
+    for (const entry of _labelTextureCache.values()) {
+        entry.texture.dispose();
+    }
+    _labelTextureCache.clear();
+}
+
+function _renderLabelTexture(text) {
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
     canvas.width = 512;
@@ -111,7 +147,11 @@ function createLabelSprite(text) {
 
     const texture = new THREE.CanvasTexture(canvas);
     texture.minFilter = THREE.LinearFilter;
-    _labelTextureCache.set(text, texture);
+    return texture;
+}
+
+function createLabelSprite(text) {
+    const texture = acquireLabelTexture(text);
 
     const spriteMat = new THREE.SpriteMaterial({
         map: texture,
@@ -123,6 +163,7 @@ function createLabelSprite(text) {
     const sprite = new THREE.Sprite(spriteMat);
     sprite.scale.set(3.5, 0.9, 1);
     sprite.userData.isLabel = true;
+    sprite.userData.labelText = String(text);
     return sprite;
 }
 
@@ -787,13 +828,19 @@ export class ResourceMeshFactory {
         if (!group) return;
         group.traverse((child) => {
             if (child.geometry) child.geometry.dispose();
-            if (child.material) {
-                if (child.material.map) child.material.map.dispose();
-                if (Array.isArray(child.material)) {
-                    child.material.forEach(m => m.dispose());
-                } else {
-                    child.material.dispose();
+            if (!child.material) return;
+
+            if (child.userData.isLabel && child.userData.labelText !== undefined) {
+                // 标签纹理是共享缓存资源：只释放引用，由缓存按 LRU 决定何时销毁
+                releaseLabelTexture(child.userData.labelText);
+            }
+
+            const materials = Array.isArray(child.material) ? child.material : [child.material];
+            for (const mat of materials) {
+                if (mat.map && !mat.map.userData.isCachedLabelTexture) {
+                    mat.map.dispose();
                 }
+                mat.dispose();
             }
         });
     }

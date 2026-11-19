@@ -1,0 +1,13 @@
+{
+  "name": "k8s-games",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "K8s Games - 3D Kubernetes cluster visualization game",
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\""
+  },
+  "dependencies": {
+    "three": "0.152.0"
+  }
+}

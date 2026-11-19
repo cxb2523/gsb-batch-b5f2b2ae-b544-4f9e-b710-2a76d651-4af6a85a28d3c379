@@ -96,6 +96,15 @@ Bottom toolbar: **Auto-Align** (K8s architecture layout) | **Reset View** | **YA
 
 Three.js r152 + Tailwind CSS CDN + vanilla ES6 modules. No build step, no dependencies, no bundler. ~50K lines across 90+ files.
 
+## Tests
+
+Rendering-layer regression tests (batch state replacement, missing-endpoint cleanup, dispose/start-stop lifecycle, label texture cache) run locally with Node's built-in test runner:
+
+```sh
+npm install   # installs three@0.152 (test-only dependency)
+npm test      # node --test "tests/*.test.mjs"
+```
+
 ## License
 
 Apache-2.0
