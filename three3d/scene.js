@@ -15,6 +15,7 @@
 import * as THREE from 'three';
 import { ribbonWindow, missileVisibleStart, TRAIL_FADE_DEAD, MISSILE_FADE } from './trail-window.js';
 import { OrbitControls } from '../vendor/three/OrbitControls.js';
+import { createTeardownCounter, disposeObjectTree, disposeLabels, clearUnitCaches } from './scene-gc.js';
 
 const COL = {
   own: 0x5bff8a, squad: 0x5bff8a, ally: 0x3d8bff, enemy: 0xff3b47, unknown: 0x6b7c8c,
@@ -547,6 +548,7 @@ function buildGround(scene, units) {
     color: COL.ground, transparent: true, opacity: 0.9, depthWrite: false,
     blending: THREE.AdditiveBlending, side: THREE.DoubleSide
   }), units.length);
+  im.name = 'ground';                /* 换局自检用：读场景快照里的实例数 */
   im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   im.frustumCulled = false;
   im.renderOrder = 2;
@@ -567,6 +569,9 @@ function buildGround(scene, units) {
 
 function buildKills(scene, killsIn) {
   const list = (killsIn || []).filter(k => isFinite(k.x));
+  /* 本局没有击杀就不建图层：换局后旧击杀层已被拆掉，这里保持"空"而不是留一个
+   * 空的 LineSegments（否则图层开关/场景快照里会看到上一局的残留容器）。 */
+  if (!list.length) { state._kills = null; return null; }
   const maxVerts = Math.max(1, list.length) * 3 * 2;          /* 每个击杀 3 段（X 两段 + 高度线一段） */
   const arr = new Float32Array(maxVerts * 3);
   const g = new THREE.BufferGeometry();
@@ -818,19 +823,133 @@ function prepUnits(M) {
   return { own, units };
 }
 
+/* ------------------------------------------------------------ 换局拆除
+ * 每局（每次 init）创建的全部对象都挂在 round 上；下一次 init 先按它拆干净：
+ *   - 场景树：从 scene 摘下并 dispose 几何体 / 材质 / 纹理（InstancedMesh 连矩阵纹理）；
+ *   - 标签层：摘掉 .ac-labels 容器（含文本），清空标签列表；
+ *   - 按单位惰性缓存：航迹序列 / 有效点 / 断口 / 翼展 / 采样步长；
+ *   - 其余轮次级状态：陆地层、击杀、导弹、地面方块、跑道、镜头锚点、统计。
+ *
+ * 幂等：首次 init 时 round / scene 都是 null，函数返回全 0 计数且不抛错。
+ * 若上一次 init 中途抛错，round 已在创建场景后立即登记，下一次仍能拆掉残骸。 */
+let round = null;                 /* 当前局的登记表；null = 还没有局 */
+let lastTeardown = createTeardownCounter();
+
+function resetSceneState() {
+  state.ready = false;
+  state.scene = null;
+  state.camera = null;
+  state.own = null;
+  state.units = [];
+  state.meta = null;
+  state.kills = [];
+  state.runways = null;
+  state.airfields = null;
+  state.ground = null;
+  state.missiles = null;
+  state.drops = null;
+  state.landFill = null;
+  state.terrainInfo = null;
+  state.bounds = null;
+  state.ownGaps = [];
+  state.labels = [];
+  state.labelBox = null;
+  state._kills = null;
+  state._gClusterOf = null;
+  delete state._landFrac;
+  state.t = 0;
+  state._dt = null;
+  state._lastNow = 0;
+  state.stats = { units: 0, calls: 0, fps: 0, tris: 0 };
+  state.camMode = 'follow';
+  /* 图层开关回到默认（渲染时每帧会按调用方 options 重新覆盖；这里保证
+   * "同一份数据重复 init" 与 "单次 init" 的初始状态一致）。 */
+  Object.assign(state.opts, {
+    grid: true, trails: true, labels: true, map: true, kills: true, water: true,
+    missiles: true, ownModel: true
+  });
+  delete state.opts.ground; delete state.opts.drops; delete state.opts.markers;
+  delete state.opts.enemy; delete state.opts.ally; delete state.opts.airfields;
+  delete state.opts.land;
+  /* 相机与控制器随场景一起退役：旧相机仍被旧 controls 引用，留着没有意义。 */
+  if (state.controls) {
+    try { state.controls.dispose(); } catch (e) { /* 已断开 */ }
+    state.controls = null;
+  }
+}
+
+function teardownRound() {
+  const c = createTeardownCounter();
+  const sc = (round && round.scene) || state.scene;
+  const units = []
+    .concat((round && round.units) || [], (round && round.own) || [],
+            state.units || [], state.own || []);
+
+  /* 1) 场景对象：逐个从场景摘下，再释放它引用的 GPU 资源。 */
+  if (sc) {
+    const children = sc.children.slice();
+    for (const child of children) {
+      try { sc.remove(child); } catch (e) { /* 已不在场景里 */ }
+      try { disposeObjectTree(child, c); } catch (e) { /* 坏对象：继续拆剩下的 */ }
+    }
+  }
+
+  /* 2) 标签层：容器与列表。 */
+  c.labels += (round && Array.isArray(round.labels)) ? round.labels.length : (state.labels || []).length;
+  try {
+    disposeLabels((round && round.labelBox) || state.labelBox,
+                  (typeof document !== 'undefined') ? document : null, c);
+  } catch (e) { /* DOM 不可用（Node 假对象）：计数已尽量填上 */ }
+
+  /* 3) 按单位缓存：只属于当前局。 */
+  clearUnitCaches(units, c);
+
+  resetSceneState();
+  _squadCache = null;              /* 小队信息来自本局 ACE_MISSION */
+  multiPlayers = new Set();
+  identityMode = null;
+  round = null;
+  /* 镜头锚点：与 init 里那段重置保持一致，并清掉上一局的 lastT，
+   * 否则换局后第一次 seek 判定会拿旧局的时刻做差。
+   * （CAMS / FOLLOW 在模块后面定义；正常运行时已就绪，这里仍防御一下。） */
+  try {
+    CAMS.oSinit = false; CAMS.init = false; CAMS.hold = false; CAMS.cut = false;
+    CAMS.cutAt = null; CAMS.spin = null; CAMS.over = null; CAMS.wasNull = false;
+    CAMS.gapDone = {}; CAMS.lastT = null;
+    CAMS.fx = 0; CAMS.fy = 0; CAMS.fz = 0; CAMS.az = 0; CAMS.el = FOLLOW.el; CAMS.r = FOLLOW.r;
+    CAMS.oSx = 0; CAMS.oSy = 0; CAMS.oSz = 0;
+  } catch (e) { /* 模块尚未求值完（理论上不会走到） */ }
+  return c;
+}
+
 function init(canvas, M, opts) {
   if (!canvas) { throw new Error('init: 缺少 canvas'); }
+  /* 换局：先把上一局完整拆掉（幂等；首次 init 时是空操作）。
+   * 必须在 new WebGLRenderer / new Scene 之前执行，否则旧局的网格、材质、纹理
+   * 会永远挂在 GPU 上（它们已经不在新场景里，但没人会再 dispose 它们）。 */
+  lastTeardown = teardownRound();
+
   state.canvas = canvas;
   /* preserveDrawingBuffer: 让 WebGL 画布在合成后仍可被 drawImage 读回。
      * 宣传片（promo）要把这块画布 drawImage 到 2D 主画布上，默认 false 时缓冲可能已被清空
      * （表现为偶发黑块 / 帧间抖动）。对产品页只多一点点显存开销。 */
-  const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: false, preserveDrawingBuffer: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setClearColor(0x05080d, 1);
-  state.renderer = renderer;
+  /* 渲染器按 canvas 复用：同一个 canvas 重复 init 时保留上下文，换 canvas 才释放旧的。
+   * 渲染器与会话绑定而不是与"局"绑定，但旧 canvas 上的那一块必须显式 dispose。 */
+  if (state.renderer && state.renderer.domElement !== canvas) {
+    try { state.renderer.dispose(); } catch (e) { /* 已失效 */ }
+    state.renderer = null;
+  }
+  if (!state.renderer) {
+    const renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: false, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x05080d, 1);
+    state.renderer = renderer;
+  }
 
   const scene = new THREE.Scene();
   state.scene = scene;
+  /* 本局登记表：init 中途抛错时，下一次 init 也能按这里拆掉已创建的部分。 */
+  round = { scene: scene, labelBox: null, units: [], own: null };
   const camera = new THREE.PerspectiveCamera(52, 1, 20, 500000);
   camera.position.set(0, 26000, 30000);
   state.camera = camera;
@@ -846,6 +965,8 @@ function init(canvas, M, opts) {
   const p = prepUnits(M || {});
   state.own = p.own;
   state.units = p.units;
+  round.units = p.units;
+  round.own = p.own;
 
   /* 换回放必须把相机状态清干净：否则会拿**上一局**的重锚点去比，
    * 开局就误判"55 km 瞬移"→ 一上来进远景并来回切换（2026-10-22 用户反馈）。 */
@@ -936,18 +1057,14 @@ function init(canvas, M, opts) {
   if (p.own) { p.own.vis = buildUnit(scene, p.own); }
   state.kills = (M.events || []).filter(e => e.kind === 'kill' && isFinite(e.x));
 
-  /* 标签层：换回放时 init 会被再调用一次 —— 必须先把上一份标签层摘掉，
-   * 否则旧回放的标签会一直留在 DOM 上（用户报的「换 wrpl 没清掉标签」）。 */
+  /* 标签层：teardownRound 已把上一份 .ac-labels 与标签列表清掉，
+   * 这里只负责建本局的容器；随后把容器与条目登记到 round，供下一次 init 拆除。 */
   injectLabelCss();
-  try {
-    const stale = document.querySelectorAll('.ac-labels');
-    for (let i = 0; i < stale.length; i++) { stale[i].parentNode.removeChild(stale[i]); }
-  } catch (e) {}
-  state.labels = [];
   const box = document.createElement('div');
   box.className = 'ac-labels';
   canvas.parentNode.appendChild(box);
   state.labelBox = box;
+  round.labelBox = box;
   const ownModel = (p.own && M.meta && M.meta.player)
     ? (M.meta.player.vehicleName || (M.meta.player.vehicle ? String(M.meta.player.vehicle).toUpperCase().replace(/_/g, '-') : '')) : '';
   /* 本机机型按「当前时刻所在那一段」取：换机后本机可能先在地面、后在空中，机型不同。 */
@@ -974,6 +1091,7 @@ function init(canvas, M, opts) {
   }
   ownSegs.sort((a, b) => a.t0 - b.t0);
   state.labels = buildLabels(box, airUnits.concat(groundUnits), p.own ? p.own.label : null, ownModel, ownSegs);
+  round.labels = state.labels;
 
   state.ready = true;
   window.__ACE_OPTS = state.opts;   /* 排查用：外部可直接改图层开关 */
@@ -1840,10 +1958,33 @@ function render(st) {
   state.stats.tris = state.renderer.info.render.triangles;
 }
 
+/* 诊断：当前场景里的对象数与命名图层集合。
+ * 换局自检（tools/check-scene-teardown.mjs）与手工排查都用它，
+ * 断言"新局没有地形/导弹时对应图层为空，而不是沿用旧对象"。 */
+function sceneSnapshot() {
+  const sc = state.scene;
+  if (!sc) { return { objects: 0, layers: [], groundInstances: 0 }; }
+  let n = 0;
+  const layers = [];
+  let groundInstances = 0;
+  sc.traverse((o) => {
+    n++;
+    if (o.name) { layers.push(o.name); }
+    if (o.name === 'ground' && o.isInstancedMesh) { groundInstances = o.count; }
+  });
+  layers.sort();
+  return { objects: n, layers: layers, groundInstances: groundInstances };
+}
+
 const API = {
   init: init, render: render, setCamera: setCamera, setOption: setOption,
   getReady: () => state.ready,
-  getStats: () => Object.assign({}, state.stats, { t: state.t, ready: state.ready, camMode: state.camMode })
+  getStats: () => Object.assign({}, state.stats, {
+    t: state.t, ready: state.ready, camMode: state.camMode,
+    labels: (state.labels || []).length,
+    teardown: Object.assign({}, lastTeardown),
+    scene: sceneSnapshot()
+  })
 };
 window.ACESceneReal = API;                   /* 供 scene3d3-loader.js 接管 */
 if (!window.ACEScene || window.ACEScene.__isProxy) { window.ACEScene = API; }

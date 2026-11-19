@@ -53,6 +53,11 @@ window.ACE_MASK_BASE    = '/path/to/dataset/landmask/';
 
 也可以用 `tools/pack_terrain.py` 打包到 `dist/terrain` 后从 `dist/` 起服务；其它地图缺素材时地形层留空并在 `limits` 里说明。
 
+`three3d/scene.js` 每次 `init` 会先完整拆除上一局（场景对象/几何体/材质/纹理/标签/按单位缓存），
+所以工具页可以反复拖入不同 `.wrpl` 而不残留旧局的航迹、击杀、导弹与地面方块。
+拆除计数的自动检查：`node tools/check-scene-teardown.mjs`；手工验收步骤见
+[`docs/SCENE-TEARDOWN.md`](docs/SCENE-TEARDOWN.md)。
+
 ## 已知问题
 
 - **阵营标识**：空中用击杀关系二色 + 出生位置聚类；地面用 ECS 的 `team` 组件（与上游 wrpl-acmi 对拍 6 份回放 715 个地面单位，0 分歧）。只有船/没有构造块的单位拿不到 team，保持 `unknown`，不按位置猜。
