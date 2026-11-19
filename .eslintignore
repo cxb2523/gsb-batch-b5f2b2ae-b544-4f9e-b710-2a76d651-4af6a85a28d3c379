@@ -1,0 +1,3 @@
+# Standalone browser acceptance harness is a plain HTML page, not a Vue SFC,
+# so the Vue template lint rules do not apply to it.
+test/browser/acceptance.html

@@ -78,6 +78,19 @@ export default {
     isSporadicValid: false,
     errorSnackbar: false,
     errorSnackbarText: '',
+    // Managed audio-graph lifecycle state. The nodes below are created on every
+    // play/record run and fully disposed by releaseAudioChain() on stop, so that
+    // repeated play/stop cycles never stack stale nodes or keep old timers alive.
+    noise: null,
+    filter: null,
+    tremolo: null,
+    lfo: null,
+    sampleReverbs: [],
+    transportInterval: null,
+    timeRemainingInterval: null,
+    recordingInterval: null,
+    isRecording: false,
+    preRecordingSnapshot: null,
     rules: {
       lt (n) {
         return value => (!isNaN(parseInt(value, 10)) && value < n) || 'Must be less than ' + n
@@ -137,10 +150,8 @@ export default {
     }
   },
   created () {
-    this.noise = new Tone.Noise()
-    this.filter = new Tone.Filter()
-    this.tremolo = new Tone.Tremolo()
-    this.lfo = new Tone.LFO()
+    // Pooled, long-lived resources. Per-run graph nodes (noise/filter/tremolo/
+    // lfo/reverbs) start as null and are owned by releaseAudioChain().
     this.players = new Tone.Players()
     this.samplePreviewPlayer = new Tone.Player().toDestination()
     this.samplePreviewPlayer.loop = true
@@ -152,9 +163,168 @@ export default {
     this.getCurrentUser()
   },
   beforeDestroy () {
+    // Tear down the active run first (nodes, timers, transport), then release
+    // the pooled resources that live for the whole component lifetime.
     this.stop()
+    this.disposeNode(this.recorder)
+    this.disposeNode(this.samplePreviewPlayer)
+    this.disposeNode(this.players)
   },
   methods: {
+    // ---------------------------------------------------------------------------
+    // Audio-graph lifecycle
+    //
+    // play(), playProfileForRecording() and stop() all converge on the same
+    // acquire/release pair:
+    //   - releaseAudioChain() stops and disposes every per-run node (Noise,
+    //     Filter, Tremolo, LFO, per-sample Reverb), clears every sporadic/timer
+    //     interval and resets the Transport. Pooled Players/Recorder survive.
+    //   - buildNoiseChain()/setupSamplePlayers() construct a fresh graph only
+    //     after the previous one has been released, so nodes never stack.
+    // ---------------------------------------------------------------------------
+    disposeNode (node) {
+      // Every Tone node used here exposes dispose(); guard anyway so a missing
+      // or already-disposed node can never take down the teardown path.
+      if (node && typeof node.dispose === 'function') {
+        try {
+          node.dispose()
+        } catch (e) {
+          // Disposal is best-effort; the node is being abandoned regardless.
+        }
+      }
+    },
+    clearSporadicTimers () {
+      this.loadedSamples.forEach(s => {
+        clearInterval(s.initialSporadicPlayInterval)
+        clearInterval(s.sporadicInterval)
+        s.initialSporadicPlayInterval = null
+        s.sporadicInterval = null
+      })
+    },
+    releaseAudioChain () {
+      // 1. Stop all JS timers (timer-mode countdown + sporadic scheduling).
+      clearInterval(this.transportInterval)
+      clearInterval(this.timeRemainingInterval)
+      this.transportInterval = null
+      this.timeRemainingInterval = null
+      this.clearSporadicTimers()
+
+      // 2. Stop the Transport and strip everything scheduled onto it, then
+      //    reset its position and loop bounds so the next run starts clean.
+      Tone.Transport.stop()
+      Tone.Transport.cancel()
+      Tone.Transport.position = 0
+      Tone.Transport.loopStart = 0
+      Tone.Transport.loopEnd = '4m'
+
+      // 3. Stop and disconnect the synced sample players, but do NOT dispose
+      //    them: they are pooled inside Tone.Players and dispose() would also
+      //    dispose the shared AudioBuffer used by the next run.
+      this.loadedSamples.forEach(s => {
+        const player = this.players.has(s.id) ? this.players.player(s.id) : null
+        if (player) {
+          try {
+            player.unsync()
+            player.stop()
+          } catch (e) {
+            // Player may never have been started; ignore.
+          }
+          player.disconnect()
+          player.toDestination()
+        }
+      })
+
+      // 4. Dispose of every node created for this run.
+      this.disposeNode(this.lfo)
+      this.lfo = null
+      this.disposeNode(this.tremolo)
+      this.tremolo = null
+      this.disposeNode(this.filter)
+      this.filter = null
+      this.sampleReverbs.forEach(reverb => this.disposeNode(reverb))
+      this.sampleReverbs = []
+      this.disposeNode(this.noise)
+      this.noise = null
+    },
+    // Route an effect/output node either straight to the destination (normal
+    // playback) or through the recorder first so it also lands on the recording.
+    routeOutput (node) {
+      if (this.isRecording) {
+        return node.connect(this.recorder).toDestination()
+      }
+      return node.toDestination()
+    },
+    buildNoiseChain () {
+      if (!this.isFilterEnabled && !this.isTremoloEnabled) {
+        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor })
+        this.routeOutput(this.noise)
+      } else if (!this.isFilterEnabled && this.isTremoloEnabled) {
+        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth })
+        this.routeOutput(this.tremolo)
+        this.tremolo.start()
+        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.tremolo)
+      } else if (this.isFilterEnabled && !this.isTremoloEnabled) {
+        this.filter = new Tone.Filter(this.filterCutoff, this.filterType)
+        this.routeOutput(this.filter)
+        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
+      } else {
+        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth })
+        this.routeOutput(this.tremolo)
+        this.tremolo.start()
+        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
+        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
+      }
+
+      // Only attach the LFO when a filter node actually exists for it to drive.
+      if (this.isLFOFilterCutoffEnabled && this.filter) {
+        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
+        this.lfo.connect(this.filter.frequency).start()
+      }
+    },
+    setupSamplePlayers (useTimer, duration) {
+      this.loadedSamples.forEach(s => {
+        const player = this.players.player(s.id)
+        player.loop = true
+        player.fadeIn = s.fadeIn
+        if (s.loopPointsEnabled) {
+          player.setLoopPoints(s.loopStart, s.loopEnd)
+        } else {
+          player.setLoopPoints(0, player.buffer.duration)
+        }
+        player.volume.value = s.volume
+
+        // Rebuild this player's routing from scratch.
+        player.disconnect()
+        if (s.reverbEnabled) {
+          const reverb = new Tone.Reverb(s.reverbDecay)
+          reverb.set({ preDelay: s.reverbPreDelay, wet: s.reverbWet })
+          this.sampleReverbs.push(reverb)
+          this.routeOutput(reverb)
+          player.connect(reverb)
+        } else {
+          this.routeOutput(player)
+        }
+
+        if (s.playbackMode === 'sporadic') {
+          player.loop = false
+
+          const maxInt = parseInt(s.sporadicMax, 10)
+          const minInt = parseInt(s.sporadicMin, 10)
+
+          if (minInt <= maxInt) {
+            const rand = Math.floor(Math.random() * (maxInt - minInt + 1) + minInt)
+            s.initialSporadicPlayInterval = setInterval(() => this.playSporadicSample(s.id), rand * 1000)
+          }
+        } else {
+          player.loop = true
+          if (useTimer) {
+            player.unsync().sync().start(0).stop(duration)
+          } else {
+            player.unsync().sync().start(0)
+          }
+        }
+      })
+    },
     async play () {
       if (!this.players.loaded) {
         return
@@ -162,31 +332,14 @@ export default {
 
       await Tone.start()
 
+      // Release any graph left over from a previous run before building the
+      // new one, so repeated play/stop cycles never accumulate nodes/timers.
+      this.releaseAudioChain()
+      this.isRecording = false
+
       this.playDisabled = true
-      Tone.Transport.cancel()
 
-      if (!this.isFilterEnabled && !this.isTremoloEnabled) {
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).toDestination()
-      } else if (!this.isFilterEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.tremolo)
-      } else if (this.isFilterEnabled && !this.isTremoloEnabled) {
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).toDestination()
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      } else if (this.isFilterEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      } else {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      }
-
-      if (this.isLFOFilterCutoffEnabled) {
-        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
-        this.lfo.connect(this.filter.frequency).start()
-      }
+      this.buildNoiseChain()
 
       if (this.isTimerEnabled) {
         this.duration = parseInt((this.hours * 3600)) + parseInt((this.minutes * 60)) + parseInt(this.seconds)
@@ -200,50 +353,15 @@ export default {
         this.noise.sync().start(0)
       }
 
-      this.loadedSamples.forEach(s => {
-        this.players.player(s.id).loop = true
-        this.players.player(s.id).fadeIn = s.fadeIn
-        if (s.loopPointsEnabled) {
-          this.players.player(s.id).setLoopPoints(s.loopStart, s.loopEnd)
-        } else {
-          this.players.player(s.id).setLoopPoints(0, this.players.player(s.id).buffer.duration)
-        }
-        this.players.player(s.id).volume.value = s.volume
-
-        this.players.player(s.id).disconnect()
-        if (s.reverbEnabled) {
-          const reverb = new Tone.Reverb(s.reverbDecay).toDestination()
-          reverb.set({ preDelay: s.reverbPreDelay, wet: s.reverbWet })
-          this.players.player(s.id).connect(reverb)
-        } else {
-          this.players.player(s.id).toDestination()
-        }
-
-        if (s.playbackMode === 'sporadic') {
-          this.players.player(s.id).loop = false
-
-          const maxInt = parseInt(s.sporadicMax, 10)
-          const minInt = parseInt(s.sporadicMin, 10)
-
-          if (minInt <= maxInt) {
-            const rand = Math.floor(Math.random() * (maxInt - minInt + 1) + minInt)
-            s.initialSporadicPlayInterval = setInterval(() => this.playSporadicSample(s.id), rand * 1000)
-          }
-        } else {
-          this.players.player(s.id).loop = true
-
-          if (this.isTimerEnabled) {
-            this.players.player(s.id).unsync().sync().start(0).stop(this.duration)
-          } else {
-            this.players.player(s.id).unsync().sync().start(0)
-          }
-        }
-      })
+      this.setupSamplePlayers(this.isTimerEnabled, this.duration)
 
       Tone.Transport.start('+0.1')
     },
     playSporadicSample (id) {
       const sample = this.loadedSamples.find(s => s.id === id)
+      if (!sample) {
+        return
+      }
 
       clearInterval(sample.initialSporadicPlayInterval)
       clearInterval(sample.sporadicInterval)
@@ -257,76 +375,113 @@ export default {
       sample.sporadicInterval = setInterval(() => this.playSporadicSample(id), sample.playNextTime * 1000)
     },
     stop () {
-      clearInterval(this.transportInterval)
-      Tone.Transport.stop()
-      this.playDisabled = false
+      // Fully converge the current run: nodes disposed, timers cleared,
+      // transport reset, recording stopped if one is in progress.
+      if (this.isRecording && this.recorder && this.recorder.state === 'started') {
+        try {
+          this.recorder.stop()
+        } catch (e) {
+          // Recorder already inactive; nothing to do.
+        }
+      }
+      this.isRecording = false
+      clearInterval(this.recordingInterval)
+      this.recordingInterval = null
 
-      clearInterval(this.timeRemainingInterval)
+      this.releaseAudioChain()
+
+      this.playDisabled = false
       this.timeRemaining = 0
       this.duration = 0
-
-      this.loadedSamples.forEach(s => {
-        if (s.playbackMode === 'sporadic') {
-          clearInterval(s.initialSporadicPlayInterval)
-          clearInterval(s.sporadicInterval)
-        }
-      })
     },
     startTimer () {
       this.timeRemaining -= 1
     },
     updateVolume () {
-      this.noise.volume.value = this.volume
+      if (this.noise) {
+        this.noise.volume.value = this.volume
+      }
     },
     updateNoiseColor () {
-      this.noise.type = this.noiseColor
+      if (this.noise) {
+        this.noise.type = this.noiseColor
+      }
     },
     updateFilterType () {
-      this.filter.type = this.filterType
+      if (this.filter) {
+        this.filter.type = this.filterType
+      }
     },
     updateFilterCutoff () {
-      this.filter.set({ frequency: this.filterCutoff })
+      if (this.filter) {
+        this.filter.set({ frequency: this.filterCutoff })
+      }
     },
     updateLFOFilterCutoffFrequency () {
-      this.lfo.set({ frequency: this.lfoFilterCutoffFrequency })
+      if (this.lfo) {
+        this.lfo.set({ frequency: this.lfoFilterCutoffFrequency })
+      }
     },
     updateLFOFilterCutoffRange () {
-      this.lfo.set({ min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
+      if (this.lfo) {
+        this.lfo.set({ min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
+      }
     },
     updateTremoloFrequency () {
-      this.tremolo.set({ frequency: this.tremoloFrequency })
+      if (this.tremolo) {
+        this.tremolo.set({ frequency: this.tremoloFrequency })
+      }
     },
     updateTremoloDepth () {
-      this.tremolo.set({ depth: this.tremoloDepth })
+      if (this.tremolo) {
+        this.tremolo.set({ depth: this.tremoloDepth })
+      }
+    },
+    updateSampleVolume (id, index) {
+      if (this.players.has(id)) {
+        this.players.player(id).volume.value = this.loadedSamples[index].volume
+      }
+      this.$forceUpdate()
     },
     updateAudioChain () {
+      // If nothing is playing there is no graph to rewire; the next play()
+      // builds a chain from the current checkbox state.
+      if (!this.noise) {
+        return
+      }
+
+      // Rebuild the effect sub-chain while playback is running. The Noise node
+      // itself stays alive and is reconnected to the fresh output.
+      this.disposeNode(this.lfo)
+      this.lfo = null
+      this.disposeNode(this.tremolo)
+      this.tremolo = null
+      this.disposeNode(this.filter)
+      this.filter = null
       this.noise.disconnect()
 
       if (!this.isFilterEnabled && !this.isTremoloEnabled) {
-        this.noise.toDestination()
+        this.routeOutput(this.noise)
       } else if (!this.isFilterEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
+        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth })
+        this.routeOutput(this.tremolo)
+        this.tremolo.start()
         this.noise.connect(this.tremolo)
-      } else if (this.isFilterEnabled && !this.isLFOFilterCutoffEnabled && !this.isTremoloEnabled) {
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).toDestination()
+      } else if (this.isFilterEnabled && !this.isTremoloEnabled) {
+        this.filter = new Tone.Filter(this.filterCutoff, this.filterType)
+        this.routeOutput(this.filter)
         this.noise.connect(this.filter)
-        this.lfo.disconnect()
-        this.lfo.stop()
-      } else if (this.isFilterEnabled && this.isLFOFilterCutoffEnabled && !this.isTremoloEnabled) {
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).toDestination()
-        this.noise.connect(this.filter)
-        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
-        this.lfo.connect(this.filter.frequency).start()
-      } else if (this.isFilterEnabled && this.isLFOFilterCutoffEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
-        this.noise.connect(this.filter)
-        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
-        this.lfo.connect(this.filter.frequency).start()
       } else {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).toDestination().start()
+        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth })
+        this.routeOutput(this.tremolo)
+        this.tremolo.start()
         this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
         this.noise.connect(this.filter)
+      }
+
+      if (this.isLFOFilterCutoffEnabled && this.filter) {
+        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
+        this.lfo.connect(this.filter.frequency).start()
       }
     },
     populateProfileItems (profileId) {
@@ -532,10 +687,6 @@ export default {
 
       this.addSampleDialog = false
       this.checkedSamples = []
-    },
-    updateSampleVolume (id, index) {
-      this.players.player(id).volume.value = this.loadedSamples[index].volume
-      this.$forceUpdate()
     },
     removeSample (index) {
       this.loadedSamples.splice(index, 1)
@@ -768,6 +919,61 @@ export default {
       this.startRecordingDialog = true
       this.profileMoreDialog = false
     },
+    snapshotCurrentSettings () {
+      return {
+        isTimerEnabled: this.isTimerEnabled,
+        duration: this.duration,
+        volume: this.volume,
+        noiseColor: this.noiseColor,
+        isFilterEnabled: this.isFilterEnabled,
+        filterType: this.filterType,
+        filterCutoff: this.filterCutoff,
+        isLFOFilterCutoffEnabled: this.isLFOFilterCutoffEnabled,
+        lfoFilterCutoffFrequency: this.lfoFilterCutoffFrequency,
+        lfoFilterCutoffRange: this.lfoFilterCutoffRange.slice(),
+        isTremoloEnabled: this.isTremoloEnabled,
+        tremoloFrequency: this.tremoloFrequency,
+        tremoloDepth: this.tremoloDepth,
+        loadedSamples: this.loadedSamples.slice(),
+        activeProfile: this.activeProfile,
+        unwatch: this.unwatch
+      }
+    },
+    restorePreRecordingSettings () {
+      const snapshot = this.preRecordingSnapshot
+      if (!snapshot) {
+        return
+      }
+
+      // Re-arming the change-watcher after restoring would flag the restored
+      // values as unsaved edits, so detach it across the restore and rebuild a
+      // fresh watcher afterwards.
+      if (this.unwatch) {
+        this.unwatch()
+      }
+
+      this.isTimerEnabled = snapshot.isTimerEnabled
+      this.duration = snapshot.duration
+      this.volume = snapshot.volume
+      this.noiseColor = snapshot.noiseColor
+      this.isFilterEnabled = snapshot.isFilterEnabled
+      this.filterType = snapshot.filterType
+      this.filterCutoff = snapshot.filterCutoff
+      this.isLFOFilterCutoffEnabled = snapshot.isLFOFilterCutoffEnabled
+      this.lfoFilterCutoffFrequency = snapshot.lfoFilterCutoffFrequency
+      this.lfoFilterCutoffRange = snapshot.lfoFilterCutoffRange.slice()
+      this.isTremoloEnabled = snapshot.isTremoloEnabled
+      this.tremoloFrequency = snapshot.tremoloFrequency
+      this.tremoloDepth = snapshot.tremoloDepth
+      this.loadedSamples = snapshot.loadedSamples
+      this.activeProfile = snapshot.activeProfile
+
+      this.unwatch = this.$watch('changeableSettings', function () {
+        this.unsavedWork = true
+      })
+      this.unsavedWork = false
+      this.preRecordingSnapshot = null
+    },
     startRecording () {
       // Save current profile before recording
       this.updateProfile()
@@ -776,6 +982,11 @@ export default {
         .then(async response => {
           if (response.status === 200) {
             const profile = response.data.profile
+
+            // Capture the live (pre-recording) configuration so it can be
+            // restored synchronously when recording ends or is cancelled, even
+            // if a later profile request would fail.
+            this.preRecordingSnapshot = this.snapshotCurrentSettings()
 
             this.isTimerEnabled = profile.isTimerEnabled
             this.duration = profile.duration
@@ -798,7 +1009,7 @@ export default {
             this.recordingDialog = true
             this.recordingTimeElapsed = 0
 
-            this.playProfileForRecording()
+            await this.playProfileForRecording()
 
             // Wait until Transport is actually running before starting recorder
             await new Promise(resolve => {
@@ -811,6 +1022,7 @@ export default {
             })
 
             await this.recorder.start()
+            this.isRecording = true
             this.recordingInterval = setInterval(() => this.recordingTimeElapsed++, 1000)
           }
         })
@@ -822,104 +1034,67 @@ export default {
     async playProfileForRecording () {
       await Tone.start()
 
+      // Release any graph left over from a previous run first so recording
+      // chains never stack on top of normal-playback chains.
+      this.releaseAudioChain()
+      this.isRecording = true
       this.playDisabled = true
-      Tone.Transport.cancel()
 
-      if (!this.isFilterEnabled && !this.isTremoloEnabled) {
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.recorder).toDestination()
-      } else if (!this.isFilterEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).connect(this.recorder).toDestination().start()
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.tremolo)
-      } else if (this.isFilterEnabled && !this.isTremoloEnabled) {
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.recorder).toDestination()
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      } else if (this.isFilterEnabled && this.isTremoloEnabled) {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).connect(this.recorder).toDestination().start()
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      } else {
-        this.tremolo = new Tone.Tremolo({ frequency: this.tremoloFrequency, depth: this.tremoloDepth }).connect(this.recorder).toDestination().start()
-        this.filter = new Tone.Filter(this.filterCutoff, this.filterType).connect(this.tremolo)
-        this.noise = new Tone.Noise({ volume: this.volume, type: this.noiseColor }).connect(this.filter)
-      }
-
-      if (this.isLFOFilterCutoffEnabled) {
-        this.lfo = new Tone.LFO({ frequency: this.lfoFilterCutoffFrequency, min: this.lfoFilterCutoffRange[0], max: this.lfoFilterCutoffRange[1] })
-        this.lfo.connect(this.filter.frequency).start()
-      }
-
-      this.loadedSamples.forEach(s => {
-        this.players.player(s.id).loop = true
-        this.players.player(s.id).fadeIn = s.fadeIn
-        if (s.loopPointsEnabled) {
-          this.players.player(s.id).setLoopPoints(s.loopStart, s.loopEnd)
-        } else {
-          this.players.player(s.id).setLoopPoints(0, this.players.player(s.id).buffer.duration)
-        }
-        this.players.player(s.id).volume.value = s.volume
-
-        this.players.player(s.id).disconnect()
-        if (s.reverbEnabled) {
-          const reverb = new Tone.Reverb(s.reverbDecay).connect(this.recorder).toDestination()
-          reverb.set({ preDelay: s.reverbPreDelay, wet: s.reverbWet })
-          this.players.player(s.id).connect(reverb)
-        } else {
-          this.players.player(s.id).connect(this.recorder).toDestination()
-        }
-      })
+      this.buildNoiseChain()
 
       this.noise.sync().start(0)
 
-      this.loadedSamples.forEach(s => {
-        if (s.playbackMode === 'sporadic') {
-          this.players.player(s.id).loop = false
-
-          const maxInt = parseInt(s.sporadicMax, 10)
-          const minInt = parseInt(s.sporadicMin, 10)
-          const rand = Math.floor(Math.random() * (maxInt - minInt + 1) + minInt)
-
-          s.initialSporadicPlayInterval = setInterval(() => this.playSporadicSample(s.id), rand * 1000)
-        } else {
-          this.players.player(s.id).loop = true
-          this.players.player(s.id).unsync().sync().start(0)
-        }
-      })
+      this.setupSamplePlayers(false, 0)
 
       Tone.Transport.start('+0.1')
     },
     async stopRecording () {
-      const recording = await this.recorder.stop()
-
-      // Set active profile back to the selected one
-      this.loadProfile(false)
-
-      const url = URL.createObjectURL(recording)
-      const anchor = document.createElement('a')
-      anchor.download = this.recordingFileName + '.webm'
-      anchor.href = url
-      anchor.click()
-
+      let recording = null
+      if (this.recorder.state === 'started') {
+        recording = await this.recorder.stop()
+      }
+      this.isRecording = false
       clearInterval(this.recordingInterval)
+      this.recordingInterval = null
 
-      this.loadedSamples.forEach(s => {
-        if (s.playbackMode === 'sporadic') {
-          clearInterval(s.initialSporadicPlayInterval)
-          clearInterval(s.sporadicInterval)
-        }
-      })
+      // Tear down the recording graph, sporadic timers and transport, and put
+      // the pooled players back in their disconnected default state.
+      this.releaseAudioChain()
+      this.playDisabled = false
+      this.timeRemaining = 0
+      this.duration = 0
+
+      // Restore the configuration that was active before recording started.
+      this.restorePreRecordingSettings()
+
+      if (recording) {
+        const url = URL.createObjectURL(recording)
+        const anchor = document.createElement('a')
+        anchor.download = this.recordingFileName + '.webm'
+        anchor.href = url
+        anchor.click()
+        URL.revokeObjectURL(url)
+      }
 
       this.recordingDialog = false
-      this.stop()
     },
     async cancelRecording () {
-      await this.recorder.stop()
-
-      // Set active profile back to the selected one
-      this.loadProfile(false)
-
+      if (this.recorder.state === 'started') {
+        await this.recorder.stop()
+      }
+      this.isRecording = false
       clearInterval(this.recordingInterval)
+      this.recordingInterval = null
+
+      this.releaseAudioChain()
+      this.playDisabled = false
+      this.timeRemaining = 0
+      this.duration = 0
+
+      // Cancelling must still return all settings to their pre-recording state.
+      this.restorePreRecordingSettings()
+
       this.recordingDialog = false
-      this.stop()
     },
     discardChanges () {
       this.unsavedWork = false

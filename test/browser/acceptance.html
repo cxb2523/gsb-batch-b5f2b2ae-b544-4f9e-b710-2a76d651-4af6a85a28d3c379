@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Noise lifecycle browser acceptance</title>
+  <style>
+    body { font-family: monospace; margin: 1.5rem; }
+    #log { white-space: pre-wrap; font-size: 13px; }
+    .pass { color: #1a7f37; }
+    .fail { color: #cf222e; }
+  </style>
+  <script src="/node_modules/tone/build/Tone.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "tone": "/test/browser/tone-shim.mjs"
+      }
+    }
+  </script>
+</head>
+<body>
+  <h2>Noise lifecycle browser acceptance</h2>
+  <div id="log">running…</div>
+  <script type="module">
+    // `Tone` resolves through test/browser/tone-shim.mjs, which serves the real
+    // Tone.js classes with instrumented subclasses for the per-run graph nodes.
+    import * as ToneNS from 'tone'
+    import noiseOptions from '/src/components/noise.js'
+    const Tone = ToneNS.default
+
+    // Counters published by the shim.
+    const graphKinds = ['Noise', 'Filter', 'Tremolo', 'LFO', 'Reverb']
+    const getLive = () => window.__toneInstrumentation.live
+    const getPeak = () => window.__toneInstrumentation.peak
+
+    const logEl = document.getElementById('log')
+    const results = []
+    function check (name, condition, detail = '') {
+      results.push({ name, pass: !!condition, detail })
+      const line = `${condition ? 'PASS' : 'FAIL'}  ${name}${detail ? ' — ' + detail : ''}\n`
+      logEl.textContent += line
+      logEl.lastChild && (logEl.lastChild.textContent = '')
+      logEl.innerHTML += `<span class="${condition ? 'pass' : 'fail'}">${line}</span>`
+    }
+
+    // -------------------------------------------------------------------------
+    // Build a component instance with the real options object, minus the HTTP
+    // calls in created() — we allocate the pooled nodes directly instead.
+    // -------------------------------------------------------------------------
+    function makeComponent () {
+      const instance = {
+        ...noiseOptions.data(),
+        _watchers: [],
+        $watch (expr, cb) { const e = { expr, cb }; this._watchers.push(e); return () => { const i = this._watchers.indexOf(e); if (i >= 0) this._watchers.splice(i, 1) } },
+        $forceUpdate () {},
+        $http: { get: async () => ({ status: 200, data: {} }), post: async () => ({ status: 200 }), put: async () => ({ status: 200 }), delete: async () => ({ status: 200 }) },
+        $vuetify: { theme: { dark: false, themes: { dark: { primary: '' }, light: { primary: '' } } } }
+      }
+      Object.entries(noiseOptions.methods).forEach(([n, fn]) => { instance[n] = fn.bind(instance) })
+      Object.entries(noiseOptions.computed).forEach(([n, def]) => {
+        Object.defineProperty(instance, n, { get: def.bind(instance), configurable: true })
+      })
+
+      instance.players = new Tone.Players()
+      instance.samplePreviewPlayer = new Tone.Player().toDestination()
+      instance.samplePreviewPlayer.loop = true
+      instance.recorder = new Tone.Recorder()
+
+      // Inject an in-memory AudioBuffer so no sample URL has to be fetched.
+      const ctx = Tone.getContext().rawContext
+      const buffer = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate)
+      buffer.getChannelData(0).fill(0.01)
+      instance.players.add('s1', buffer)
+      instance.loadedSamples = [{
+        id: 's1', name: 'test', volume: -10, reverbEnabled: true,
+        reverbPreDelay: 0.01, reverbDecay: 0.1, reverbWet: 0.3,
+        playbackMode: 'sporadic', sporadicMin: 1, sporadicMax: 1,
+        fadeIn: 0, loopPointsEnabled: false, loopStart: 0, loopEnd: 0
+      }]
+      return instance
+    }
+
+    const wait = ms => new Promise(r => setTimeout(r, ms))
+    const intervals = new Set()
+    const nativeSetInterval = globalThis.setInterval.bind(globalThis)
+    const nativeClearInterval = globalThis.clearInterval.bind(globalThis)
+    globalThis.setInterval = (fn, ms) => { const id = nativeSetInterval(fn, ms); intervals.add(id); return id }
+    globalThis.clearInterval = (id) => { intervals.delete(id); nativeClearInterval(id) }
+
+    async function run () {
+      const c = makeComponent()
+
+      // ---- Scenario 1: play -> stop -> play -> stop, nodes must not stack ---
+      c.isFilterEnabled = true
+      c.isTremoloEnabled = true
+      c.isLFOFilterCutoffEnabled = true
+
+      await c.play()
+      await wait(300)
+      check('play: exactly one live node per kind',
+        graphKinds.every(k => getLive()[k] === 1), JSON.stringify(getLive()))
+      check('transport started', Tone.Transport.state === 'started', Tone.Transport.state)
+
+      // Slider updates must reach the live nodes without throwing. The filter
+      // cutoff slider is disabled in the UI while the LFO is active (the LFO
+      // overrides that param), so verify cutoff against a separate non-LFO run.
+      let slidersOk = true
+      let sliderDetail = ''
+      try {
+        c.volume = -20; c.updateVolume()
+        c.tremoloDepth = 0.8; c.updateTremoloDepth()
+        c.lfoFilterCutoffFrequency = 1.25; c.updateLFOFilterCutoffFrequency()
+        c.loadedSamples[0].volume = -33
+        c.updateSampleVolume('s1', 0)
+      } catch (e) { slidersOk = false; sliderDetail = e.message }
+      const volumeApplied = Math.abs(c.noise.volume.value - (-20)) < 0.01
+      const lfoRateApplied = Math.abs(c.lfo.frequency.value - 1.25) < 0.01
+      const sampleVolumeApplied = Math.abs(c.players.player('s1').volume.value - (-33)) < 0.01
+      check('slider updates reach live nodes',
+        slidersOk && volumeApplied && lfoRateApplied && sampleVolumeApplied,
+        sliderDetail || `volume=${c.noise.volume.value} lfoRate=${c.lfo.frequency.value} sample=${c.players.player('s1').volume.value}`)
+
+      c.stop()
+      check('stop: all per-run nodes disposed',
+        graphKinds.every(k => getLive()[k] === 0), JSON.stringify(getLive()))
+      // Transport.seconds lands on a tiny floating-point residue after stop;
+      // compare against an epsilon and require the stopped state explicitly.
+      const transportReset = Tone.Transport.state === 'stopped' &&
+        Math.abs(Tone.Transport.seconds) < 0.001
+      check('stop: transport reset', transportReset,
+        `state=${Tone.Transport.state} seconds=${Tone.Transport.seconds}`)
+      check('stop: all JS intervals cleared', intervals.size === 0, `${intervals.size} left`)
+      check('stop: pooled players survive', c.players.has('s1') && !c.players.player('s1').disposed)
+
+      // Slider updates after stop must be safe no-ops.
+      let noThrow = true
+      try {
+        c.updateVolume(); c.updateFilterCutoff(); c.updateTremoloDepth()
+        c.updateLFOFilterCutoffFrequency(); c.updateAudioChain(); c.updateNoiseColor()
+      } catch (e) { noThrow = false }
+      check('sliders after stop are safe no-ops', noThrow)
+
+      await c.play()
+      await wait(300)
+      check('replay: still exactly one live node per kind (no stacking)',
+        graphKinds.every(k => getLive()[k] === 1), JSON.stringify(getLive()))
+      // The freshly built Noise node must be constructed from the current
+      // volume slider state (c.volume was moved to -20 above).
+      check('replay: new nodes inherit current slider values',
+        Math.abs(c.noise.volume.value - c.volume) < 0.01 && c.volume === -20,
+        `nodeVolume=${c.noise.volume.value} slider=${c.volume}`)
+      c.stop()
+      check('second stop: all nodes disposed again',
+        graphKinds.every(k => getLive()[k] === 0), JSON.stringify(getLive()))
+
+      // Cutoff slider on an LFO-free filter chain: the manual value must reach
+      // the filter's frequency param directly.
+      c.isLFOFilterCutoffEnabled = false
+      c.filterCutoff = 3300
+      await c.play()
+      await wait(150)
+      c.updateFilterCutoff()
+      await wait(150)
+      check('cutoff slider reaches filter when LFO is off',
+        Math.abs(c.filter.frequency.value - 3300) < 1,
+        `cutoff=${c.filter.frequency.value}`)
+      c.stop()
+      // Restore the full chain configuration for the recording scenarios.
+      c.isLFOFilterCutoffEnabled = true
+
+      // ---- Scenario 2: recording end restores the pre-recording config ------
+      c.volume = -7
+      c.noiseColor = 'brown'
+      c.unwatch = c.$watch('changeableSettings', () => { c.unsavedWork = true })
+      c.preRecordingSnapshot = c.snapshotCurrentSettings()
+      c.volume = -40
+      c.noiseColor = 'white'
+
+      await c.playProfileForRecording()
+      await wait(200)
+      // Routing into the recorder is verified through the underlying native
+      // MediaStreamAudioDestinationNode: its input count is 1 once an effect
+      // chain is connected to the Tone Recorder, 0 after disposal.
+      const nativeStream = c.recorder._stream._nativeMediaStreamAudioDestinationNode
+      const recorderHasIncoming = nativeStream.numberOfInputs === 1
+      check('record: one live graph routed through recorder',
+        getLive().Noise === 1 && recorderHasIncoming,
+        `noise=${getLive().Noise} streamInputs=${nativeStream.numberOfInputs}`)
+      await c.recorder.start()
+      check('recorder started', c.recorder.state === 'started', c.recorder.state)
+      c.recordingInterval = setInterval(() => {}, 1000)
+      await wait(200)
+      await c.stopRecording()
+
+      check('record stop: recorder stopped', c.recorder.state === 'stopped')
+      check('record stop: graph disposed', getLive().Noise === 0)
+      check('record stop: recording interval cleared', intervals.size === 0)
+      check('record stop: pre-recording volume restored', c.volume === -7, String(c.volume))
+      check('record stop: pre-recording noise color restored', c.noiseColor === 'brown', c.noiseColor)
+      check('record stop: snapshot consumed', c.preRecordingSnapshot === null)
+
+      // ---- Scenario 3: cancel recording also restores -----------------------
+      c.volume = -11
+      c.preRecordingSnapshot = c.snapshotCurrentSettings()
+      c.volume = -50
+      await c.playProfileForRecording()
+      await c.recorder.start()
+      c.recordingInterval = setInterval(() => {}, 1000)
+      await c.cancelRecording()
+      check('cancel: recorder stopped and graph disposed',
+        c.recorder.state === 'stopped' && getLive().Noise === 0)
+      check('cancel: settings restored', c.volume === -11, String(c.volume))
+      check('cancel: no intervals remain', intervals.size === 0)
+
+      // ---- Scenario 4: normal playback still works after recording ----------
+      await c.play()
+      await wait(200)
+      check('play after recording: single live graph',
+        graphKinds.every(k => getLive()[k] === 1), JSON.stringify(getLive()))
+      c.stop()
+      check('play after recording: clean stop',
+        graphKinds.every(k => getLive()[k] === 0) && intervals.size === 0)
+
+      window.__acceptanceResult = {
+        pass: results.every(r => r.pass),
+        results,
+        peakCounts: getPeak(),
+        liveCounts: getLive()
+      }
+      logEl.innerHTML += `<br/><strong class="${window.__acceptanceResult.pass ? 'pass' : 'fail'}">` +
+        `${window.__acceptanceResult.pass ? 'ALL CHECKS PASSED' : 'FAILURES PRESENT'}</strong>`
+    }
+
+    run().catch(err => {
+      window.__acceptanceResult = { pass: false, fatal: String(err && err.stack || err) }
+      logEl.innerHTML += `<span class="fail">FATAL: ${err && err.stack || err}</span>`
+    })
+  </script>
+</body>
+</html>
