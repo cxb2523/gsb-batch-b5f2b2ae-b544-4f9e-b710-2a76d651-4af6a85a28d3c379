@@ -1,5 +1,5 @@
 import { html, useState, useEffect, useRef, useMemo, useInView } from '../ui.js';
-import { useApi, Skeleton, ErrorBox } from './common.js';
+import { useApi, Skeleton, ErrorBox, scopeOf } from './common.js';
 import { q } from '../api.js';
 import { fmtFull, fmtNum } from '../util.js';
 
@@ -13,26 +13,39 @@ export function SankeyCard({ api, range, ttl }) {
   const [flows, setFlows] = useState(null);
   const [hot, setHot] = useState(null);
   const [note, setNote] = useState('');
+  const scope = scopeOf(api);
   const refs = useApi(api, `/api/v0/stats/toprefs?${q({ start: range.start, end: range.end, limit: 50 })}`, { ttl, enabled: seen });
+  // The trace belongs to one site, page filter and range. Links are stamped with it, so a render for a new one can
+  // never paint the old chart, and the loop for an old one stops before it can append another link.
+  const token = scope + '\n' + range.key;
+  const tokenNow = useRef(token);
+  tokenNow.current = token;
+  const gen = useRef(0);
 
   useEffect(() => {
-    if (!refs.data) return;
+    const my = ++gen.current; // this trace owns the chart now; every older loop is retired
+    const live = () => gen.current === my && tokenNow.current === token;
+    setHot(null); setNote('');
+    if (!refs.data) { setFlows(null); return; }
     const sources = (refs.data.stats || []).filter((r) => r.name && r.id).slice(0, 6);
-    if (!sources.length) { setFlows({ links: [], done: 0, total: 0 }); return; }
-    let dead = false; const links = [];
-    setFlows({ links: [], done: 0, total: sources.length });
+    if (!sources.length) { setFlows({ token, links: [], done: 0, total: 0 }); return; }
+    const links = [];
+    setFlows({ token, links, done: 0, total: sources.length });
     (async () => {
       for (let i = 0; i < sources.length; i++) {
         try {
-          const r = await api.get(`/api/v0/stats/toprefs/${encodeURIComponent(sources[i].id)}?${q({ start: range.start, end: range.end, limit: 10 })}`, { ttl, skip: () => dead });
+          const r = await api.get(`/api/v0/stats/toprefs/${encodeURIComponent(sources[i].id)}?${q({ start: range.start, end: range.end, limit: 10 })}`, { ttl, skip: () => !live() });
+          if (!live()) return;
           for (const p of (r && r.stats) || []) if (p.count > 0 && (p.name || p.id)) links.push({ src: sources[i].name, srcIdx: i, page: p.name || String(p.id), count: p.count });
         } catch (e) { /* a failed source is simply left out */ }
-        if (dead) return;
-        setFlows({ links: [...links], done: i + 1, total: sources.length });
+        if (!live()) return;
+        setFlows({ token, links: [...links], done: i + 1, total: sources.length });
       }
     })();
-    return () => { dead = true; };
-  }, [refs.data, range.key]);
+    return () => { gen.current++; };
+  }, [token, refs.data, api, range.start, range.end, range.key, ttl]);
+
+  const shown = flows && flows.token === token ? flows : null; // what is on screen is always about this site/filter/range
 
   useEffect(() => {
     if (!box.current) return;
@@ -43,13 +56,13 @@ export function SankeyCard({ api, range, ttl }) {
 
   const small = w < 600;
   const g = useMemo(() => {
-    if (!flows || !flows.links.length) return null;
+    if (!shown || !shown.links.length) return null;
     const maxSrc = small ? 4 : 6, maxPages = small ? 5 : 8;
     const srcTot = new Map(), pageTot = new Map();
-    for (const l of flows.links) { srcTot.set(l.src, (srcTot.get(l.src) || 0) + l.count); pageTot.set(l.page, (pageTot.get(l.page) || 0) + l.count); }
+    for (const l of shown.links) { srcTot.set(l.src, (srcTot.get(l.src) || 0) + l.count); pageTot.set(l.page, (pageTot.get(l.page) || 0) + l.count); }
     const srcs = [...srcTot.entries()].sort((a, b) => b[1] - a[1]).slice(0, maxSrc).map(([name]) => name);
     const pages = [...pageTot.entries()].sort((a, b) => b[1] - a[1]).slice(0, maxPages).map(([name]) => name);
-    const L = flows.links.filter((l) => srcs.includes(l.src) && pages.includes(l.page));
+    const L = shown.links.filter((l) => srcs.includes(l.src) && pages.includes(l.page));
     const sTot = srcs.map((s) => L.filter((l) => l.src === s).reduce((a, l) => a + l.count, 0)), pTot = pages.map((p) => L.filter((l) => l.page === p).reduce((a, l) => a + l.count, 0));
     const padN = 12, H = Math.max(250, Math.max(srcs.length, pages.length) * 38);
     const unit = Math.min((H - padN * (srcs.length - 1)) / sTot.reduce((a, b) => a + b, 0), (H - padN * (pages.length - 1)) / pTot.reduce((a, b) => a + b, 0));
@@ -59,12 +72,12 @@ export function SankeyCard({ api, range, ttl }) {
     const ribbons = [];
     for (const s of sN) for (const p of pN) { const l = L.find((x) => x.src === s.name && x.page === p.name); if (!l) continue; const h = l.count * unit, y0 = s.y + s.off, y1 = p.y + p.off; s.off += h; p.off += h; const xm = (lx + nw + rx) / 2; ribbons.push({ key: s.name + '>' + p.name, src: s, page: p, count: l.count, d: `M${lx + nw},${y0}C${xm},${y0} ${xm},${y1} ${rx},${y1}L${rx},${y1 + h}C${xm},${y1 + h} ${xm},${y0 + h} ${lx + nw},${y0 + h}Z` }); }
     return { sN, pN, ribbons, H, lx, rx, nw, total: L.reduce((a, l) => a + l.count, 0) };
-  }, [flows, w, small]);
+  }, [shown, w, small]);
 
-  const loading = flows && flows.done < flows.total;
+  const loading = shown && shown.done < shown.total;
   return html`<section class="card span-12" ref=${ref} aria-label="Where traffic goes">
-    <div class="card-h"><div><h2>Where visitors go next</h2><p class="sub">From your biggest referrers to the pages they land on${loading ? ` · tracing source ${flows.done + 1} of ${flows.total}` : ''}</p></div></div>
-    ${refs.error ? html`<${ErrorBox} error=${refs.error} retry=${refs.retry} />` : !flows ? html`<${Skeleton} h=${250} r="12px" />` : !g ? (loading ? html`<${Skeleton} h=${250} r="12px" />` : html`<div class="empty">No referrers in this range yet. Direct visits are not traced.</div>`) : html`
+    <div class="card-h"><div><h2>Where visitors go next</h2><p class="sub">From your biggest referrers to the pages they land on${loading ? ` · tracing source ${shown.done + 1} of ${shown.total}` : ''}</p></div></div>
+    ${refs.error ? html`<${ErrorBox} error=${refs.error} retry=${refs.retry} />` : !shown ? html`<${Skeleton} h=${250} r="12px" />` : !g ? (loading ? html`<${Skeleton} h=${250} r="12px" />` : html`<div class="empty">No referrers in this range yet. Direct visits are not traced.</div>`) : html`
     <div ref=${box} class="sankey-wrap" style=${{ opacity: loading ? 0.7 : 1, transition: 'opacity .3s' }}>
       <svg class="sankey" viewBox=${`0 0 ${w} ${g.H + 4}`} width=${w} height=${g.H + 4} role="img" aria-label=${`Flows from ${g.sN.length} referrers to ${g.pN.length} pages. The lists beside the chart hold the same data.`}>
         ${g.ribbons.map((r) => html`<path key=${r.key} class="ribbon" d=${r.d} style=${{ fill: COLORS[r.src.i % 6], opacity: hot === null ? 0.34 : hot === r.key || hot === 's:' + r.src.name || hot === 'p:' + r.page.name ? 0.8 : 0.1 }} onPointerEnter=${() => { setHot(r.key); setNote(`${r.src.name} to ${r.page.name}: ${fmtFull(r.count)} visitors`); }} onPointerLeave=${() => { setHot(null); setNote(''); }}/>`)}

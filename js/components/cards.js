@@ -1,5 +1,5 @@
 import { html, useState, useEffect, useMemo, useRef, useInView } from '../ui.js';
-import { useApi, SkeletonRows, ErrorBox, Sparkline, Skeleton, Num, Delta } from './common.js';
+import { useApi, SkeletonRows, ErrorBox, Sparkline, Skeleton, Num, Delta, scopeOf } from './common.js';
 import { q, ttlFor } from '../api.js';
 import { fmtNum, fmtFull, fmtPct } from '../util.js';
 import { pageSeries, pageMovers, shareOf, schemeLabel } from '../model.js';
@@ -29,6 +29,8 @@ export function RankCard({ api, title, sub, endpoint, ttl, pick = (d) => d.stats
   const total = rows.reduce((a, r) => a + (r.count || 0), 0);
   const max = Math.max(1, ...rows.map((r) => r.count || 0));
   const shown = all ? rows : rows.slice(0, show);
+  // a row opened for another site or page filter is not shown against this one's numbers
+  const isOpen = (id) => open && open.scope === scopeOf(api) && open.id === id;
   // optional cards (campaigns) stay out of the page until there is something to show; the sentinel only triggers the load
   if (hideEmpty && (!data || !rows.length || (error && error.kind === 'notfound'))) return html`<div ref=${ref} aria-hidden="true" style="position:absolute;left:0;bottom:0;width:1px;height:1px;pointer-events:none"></div>`;
   return html`<section class=${'card ' + span} ref=${ref} aria-label=${title}>
@@ -38,13 +40,13 @@ export function RankCard({ api, title, sub, endpoint, ttl, pick = (d) => d.stats
       <ul class="rows">${shown.map((r, i) => {
         const id = r.id === undefined || r.id === '' ? r.name : r.id;
         const canDrill = drill && drill(r);
-        const isOpen = open === id;
+        const openHere = isOpen(id);
         return html`<li key=${id + ':' + i}>
-          <button class="row-btn" type="button" aria-expanded=${canDrill ? String(isOpen) : undefined} onClick=${() => canDrill && setOpen(isOpen ? null : id)} style=${{ cursor: canDrill ? 'pointer' : 'default' }}>
+          <button class="row-btn" type="button" aria-expanded=${canDrill ? String(openHere) : undefined} onClick=${() => canDrill && setOpen(openHere ? null : { id, scope: scopeOf(api) })} style=${{ cursor: canDrill ? 'pointer' : 'default' }}>
             <div class="row"><span class="name">${stack ? html`<i class="dot" style=${{ '--c': COLORS[i % 6] }}></i>` : null}${nameOf(r)}${tag && tag(r) ? html`<span class="tag">${tag(r)}</span>` : null}</span><span class="cnt">${fmtNum(r.count)}</span><span class="pct">${shareOf(r.count, total).toFixed(1)}%</span>
             <div class="track"><i style=${{ '--w': (r.count / max) * 100 + '%', '--c': color || (stack ? COLORS[i % 6] : undefined), animationDelay: i * 40 + 'ms' }}></i></div></div>
           </button>
-          ${isOpen && canDrill ? html`<${SubRows} api=${api} endpoint=${canDrill} ttl=${ttl} total=${r.count} />` : null}
+          ${openHere && canDrill ? html`<${SubRows} api=${api} endpoint=${canDrill} ttl=${ttl} total=${r.count} />` : null}
         </li>`;
       })}</ul>
       ${rows.length > show ? html`<button class="more" type="button" onClick=${() => setAll(!all)}>${all ? 'Show less' : `Show all ${rows.length}`}</button>` : null}`}
@@ -60,13 +62,15 @@ export function TopPages({ api, range, hits, now, filtered, onFilter }) {
   const max = Math.max(1, ...rows.map((r) => r.count));
   const movers = new Map(pageMovers(rows).map((m) => [m.path, m]));
   const shown = all ? rows : rows.slice(0, 8);
+  const scope = scopeOf(api);
+  const openHere = (id) => open && open.scope === scope && open.id === id; // never a row opened for another site or filter
   return html`<section class="card span-7" aria-label="Top pages">
     <div class="card-h"><div><h2>Top pages</h2><p class="sub">Click a page to see where its visitors came from</p></div>${rows.length ? html`<span class="sub num">${rows.length}${data.more ? '+' : ''} paths</span>` : null}</div>
     ${error ? html`<${ErrorBox} error=${error} retry=${retry} />` : !data ? html`<${SkeletonRows} n=${6} />` : !rows.length ? html`<div class="empty">No pageviews in this range.</div>` : html`
       <ul class="rows">${shown.map((r, i) => {
-        const mv = movers.get(r.path), isOpen = open === r.path_id;
+        const mv = movers.get(r.path), isOpen = openHere(r.path_id);
         return html`<li key=${r.path_id}>
-          <button class="row-btn" type="button" aria-expanded=${String(isOpen)} onClick=${() => setOpen(isOpen ? null : r.path_id)}>
+          <button class="row-btn" type="button" aria-expanded=${String(isOpen)} onClick=${() => setOpen(isOpen ? null : { id: r.path_id, scope })}>
             <div class="row" style="grid-template-columns:minmax(0,1fr) auto auto auto">
               <span class="name">${r.path}${r.title && r.title !== r.path ? html`<small>${r.title}</small>` : null}</span>
               <span class="spark" style=${{ color: mv && mv.change > 0.25 ? 'var(--up)' : mv && mv.change < -0.25 ? 'var(--down)' : 'var(--text-3)' }}><${Sparkline} values=${pageSeries(r, range)} w=${64} h=${20} label=${mv ? (mv.change > 0 ? 'rising' : 'falling') : 'trend'} /></span>
@@ -82,7 +86,7 @@ export function TopPages({ api, range, hits, now, filtered, onFilter }) {
   </section>`;
 }
 
-export function StatStrip({ cur, prev, avg, avgPrev, peak, topPage, topRef, series, hourly, look }) {
+export function StatStrip({ cur, prev, avg, avgPrev, peak, topPage, topRef, series, hourly, look, resetKey }) {
   const ref = useRef(null);
   useTilt(ref, look === 'nova');
   const pct = prev > 0 ? ((cur - prev) / prev) * 100 : null;
@@ -90,9 +94,9 @@ export function StatStrip({ cur, prev, avg, avgPrev, peak, topPage, topRef, seri
   const vals = series.filter((p) => p.v !== null).map((p) => p.v);
   const G = html`<span class="glare" aria-hidden="true"></span>`;
   return html`<section class="kpis" aria-label="Summary" ref=${ref}>
-    <div class="card kpi">${G}<div class="l">Visitors</div><div class="v">${cur === null ? html`<${Skeleton} h=${26} w="70%" />` : html`<${Num} value=${cur} />`}</div><div class="s">${pct === null ? 'no earlier data to compare' : html`<${Delta} pct=${pct} /> vs previous`}</div><${Sparkline} values=${vals} w=${120} label="visitors trend" /></div>
-    <div class="card kpi">${G}<div class="l">${hourly ? 'Per hour' : 'Per day'}</div><div class="v">${avg === null ? html`<${Skeleton} h=${26} w="60%" />` : html`<${Num} value=${Math.round(avg)} />`}</div><div class="s">${apct === null ? 'average' : html`<${Delta} pct=${apct} /> average`}</div></div>
-    <div class="card kpi">${G}<div class="l">${hourly ? 'Peak hour' : 'Peak day'}</div><div class="v">${peak ? html`<${Num} value=${peak.v} />` : html`<${Skeleton} h=${26} w="50%" />`}</div><div class="s">${peak ? peak.label : ''}</div></div>
+    <div class="card kpi">${G}<div class="l">Visitors</div><div class="v">${cur === null ? html`<${Skeleton} h=${26} w="70%" />` : html`<${Num} value=${cur} resetKey=${resetKey} />`}</div><div class="s">${pct === null ? 'no earlier data to compare' : html`<${Delta} pct=${pct} /> vs previous`}</div><${Sparkline} values=${vals} w=${120} label="visitors trend" /></div>
+    <div class="card kpi">${G}<div class="l">${hourly ? 'Per hour' : 'Per day'}</div><div class="v">${avg === null ? html`<${Skeleton} h=${26} w="60%" />` : html`<${Num} value=${Math.round(avg)} resetKey=${resetKey} />`}</div><div class="s">${apct === null ? 'average' : html`<${Delta} pct=${apct} /> average`}</div></div>
+    <div class="card kpi">${G}<div class="l">${hourly ? 'Peak hour' : 'Peak day'}</div><div class="v">${peak ? html`<${Num} value=${peak.v} resetKey=${resetKey} />` : html`<${Skeleton} h=${26} w="50%" />`}</div><div class="s">${peak ? peak.label : ''}</div></div>
     <div class="card kpi">${G}<div class="l">Top page</div>${topPage ? html`<div class="v path" title=${topPage.path}>${topPage.path}</div><div class="s">${fmtNum(topPage.count)} visitors</div>` : topPage === false ? html`<div class="v path">None yet</div>` : html`<div class="v"><${Skeleton} h=${22} w="80%" /></div>`}</div>
     <div class="card kpi">${G}<div class="l">Top referrer</div>${topRef ? html`<div class="v path" title=${topRef.name}>${topRef.name}</div><div class="s">${fmtNum(topRef.count)} visitors</div>` : topRef === false ? html`<div class="v path">None yet</div>` : html`<div class="v"><${Skeleton} h=${22} w="80%" /></div>`}</div>
   </section>`;
@@ -123,7 +127,13 @@ function centroids(paths) {
 
 // The globe's one canvas, for the whole page. Only one Countries card exists at a time, and a graphics context is not freed when its canvas is dropped, only when the
 // garbage collector gets round to it. Browsers allow about 16 and then evict the OLDEST, which is the background shader, so a fresh canvas per card or per scroll leaks them.
-let globeCanvas = null;
+// The one exception is a change of site or page filter: its markers and its rotation belong to the old data, so its context is
+// given up and a new canvas is built. That happens only on a switch, never on scrolling.
+let globeCanvas = null, globeScope = null;
+const retireGlobe = (c) => {
+  try { const gl = c.getContext('webgl') || c.getContext('experimental-webgl'); const ext = gl && gl.getExtension('WEBGL_lose_context'); if (ext) ext.loseContext(); } catch { /* already gone */ }
+  if (c.parentNode) c.parentNode.removeChild(c);
+};
 
 // Countries: a WebGL globe (Nova) or a choropleth map beside the ranked list. Hovering a row lights its country.
 export function CountriesCard({ api, range, ttl, look, theme }) {
@@ -136,7 +146,10 @@ export function CountriesCard({ api, range, ttl, look, theme }) {
   const [open, setOpen] = useState(null);
   const [all, setAll] = useState(false);
   const wrap = useRef(null), box = useRef(null);
+  const scope = scopeOf(api); // the site and page filter the card currently shows
   useEffect(() => setView(look === 'nova' ? 'globe' : 'map'), [look]);
+  // Another site, page filter or range: nothing hovered, opened or tipped from the old data may stay on screen.
+  useEffect(() => { setHot(null); setTip(null); setOpen(null); setAll(false); }, [scope, range.key]);
   useEffect(() => { if (seen) loadWorldMap().then(() => setMapReady(true)); }, [seen]);
   const { data, error, retry } = useApi(api, `/api/v0/stats/locations?${q({ start: range.start, end: range.end, limit: 100 })}`, { ttl, enabled: seen });
   const rows = data ? data.stats || [] : [];
@@ -162,7 +175,14 @@ export function CountriesCard({ api, range, ttl, look, theme }) {
     const top = ranked[0];
     const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
     let dead = false, g = null, phi = top ? (-(cent[top[0]][1] + 90) * Math.PI) / 180 : 0.6, drag = null, off = 0, dirty = true;
-    const host = box.current, canvas = globeCanvas || (globeCanvas = document.createElement('canvas')), over = document.createElement('canvas');
+    const host = box.current;
+    // A globe built for another site or page filter still carries its markers on screen: it is torn down (with its WebGL
+    // context) and a new canvas is built, rather than re-attaching the old sphere and waiting for new markers.
+    const reuse = globeCanvas && globeScope === scope;
+    if (globeCanvas && !reuse) { retireGlobe(globeCanvas); globeCanvas = null; }
+    const canvas = reuse ? globeCanvas : (globeCanvas = document.createElement('canvas'));
+    const over = document.createElement('canvas');
+    globeScope = scope;
     canvas.id = 'globe'; canvas.setAttribute('role', 'img'); canvas.setAttribute('aria-label', 'Globe with markers for visitor countries. The list beside it has the same data.');
     over.className = 'globe-over'; over.setAttribute('aria-hidden', 'true');
     host.replaceChildren(canvas, over);
@@ -226,7 +246,7 @@ export function CountriesCard({ api, range, ttl, look, theme }) {
       } catch (e) { setView('map'); }
     }).catch(() => setView('map'));
     return () => { dead = true; if (g) g.destroy(); if (canvas._gcCleanup) canvas._gcCleanup(); host.replaceChildren(); };
-  }, [view, mapReady, cent, rows, onScreen, theme, look]);
+  }, [view, mapReady, cent, rows, onScreen, theme, look, scope]);
   useEffect(() => {
     if (!wrap.current || typeof IntersectionObserver === 'undefined') return;
     const io = new IntersectionObserver((es) => setOnScreen(es[0].isIntersecting), { rootMargin: '40px' });

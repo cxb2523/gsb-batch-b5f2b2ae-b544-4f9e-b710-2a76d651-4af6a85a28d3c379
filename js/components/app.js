@@ -1,6 +1,6 @@
 import { html, useState, useEffect, useMemo, useRef, useContext, Fragment } from '../ui.js';
-import { API, q, ttlFor, narrow, listSites } from '../api.js';
-import { Ctx, useApi, useTicker, Skeleton, Delta, Credit } from './common.js';
+import { API, q, ttlFor, narrow, listSites, pending } from '../api.js';
+import { Ctx, useApi, useTicker, Skeleton, Delta, Credit, scopeOf } from './common.js';
 import { HeroChart } from './hero.js';
 import { RankCard, TopPages, StatStrip, CountriesCard, schemeLabel } from './cards.js';
 import { ConnectScreen } from './connect.js';
@@ -121,13 +121,18 @@ export function App() {
   };
   const switchSite = async (site) => {
     if (!session || site.url === session.api.baseURL) return;
+    // From this moment the dashboard shows the site being opened, not the one that is leaving: a placeholder client
+    // raises the skeletons at once, and the real client replaces it when it is ready (a failure puts the old one back).
+    const from = session.api;
     setSwitching(true);
+    setSession((p) => (p ? { ...p, api: pending(p.api, site.url) } : p));
     try {
       await new Promise((res) => setTimeout(res, 20)); // let the dimmed page paint before a demo site is built
       const api = await open(site, session.key);
       setSession((p) => ({ ...p, api }));
       if (!session.demo) write(SITE_KEY, site.url);
     } catch (e) {
+      setSession((p) => (p ? { ...p, api: from } : p));
       setNotice(e.kind === 'auth' ? `This key cannot read ${site.name}. It may be missing the Read statistics permission for that site.` : e.kind === 'network' ? e.message : `Could not open ${site.name}. ${e.message}`);
     } finally { setSwitching(false); }
   };
@@ -136,7 +141,7 @@ export function App() {
 
   if (booting) return html`<div class="connect" aria-busy="true"><div class="card"><${Skeleton} h=${28} w="60%" /><div style="height:14px"></div><${Skeleton} h=${14} /><div style="height:10px"></div><${Skeleton} h=${14} w="80%" /></div></div>`;
   if (!session) return html`<${ConnectScreen} onConnect=${connect} onDemo=${demo} initialError=${initialError} />`;
-  return html`<${Ctx.Provider} value=${{ onAuthError, look }}><${Dashboard} key=${session.api.baseURL} api=${session.api} demo=${session.demo} sites=${session.sites} onSite=${switchSite} switching=${switching} theme=${theme} look=${look} onLook=${chooseLook} onTheme=${toggleTheme} onDisconnect=${disconnect} /><//><div class=${'toast' + (notice ? ' on' : '')} role="status" aria-live="polite">${notice}</div>`;
+  return html`<${Ctx.Provider} value=${{ onAuthError, look }}><${Dashboard} api=${session.api} demo=${session.demo} sites=${session.sites} onSite=${switchSite} switching=${switching} theme=${theme} look=${look} onLook=${chooseLook} onTheme=${toggleTheme} onDisconnect=${disconnect} /><//><div class=${'toast' + (notice ? ' on' : '')} role="status" aria-live="polite">${notice}</div>`;
 }
 
 function AppearancePanel({ look, onLook }) {
@@ -162,11 +167,18 @@ function AppearancePanel({ look, onLook }) {
 function Dashboard({ api: baseApi, demo, sites = [], onSite, switching, theme, look, onLook, onTheme, onDisconnect }) {
   const tz = baseApi.tz || browserTZ();
   const [pageFilter, setPageFilter] = useState(null); // { id, path }: the whole dashboard narrowed to one page
-  const api = useMemo(() => (pageFilter ? narrow(baseApi, [pageFilter.id]) : baseApi), [baseApi, pageFilter]);
+  const [hover, setHover] = useState(null);
+  // A page filter belongs to a site: when another site's data actually arrives it is dropped (not while that site is
+  // still being opened, so a switch that fails leaves the filter where it was). While a switch is in flight the cards
+  // ask the placeholder client for the whole of the next site, never the old one's narrowed view.
+  const siteKey = baseApi.pending ? null : (baseApi.key || baseApi.baseURL);
+  const [site, setSite] = useState(siteKey);
+  if (siteKey && siteKey !== site) { setSite(siteKey); setPageFilter(null); setHover(null); }
+  const filter = baseApi.pending ? null : pageFilter;
+  const api = useMemo(() => (filter ? narrow(baseApi, [filter.id]) : baseApi), [baseApi, filter]);
   const now = useMemo(() => new Date(), []);
   const [preset, setPreset] = useState(() => (read(RANGE_KEY) && PRESETS.some((p) => p[0] === read(RANGE_KEY)) ? read(RANGE_KEY) : '30d'));
   const [custom, setCustom] = useState(null);
-  const [hover, setHover] = useState(null);
   const [palette, setPalette] = useState(false);
   const [recap, setRecap] = useState(false);
   const base = useContext(Ctx);
@@ -194,7 +206,7 @@ function Dashboard({ api: baseApi, demo, sites = [], onSite, switching, theme, l
   const refresh = async () => {
     if (demo || busy) return;
     setBusy(Date.now()); setSettled(false); setToast(''); setTimeout(() => setSettled(true), 700);
-    await api.clearCache();
+    await baseApi.clearCache(); // the whole site, so the page-filtered answers go with it
     setEpoch((e) => e + 1);
   };
   useEffect(() => {
@@ -225,7 +237,7 @@ function Dashboard({ api: baseApi, demo, sites = [], onSite, switching, theme, l
   const topRef = refRows ? (refRows[0] || false) : null;
   const insights = useMemo(() => (total.data && prevTotal.data ? buildInsights({ total: total.data, series, prevSeries, prevTotal: hasPrev ? prev : 0, range, hits: hits.data && hits.data.hits, now, tz }) : null), [total.data, prevTotal.data, hits.data, series]);
   const hp = hover !== null ? series[hover] : null;
-  const bigValue = useTicker(hp ? hp.v || 0 : cur, { instant: !!hp });
+  const bigValue = useTicker(hp ? hp.v || 0 : cur, { instant: !!hp, key: scopeOf(api) + '\n' + range.key });
   const pct = hasPrev && prev > 0 && cur !== null ? ((cur - prev) / prev) * 100 : null;
   const rangeLabel = range.days === 1 ? labelDay(range.from, true) : `${labelDay(range.from, range.from.slice(0, 4) !== range.to.slice(0, 4))} to ${labelDay(range.to, true)}`; // the start shows its year when the range crosses a year
   const updated = relativeTime(Date.now());
@@ -286,13 +298,13 @@ function Dashboard({ api: baseApi, demo, sites = [], onSite, switching, theme, l
     <${SectionRail} />
     <main>
       <${Anchor} id="overview" />
-      ${pageFilter ? html`<div class="filterbar" role="status"><span>Only <b>${pageFilter.path}</b></span><button type="button" onClick=${() => setPageFilter(null)}>Show all pages <span aria-hidden="true">✕</span></button></div>` : null}
+      ${filter ? html`<div class="filterbar" role="status"><span>Only <b>${filter.path}</b></span><button type="button" onClick=${() => setPageFilter(null)}>Show all pages <span aria-hidden="true">✕</span></button></div>` : null}
       <section class="card hero" aria-label="Visitors over time">
         <div class="hero-top">
           <div>
             <div class="eyebrow">${hp ? hp.long : rangeLabel}</div>
             <div class="big">
-              <span class="num">${bigValue === null ? '-' : fmtFull(bigValue)}</span>
+              ${hp || bigValue !== null ? html`<span class="num">${bigValue === null ? '-' : fmtFull(bigValue)}</span>` : html`<${Skeleton} h=${56} w="180px" r="10px" />`}
               <span class="unit">visitors</span>
               ${hp ? null : html`<${Delta} pct=${pct} />`}
             </div>
@@ -304,11 +316,11 @@ function Dashboard({ api: baseApi, demo, sites = [], onSite, switching, theme, l
         ${insights && insights.length ? html`<div class="insights" aria-label="Highlights">${insights.map((s, i) => html`<div key=${s.k} class=${'insight ' + (s.tone || '')} style=${{ animationDelay: i * 60 + 'ms' }}><b>${s.text}</b><span>${s.detail}</span></div>`)}</div>` : null}
       </section>
 
-      <${StatStrip} cur=${cur} prev=${hasPrev ? prev : null} avg=${avg} avgPrev=${hasPrev ? avgPrev : null} peak=${peak} topPage=${topPage} topRef=${topRef} series=${series} hourly=${range.hourly} look=${look} />
+      <${StatStrip} cur=${cur} prev=${hasPrev ? prev : null} avg=${avg} avgPrev=${hasPrev ? avgPrev : null} peak=${peak} topPage=${topPage} topRef=${topRef} series=${series} hourly=${range.hourly} look=${look} resetKey=${scopeOf(api) + '\n' + range.key} />
 
       <div class="grid">
         <${Anchor} id="traffic" />
-        <${TopPages} api=${api} range=${range} hits=${hits} now=${now} filtered=${!!pageFilter} onFilter=${(r) => { setPageFilter(r); setHover(null); window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); }} />
+        <${TopPages} api=${api} range=${range} hits=${hits} now=${now} filtered=${!!filter} onFilter=${(r) => { setPageFilter(r); setHover(null); window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); }} />
         <${RankCard} api=${api} span="span-5" title="Referrers" sub="Where visitors arrive from" endpoint=${E('toprefs', range, { limit: 50 })} ttl=${ttl} show=${8} drill=${(r) => r.id && '/api/v0/stats/toprefs/' + encodeURIComponent(r.id) + '?' + q({ start: range.start, end: range.end, limit: 10 })} tag=${(r) => (r.name ? schemeLabel(r.ref_scheme) : '')} empty="No referrers yet. Direct visits are not listed." />
         <${SankeyCard} api=${api} range=${range} ttl=${ttl} />
         <${Anchor} id="audience" />

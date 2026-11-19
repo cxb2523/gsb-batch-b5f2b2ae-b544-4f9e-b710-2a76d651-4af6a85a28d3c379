@@ -15,6 +15,27 @@ export function waitFromText(text) {
 }
 const LONG_WAIT_S = 20; // a wait longer than this is not worth holding the screen for
 
+// A stand-in for a client whose next site is still being opened. It answers nothing, so every card waits in its
+// loading state instead of holding the last site's numbers; its keys never collide with a real site's or filter's.
+export function pending(api, url) {
+  const view = Object.create(api);
+  if (url) view.baseURL = url;
+  view.cacheScope = scopeOf(api) + '|pending>' + (url || '');
+  view.scope = view.cacheScope;
+  view.key = url || view.cacheScope;
+  view.pending = true;
+  view.get = () => new Promise(() => { /* the card is replaced by the real client when the switch lands */ });
+  // The queue and the hourly cap belong to the key, not to the site on screen: the dashboard keeps listening on the
+  // client that is still there, so a cap reached during a switch is still reported.
+  for (const p of ['onLimit', 'blockedUntil']) {
+    Object.defineProperty(view, p, { configurable: true, get: () => api[p], set: (v) => { api[p] = v; } });
+  }
+  return view;
+}
+
+// What a client is answering for: the site, and (for a narrowed view) the page filter. Also the prefix of its cache keys.
+export const scopeOf = (api) => (api ? api.cacheScope || api.scope || api.baseURL || '' : '');
+
 export class API {
   constructor(baseURL, apiKey) {
     this.baseURL = baseURL.replace(/\/+$/, '');
@@ -26,9 +47,11 @@ export class API {
     this.tz = null;
     this.blockedUntil = 0; // set while GoatCounter's hourly cap is closed
     this.onLimit = null;
+    this.scope = this.baseURL; // which site (and which page filter) an answer belongs to; see narrow()
+    this.key = this.baseURL;   // which site the dashboard shows; a view that only asks for other data keeps it
   }
 
-  _key(endpoint) { return `${this.baseURL}|${endpoint}`; }
+  _key(endpoint, scope = this.scope) { return `${scope}|${endpoint}`; }
 
   async _fetch(endpoint) {
     const url = this.baseURL + endpoint;
@@ -100,19 +123,26 @@ export class API {
   }
 
   // ttl: how long a cached answer counts as fresh. onStale(data) is called at once with an older copy, if any.
-  async get(endpoint, { ttl = 60_000, force = false, onStale, skip } = {}) {
-    const key = this._key(endpoint);
+  // skip() is asked before the answer is handed back: a caller that was replaced meanwhile (another site, another
+  // page filter, another range) throws its answer away instead of showing it, even when it came from the cache.
+  // scope: defaults to the client's own (one site); a narrowed view passes the page filter's key instead.
+  async get(endpoint, { ttl = 60_000, force = false, onStale, skip, scope = this.scope } = {}) {
+    const key = this._key(endpoint, scope);
+    const dropped = () => Object.assign(new Error('cancelled'), { kind: 'cancelled' });
     if (!force) {
       const hit = await cacheGet(key);
+      if (skip && skip()) throw dropped();
       if (hit && Date.now() - hit.t < ttl) return hit.data;
       if (hit && onStale) onStale(hit.data);
     }
     const data = await this._queued(endpoint, 2, skip);
-    cacheSet(key, { t: Date.now(), data });
+    cacheSet(key, { t: Date.now(), data }); // the answer is valid for the question it was asked for, even if the card moved on
+    if (skip && skip()) throw dropped();
     return data;
   }
 
-  clearCache() { return cacheClear(this.baseURL + '|'); }
+  // Clear every saved answer for one site, or for one page filter of it.
+  clearCache(scope = this.scope) { return cacheClear(scope + '|'); }
 }
 
 // Window cache rules: a window that ended before today never changes, today refreshes quickly.
@@ -125,13 +155,17 @@ export const q = (o) => Object.entries(o).filter(([, v]) => v !== undefined && v
 
 // A view of the same client narrowed to some pages (GoatCounter path ids). It shares the queue, the rate-limit state
 // and the cache with the original; only the statistics requests gain `include_paths`, so every card narrows at once.
+// Its cache keys carry a page-filter tag, so a narrowed answer never stands in for the whole site's (or another page's).
 export function narrow(api, ids) {
   const list = ids.join(',');
+  const scope = scopeOf(api) + '|paths=' + list;
   const view = Object.create(api);
   view.filter = ids;
-  view.get = (endpoint, opts) => {
+  view.cacheScope = scope;
+  view.pending = false; // it asks the site below, which is a real one
+  view.get = (endpoint, opts = {}) => {
     const plain = !/\/stats\//.test(endpoint) || /\/stats\/hits\/\d/.test(endpoint) || /include_paths=/.test(endpoint);
-    return api.get(plain ? endpoint : endpoint + (endpoint.includes('?') ? '&' : '?') + 'include_paths=' + list, opts);
+    return api.get(plain ? endpoint : endpoint + (endpoint.includes('?') ? '&' : '?') + 'include_paths=' + list, { ...opts, scope: opts.scope === undefined ? scope : opts.scope });
   };
   return view;
 }

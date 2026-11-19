@@ -1,5 +1,5 @@
 import { html, useState, useEffect, useMemo, useInView } from '../ui.js';
-import { useApi, Skeleton, ErrorBox } from './common.js';
+import { useApi, Skeleton, ErrorBox, scopeOf } from './common.js';
 import { SubRows } from './cards.js';
 import { fmtFull, fmtNum } from '../util.js';
 import { shareOf } from '../model.js';
@@ -38,6 +38,7 @@ export function BreakdownCard({ api, title, sub, endpoint, ttl, kind, drill, spa
   const [icons, setIcons] = useState(null);
   const [active, setActive] = useState(null);
   const [open, setOpen] = useState(null);
+  const scope = scopeOf(api);
   const uid = useMemo(() => ++uidN, []);
   useEffect(() => { if (seen) import('../icons.js').then(setIcons).catch(() => {}); }, [seen]);
   const { data, error, retry } = useApi(api, endpoint, { ttl, enabled: seen });
@@ -53,9 +54,9 @@ export function BreakdownCard({ api, title, sub, endpoint, ttl, kind, drill, spa
     <div class="card-h"><div><h2>${title}</h2>${sub ? html`<p class="sub">${sub}</p>` : null}</div></div>
     ${error ? html`<${ErrorBox} error=${error} retry=${retry} />` : !data ? html`<div class="dn"><${Skeleton} h=${190} r="50%" /></div>` : !rows.length ? html`<div class="empty">No data in this range.</div>` : html`
       <${Donut} rows=${rows} total=${total} active=${active} setActive=${setActive} label=${`${title} breakdown`} uid=${uid} />
-      <ul class="rows lg">${rows.map((r, i) => { const can = drill && r.id !== '__other' && drill(r), isOpen = open === r.key;
+      <ul class="rows lg">${rows.map((r, i) => { const can = drill && r.id !== '__other' && drill(r), isOpen = open && open.scope === scope && open.id === r.key;
         return html`<li key=${r.key} onPointerEnter=${() => setActive(i)} onPointerLeave=${() => setActive(null)}>
-          <button class="row-btn" type="button" aria-expanded=${can ? String(isOpen) : undefined} onClick=${() => can && setOpen(isOpen ? null : r.key)} style=${{ cursor: can ? 'pointer' : 'default' }}>
+          <button class="row-btn" type="button" aria-expanded=${can ? String(isOpen) : undefined} onClick=${() => can && setOpen(isOpen ? null : { id: r.key, scope })} style=${{ cursor: can ? 'pointer' : 'default' }}>
             <div class="row"><${Chip} icons=${icons} row=${r} kind=${kind} color=${r.color} /><span class="name">${r.label}</span><span class="cnt">${fmtNum(r.count)}</span><span class="pct">${shareOf(r.count, total).toFixed(1)}%</span></div>
           </button>
           ${isOpen && can ? html`<${SubRows} api=${api} endpoint=${can} ttl=${ttl} total=${r.count} />` : null}

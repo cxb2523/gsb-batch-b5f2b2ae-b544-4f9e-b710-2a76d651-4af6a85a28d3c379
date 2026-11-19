@@ -107,7 +107,9 @@ export function springTo(from, to, onFrame, { k = 170, c = 26 } = {}) {
 export function tweenTo(from, to, onFrame, ms = 320) {
   const t0 = performance.now(); let raf = 0;
   const step = (now) => {
-    const t = Math.min(1, (now - t0) / ms);
+    // A frame's timestamp can be a little earlier than the moment the tween was scheduled; without the floor that
+    // would make t negative and the eased value shoot past `from`, showing a negative count for a frame.
+    const t = Math.max(0, Math.min(1, (now - t0) / ms));
     onFrame(from + (to - from) * EASE.out(t));
     if (t < 1) raf = requestAnimationFrame(step); else onFrame(to);
   };

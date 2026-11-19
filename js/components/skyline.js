@@ -1,5 +1,5 @@
 import { html, useState, useEffect, useRef, useMemo, useInView, useContext } from '../ui.js';
-import { Ctx, useApi, Skeleton, ErrorBox } from './common.js';
+import { Ctx, useApi, Skeleton, ErrorBox, scopeOf } from './common.js';
 import { q } from '../api.js';
 import { makeRange, hourLabel, fmtFull } from '../util.js';
 const fmtAvg = (v) => (v >= 10 ? fmtFull(v) : String(Math.round(v * 10) / 10)); // light sites have fractions of a visitor per hour
@@ -97,7 +97,11 @@ export function TimePatterns({ api, tz, look, theme, now }) {
   const [ref, seen] = useInView();
   const [note, setNote] = useState('');
   const range = useMemo(() => makeRange('90d', tz, null, now), [tz, now]);
+  // Narrowed to a page, this card has to follow: include_paths now rides on the request through api.get.
   const { data, error, retry } = useApi(api, `/api/v0/stats/total?${q({ start: range.start, end: range.end })}`, { ttl: 6 * 3600_000, enabled: seen });
+  // A new site or page filter must not keep a note about the old pattern on screen.
+  const scope = scopeOf(api);
+  useEffect(() => { setNote(''); }, [scope]);
   const hw = useMemo(() => (data ? hourWeekday(data) : null), [data]);
   const enough = hw && hw.enough;
   return html`<section class="card span-12" ref=${ref} aria-label="When readers show up">

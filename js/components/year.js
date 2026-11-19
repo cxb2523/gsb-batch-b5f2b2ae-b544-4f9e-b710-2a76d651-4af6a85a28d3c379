@@ -1,5 +1,5 @@
 import { html, useState, useEffect, useMemo, useRef, useInView } from '../ui.js';
-import { useApi, Skeleton, ErrorBox } from './common.js';
+import { useApi, Skeleton, ErrorBox, scopeOf } from './common.js';
 import { q } from '../api.js';
 import { makeRange, addDays, diffDays, weekdayOf, labelDay, fmtFull, fmtNum } from '../util.js';
 import { dayList } from '../model.js';
@@ -28,7 +28,10 @@ export function YearCard({ api, tz, now, look }) {
   const range = useMemo(() => makeRange('12m', tz, null, now), [tz, now]);
   const { data, error, retry } = useApi(api, `/api/v0/stats/total?${q({ start: range.start, end: range.end })}`, { ttl: 6 * 3600_000, enabled: seen });
   const [note, setNote] = useState('');
+  // A goal belongs to a site, so it moves with the site and the page filter, and a note about the old calendar goes.
+  const scope = scopeOf(api);
   const [goal, setGoal] = useState(() => readGoal(api));
+  useEffect(() => { setGoal(readGoal(api)); setNote(''); }, [scope]);
   const scroller = useRef(null);
 
   const calc = useMemo(() => {

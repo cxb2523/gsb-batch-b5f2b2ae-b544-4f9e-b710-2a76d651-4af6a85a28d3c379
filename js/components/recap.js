@@ -77,12 +77,12 @@ export function RecapDialog({ open, onClose, api, range, info, look }) {
     let dead = false; setSvg(''); setMsg('');
     (async () => {
       let topCountry = null;
-      try { const r = await api.get(`/api/v0/stats/locations?${q({ start: range.start, end: range.end, limit: 5 })}`, { ttl: 60_000 }); const t = ((r && r.stats) || []).filter((x) => x.name)[0]; if (t) topCountry = { name: t.name, count: t.count }; } catch (e) { /* the card just omits the country */ }
+      try { const r = await api.get(`/api/v0/stats/locations?${q({ start: range.start, end: range.end, limit: 5 })}`, { ttl: 60_000, skip: () => dead }); const t = ((r && r.stats) || []).filter((x) => x.name)[0]; if (t) topCountry = { name: t.name, count: t.count }; } catch (e) { /* the card just omits the country */ }
       const fonts = await fontCss(look);
       if (!dead) setSvg(recapSVG({ ...info, topCountry }, fonts, look));
     })();
     return () => { dead = true; };
-  }, [open]);
+  }, [open, info.site, info.range]);
   const url = svg ? 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg) : '';
   const save = async () => { setBusy(true); try { const blob = await toPng(svg); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `goatcounter-recap-${range.to}.png`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); } catch (e) { setMsg('Could not create the image in this browser.'); } setBusy(false); };
   const share = async () => { setBusy(true); try { const blob = await toPng(svg); const file = new File([blob], `goatcounter-recap-${range.to}.png`, { type: 'image/png' }); if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: 'My traffic recap' }); else setMsg('Sharing is not available here. Use Download instead.'); } catch (e) { /* cancelled */ } setBusy(false); };
