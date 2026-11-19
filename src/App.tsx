@@ -64,6 +64,9 @@ export default function App() {
   const recordingRef = useRef<Recording>([]);
   const recordingStartRef = useRef<number | null>(null);
   const [runId, setRunId] = useState(0);
+  // Mirrors runId in a ref so async callbacks (e.g. a leaderboard submission
+  // that resolves late) can tell whether their run is still the current one.
+  const runEpochRef = useRef(0);
 
   // ---- Ghost --------------------------------------------------------------
   const [ghostRun, setGhostRun] = useState<RunWithRecording | null>(null);
@@ -114,21 +117,36 @@ export default function App() {
     }
   }, [state.phase]);
 
-  // Recording lifecycle: start a fresh tape when a run begins; stop when it ends.
+  // Run lifecycle: the recording, the ghost replay clock and the submission
+  // state all belong to exactly one run. Entering `playing` always starts a
+  // fresh run — new tape, new clock, clean submission state — no matter
+  // whether the previous run ended in a crash or a level transition.
+  // Entering `idle` (title dismissed, level advanced, or RESTART) tears the
+  // previous run down; `gameOver` just freezes the clock so the finished
+  // tape stays available for submission.
   useEffect(() => {
-    if (state.phase === "playing" && recordingStartRef.current === null) {
+    if (state.phase === "playing") {
       recordingStartRef.current = performance.now();
       recordingRef.current = [[0, false]];
-      setRunId((id) => id + 1);
+      runEpochRef.current += 1;
+      setRunId(runEpochRef.current);
+      setSubmitting(false);
       setSubmitted(false);
+      return;
     }
-    if (state.phase === "title" || state.phase === "idle") {
-      // resetting state outside an active run
-      if (state.phase === "idle" && state.level === 1) {
-        recordingStartRef.current = null;
-      }
+    if (state.phase === "idle") {
+      recordingStartRef.current = null;
+      recordingRef.current = [];
+      runEpochRef.current += 1;
+      setRunId(runEpochRef.current);
+      setSubmitting(false);
+      setSubmitted(false);
+      return;
     }
-  }, [state.phase, state.level]);
+    if (state.phase === "gameOver") {
+      recordingStartRef.current = null;
+    }
+  }, [state.phase]);
 
   // Capture every playerUp edge into the tape.
   useEffect(() => {
@@ -137,13 +155,6 @@ export default function App() {
     const t = performance.now() - recordingStartRef.current;
     recordingRef.current = appendEvent(recordingRef.current, t, state.playerUp);
   }, [state.playerUp, state.phase]);
-
-  // On game over, freeze the recording (it stays in recordingRef for submission).
-  useEffect(() => {
-    if (state.phase === "gameOver") {
-      recordingStartRef.current = null;
-    }
-  }, [state.phase]);
 
   const tick = useCallback(() => {
     if (state.phase !== "playing") return;
@@ -213,6 +224,10 @@ export default function App() {
 
   const handleSubmitName = async (name: string) => {
     if (submitting || submitted) return;
+    // The run this submission belongs to. If the player restarts (and maybe
+    // starts a new run) while the request is in flight, the late result must
+    // not mark the new run's UI as submitted.
+    const epoch = runEpochRef.current;
     setSubmitting(true);
     setPlayerName(name);
     setStoredPlayerName(name);
@@ -223,10 +238,11 @@ export default function App() {
         level: state.level,
         recording: recordingRef.current,
       });
+      if (runEpochRef.current !== epoch) return;
       setSubmitted(true);
       setLeaderboardRefresh((n) => n + 1);
     } finally {
-      setSubmitting(false);
+      if (runEpochRef.current === epoch) setSubmitting(false);
     }
   };
 
