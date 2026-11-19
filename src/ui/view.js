@@ -95,16 +95,16 @@ function hostSection(session, blocks, roster, screen) {
   return screen === "playing" ? { text: T.chip.ingame, tone: "ok live" } : { text: T.chip.hosting, tone: "wait live" };
 }
 
-const GUEST_STEP = { "joining-room": 0, following: 1, loading: 2, "waiting-host": 3, freezing: 3, connect: 3, challenging: 3, joining: 3, connected: 4 };
+const GUEST_STEP = { "joining-room": 0, following: 1, loading: 2, "waiting-host": 3, freezing: 3, connect: 3, challenging: 3, joining: 3, connected: 4, interrupted: 4 };
 
 function guestSection(session, blocks, screen) {
   const phase = session.phase;
-  const failed = ["ended", "failed"].includes(phase);
+  const failed = ["ended", "failed", "interrupted"].includes(phase);
   const slug = session.lobby?.slug ?? session.hostInfo?.slug ?? null;
   const mapName = slug ? MAP_NAMES[slug] : null;
   let step = GUEST_STEP[phase] ?? session.lastStep ?? 0;
   if (phase === "joining-room" && session.hostInfo?.slug) step = 1;
-  if (!failed) session.lastStep = step;
+  if (!["ended", "failed"].includes(phase)) session.lastStep = step;
 
   if (session.inviteRelay && session.inviteRelay !== session.relay) {
     blocks.push({ kind: "callout", tone: "wait", text: T.otherRelay(new URL(session.inviteRelay).hostname), buttons: [{ act: "useInviteRelay", label: T.useRelay, style: "primary" }] });
@@ -116,7 +116,14 @@ function guestSection(session, blocks, screen) {
     blocks.push({ kind: "callout", tone: "wait", title: "⌨", text: T.pressKey });
   } else {
     const text = guestMessage(session, phase, mapName, screen);
-    if (text) blocks.push({ kind: "callout", tone: failed ? "bad" : phase === "connected" ? "ok" : "info", text, buttons: failed ? [{ act: "rejoin", label: T.rejoin, style: "primary" }] : [] });
+    if (text) {
+      const buttons = phase === "interrupted"
+        ? [{ act: "reconnect", label: T.reconnect, style: "primary", disabled: Boolean(session.reconnecting) }]
+        : failed
+          ? [{ act: "rejoin", label: T.rejoin, style: "primary" }]
+          : [];
+      blocks.push({ kind: "callout", tone: failed ? "bad" : phase === "connected" ? "ok" : "info", text, buttons });
+    }
   }
   if (session.joinedLate && ["joining", "connected"].includes(phase)) blocks.push({ kind: "callout", tone: "info", text: T.lateJoin });
   if (phase === "connected" && session.paused) blocks.push({ kind: "callout", tone: "wait", text: session.menuOpen ? T.pausedYou : T.pausedBy });
@@ -138,17 +145,20 @@ function guestMessage(session, phase, mapName, screen) {
     case "loading":
       return T.loadingMap;
     case "waiting-host":
+      if (session.reconnecting) return T.reconnecting;
       if (session.hostState?.ready && !session.hostState.turn) return T.nextInLine;
       return session.peer ? T.hostLoading : T.waitingHost;
     case "freezing":
     case "connect":
     case "challenging":
-      return T.connecting;
+      return session.reconnecting ? T.reconnecting : T.connecting;
     case "joining":
-      return T.joiningGame;
+      return session.reconnecting ? T.reconnecting : T.joiningGame;
     case "connected":
       if (screen === "playing") return null;
       return session.hostState?.screen === "playing" || (screen === "ready" && session.lobby?.playing) ? T.clickToPlay : T.waitingStart;
+    case "interrupted":
+      return session.reconnecting ? T.reconnecting : T.interrupted;
     case "ended":
       return T.ended;
     case "failed":

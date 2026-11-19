@@ -71,6 +71,7 @@ export function guestRoster(session) {
 function ownStatus(session) {
   const phase = session.phase;
   if (phase === "connected") return session.lobby?.playing || session.hostState?.screen === "playing" ? ["ingame", "ok"] : ["ready", "ok"];
+  if (phase === "interrupted") return ["reconnecting", "wait"];
   if (["ended", "failed"].includes(phase)) return ["disconnected", "bad"];
   if (CONNECTING.includes(phase)) return ["joining", "wait"];
   if (phase === "waiting-host" && session.hostState?.ready && !session.hostState.turn) return ["turn", "wait"];

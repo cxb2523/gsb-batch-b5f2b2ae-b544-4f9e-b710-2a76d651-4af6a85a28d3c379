@@ -4,7 +4,7 @@ import { CONNECTION } from "./engine/builds.js";
 import { followMovedSite, go, keepSinglePlayer, landingUrl, paramsFromHash } from "./game/page.js";
 import { AIM_SPEEDS, Gamepad } from "./input/gamepad.js";
 import { startPump } from "./net/pump.js";
-import { guestTick, moveToHost } from "./session/guest.js";
+import { guestTick, moveToHost, reconnectSession } from "./session/guest.js";
 import { holdStart, hookMain, hookWasm } from "./session/hooks.js";
 import { hostTick } from "./session/host.js";
 import { onControl } from "./session/messages.js";
@@ -128,6 +128,9 @@ function actions(session) {
     },
     startNow: () => (session.startAlone = true),
     rejoin: () => location.reload(),
+    // In-session reconnect after the host dropped: a single attempt at a time (reconnectSession no-ops while one is
+    // in flight); a failed attempt lands back in the same interrupted state with this button available again.
+    reconnect: () => reconnectSession(session),
     openUpdate: () => window.open(session.update?.url, "_blank", "noopener"),
     openRelayGuide: () => window.open(`${RELAY_GUIDE.replace("#", LANG_QUERY)}`, "_blank", "noopener"),
     goToHost: () => moveToHost(session, "button"),

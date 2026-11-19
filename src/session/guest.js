@@ -8,6 +8,9 @@ import { introduce } from "./messages.js";
 import { validSeat } from "./session.js";
 
 const HOST_GONE_MS = 10000;
+// Packet-level heartbeat: the host's pump sends pings every 2 s and game frames far more often. Nothing at all for
+// this long means the host's page (or the connection to it) is gone, even if the relay has not announced the leave.
+const HOST_SILENT_MS = 10000;
 const STATE_REPEAT_MS = 2000;
 const SPAWN_JUMP = 400; // a view jump this large means we (re)spawned
 const NEAR_HOST = 300;
@@ -78,11 +81,12 @@ function until(check, timeoutMs) {
 export function guestTick(session) {
   const screen = pageScreen();
   const engine = session.engine;
-  if (screen === "error" && !["ended", "failed"].includes(session.phase)) {
+  if (screen === "error" && !["ended", "failed", "interrupted"].includes(session.phase)) {
     session.phase = "ended";
     session.note("engine stopped");
   }
-  // While our server is parked, our client would otherwise time out on it.
+  // While our server is parked, our client would otherwise time out on it. Never keep a dead session alive: once the
+  // host is gone the client must be allowed to notice and the card must show the reconnectable state.
   if (engine && ["freezing", "connect"].includes(session.phase)) engine.keepClientAlive();
   if (engine && ["challenging", "joining"].includes(session.phase)) {
     if (engine.dvar("clPaused")) engine.setDvar("clPaused", 0);
@@ -91,8 +95,94 @@ export function guestTick(session) {
   if (session.peer && (session.phase !== session.sentPhase || Date.now() - (session.sentPhaseAt ?? 0) > STATE_REPEAT_MS)) introduce(session);
   if (!session.peer) session.sentPhase = null;
 
+  // The packet heartbeat decides "session interrupted" for every in-game/connecting phase, before the step runs.
+  if (engine && SESSION_PHASES.has(session.phase) && hostWentSilent(session)) interruptSession(session);
+
   const step = STEPS[session.phase];
   if (step) step(session, engine, screen);
+}
+
+/** Phases in which the host is expected to keep sending frames; a silent host there means the session is over. */
+const SESSION_PHASES = new Set(["waiting-host", "freezing", "connect", "challenging", "joining", "connected"]);
+
+/**
+ * True once we have heard from the host at least once and then received nothing (not even its 2 s pings) past the
+ * threshold. The pump worker measures the silence itself, so a half-open socket the relay never reports still counts.
+ */
+function hostWentSilent(session) {
+  const age = session.stats?.peerAgeMs;
+  return age != null && age > HOST_SILENT_MS;
+}
+
+/**
+ * A host that left or went silent: tear the broken session down to a reconnectable lobby state.
+ * - stop reading our client's old outgoing queue and forget every packet still queued in the pump (old queue dead);
+ * - drop the engine connection and every pause marker, so the game cannot stay frozen on the host's old pause;
+ * - keep seat, guest id and relay: when the host reopens the room we take the same seat again.
+ */
+export function interruptSession(session, why = "host silent") {
+  if (session.phase === "interrupted") return;
+  session.phase = "interrupted";
+  session.reconnecting = false;
+  session.fail("hostLeft");
+  session.note(`session interrupted: ${why}`);
+  // Release the old loopback queues and the pump's in-flight packets; control messages stay reachable through the
+  // worker's socket, but no engine queue is read or written until reconnect reattaches them.
+  session.pump?.postMessage({ type: "detach" });
+  const engine = session.engine;
+  if (engine) {
+    engine.command("disconnect");
+    // Reset the pause state the host used to own: nothing must remain paused from the old session.
+    if (engine.dvar("svPaused")) engine.setDvar("svPaused", 0);
+    if (engine.dvar("clPaused")) engine.setDvar("clPaused", 0);
+  }
+  session.paused = false;
+  session.menuOpen = false;
+  session.remotePause = false;
+  // Forget everything the old host told us; a recovered host re-sends its info and state.
+  session.hostState = null;
+  session.hostPos = null;
+  session.hostTrail = [];
+  session.connectWaitAt = null;
+  session.connectAt = 0;
+  session.introReleased = false;
+}
+
+/**
+ * Card "Reconnect": one attempt at a time. Reattaches the pump's queues, drops the old engine connection and walks
+ * the normal join flow again from "waiting-host". A later failure returns to the same interrupted state.
+ */
+export function reconnectSession(session) {
+  if (session.phase !== "interrupted" || session.reconnecting) return false;
+  const engine = session.engine;
+  if (!engine || !session.pump) return false;
+  session.reconnecting = true;
+  session.error = null;
+  session.note("reconnecting to the host");
+  // Reattach the same engine queues with a clean slate; the old queues are re-armed, but any stale contents were
+  // dropped by "detach" and "read" skips what the engine wrote meanwhile.
+  session.pump.postMessage({
+    type: "attach",
+    buffer: engine.buffer,
+    loopback: session.build.loopback,
+    reads: [{ seat: 0, base: engine.queueAt(1) }],
+    writeBase: engine.queueAt(0),
+    ports: { 0: 0 },
+    reading: false,
+    injecting: false,
+  });
+  engine.command("disconnect");
+  if (engine.dvar("svPaused")) engine.setDvar("svPaused", 0);
+  if (engine.dvar("clPaused")) engine.setDvar("clPaused", 0);
+  session.paused = false;
+  session.menuOpen = false;
+  session.remotePause = false;
+  session.connectWaitAt = null;
+  session.connectAt = 0;
+  session.hostState = null;
+  session.phase = "waiting-host";
+  introduce(session);
+  return true;
 }
 
 const STEPS = {
@@ -143,42 +233,49 @@ const STEPS = {
       session.phase = "joining";
       session.note("handshake started, passing the host's packets in");
     } else if (Date.now() - session.connectAt > 15000) {
-      session.fail("connectFailed");
-      session.phase = "failed";
+      joinAttemptFailed(session, "connectFailed");
     }
   },
 
   joining(session, engine) {
     if (engine.clientServerPort() !== 0) engine.pointClientAt(0);
     if (engine.connectionState() === CONNECTION.active) {
+      session.reconnecting = false;
       session.phase = "connected";
       session.lastViewOrigin = null;
       session.spawn ??= { tries: 0, sentAt: 0 };
       session.note("connected to the host");
     } else if (Date.now() - session.connectAt > 90000) {
-      session.fail("notLetIn");
-      session.phase = "failed";
+      joinAttemptFailed(session, "notLetIn");
     }
   },
 
   connected(session, engine, screen) {
     if (engine.connectionState() < CONNECTION.challenging) {
-      session.phase = "ended";
-      session.note("disconnected");
+      interruptSession(session, "the engine dropped the connection");
     } else if (!session.peer && session.hostLeftAt && Date.now() - session.hostLeftAt > HOST_GONE_MS) {
-      session.phase = "ended";
-      session.fail("hostLeft");
-      engine.command("disconnect");
+      interruptSession(session, "the host left the room");
     } else {
       syncGuestPause(session, engine, screen);
       // The host may keep the lobby open for minutes; a slow moment there must not time us out. If the host really
-      // leaves, the relay tells us.
+      // leaves, the packet heartbeat above interrupts the session even before the relay announces it.
       if (session.hostState?.screen !== "playing") engine.keepClientAlive();
       stayNearHost(session);
       restoreSpeed(session, engine);
     }
   },
 };
+
+/** A failed handshake: a reconnect attempt returns to the reconnectable state; the first join shows its error. */
+function joinAttemptFailed(session, key) {
+  if (session.reconnecting) {
+    session.reconnecting = false;
+    interruptSession(session, `reconnect failed (${key})`);
+  } else {
+    session.fail(key);
+    session.phase = "failed";
+  }
+}
 
 const SLOW_AFTER_HOST_MS = 1500;
 

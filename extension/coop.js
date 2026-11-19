@@ -580,7 +580,7 @@
 
   // src/net/pump.js
   function startPump(session, onControl2) {
-    const url = URL.createObjectURL(new Blob(['(() => {\n  // relay/src/protocol.js\n  var PROTOCOL_VERSION = 3;\n  var ROLES = Object.freeze(["host", "guest"]);\n  var RELAY_MESSAGE_TYPES = Object.freeze(["welcome", "peer", "error"]);\n  var MAX_GUESTS = 3;\n  var MAX_TEXT_BYTES = 4096;\n  var MAX_BINARY_BYTES = 65536;\n  var MAX_PACKET_BYTES = 1264;\n  function relaySocketUrl(relayBase, room, role, guestId) {\n    const url = new URL(relayBase);\n    url.protocol = url.protocol === "http:" || url.protocol === "ws:" ? "ws:" : "wss:";\n    url.pathname = `/v1/rooms/${encodeURIComponent(room)}`;\n    url.search = `?role=${role}&v=${PROTOCOL_VERSION}${role === "guest" ? `&id=${guestId}` : ""}`;\n    return url.toString();\n  }\n  var BATCH_VERSION = 1;\n  var KIND_PACKETS = 1;\n  var KIND_SEAT_PACKETS = 2;\n  function writeBatch(kind, items, seatOf, packetOf) {\n    const header = kind === KIND_SEAT_PACKETS ? 3 : 2;\n    let size = 4;\n    for (const item of items) size += header + packetOf(item).byteLength;\n    if (items.length > 65535 || size > MAX_BINARY_BYTES) throw new RangeError("packet batch too large");\n    const out = new Uint8Array(size);\n    const view = new DataView(out.buffer);\n    out[0] = BATCH_VERSION;\n    out[1] = kind;\n    view.setUint16(2, items.length, true);\n    let at = 4;\n    for (const item of items) {\n      const packet = packetOf(item);\n      if (packet.byteLength > MAX_PACKET_BYTES) throw new RangeError("packet too large");\n      if (kind === KIND_SEAT_PACKETS) out[at++] = seatOf(item);\n      view.setUint16(at, packet.byteLength, true);\n      out.set(packet, at + 2);\n      at += 2 + packet.byteLength;\n    }\n    return out;\n  }\n  function readBatch(kind, data) {\n    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);\n    if (bytes.byteLength < 4 || bytes[0] !== BATCH_VERSION || bytes[1] !== kind) return null;\n    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);\n    const count = view.getUint16(2, true);\n    const items = [];\n    let at = 4;\n    for (let i = 0; i < count; i += 1) {\n      let seat = 0;\n      if (kind === KIND_SEAT_PACKETS) {\n        if (at + 1 > bytes.byteLength) return null;\n        seat = bytes[at++];\n        if (seat < 1 || seat > MAX_GUESTS) return null;\n      }\n      if (at + 2 > bytes.byteLength) return null;\n      const length = view.getUint16(at, true);\n      at += 2;\n      if (length > MAX_PACKET_BYTES || at + length > bytes.byteLength) return null;\n      items.push({ seat, packet: bytes.subarray(at, at + length) });\n      at += length;\n    }\n    return at === bytes.byteLength ? items : null;\n  }\n  var encodePackets = (packets) => writeBatch(KIND_PACKETS, packets, null, (p) => p);\n  var decodePackets = (data) => readBatch(KIND_PACKETS, data)?.map((item) => item.packet) ?? null;\n  var encodeSeatPackets = (items) => writeBatch(KIND_SEAT_PACKETS, items, (i) => i.seat, (i) => i.packet);\n  var decodeSeatPackets = (data) => readBatch(KIND_SEAT_PACKETS, data);\n  function parseControl(text) {\n    if (typeof text !== "string" || text.length > MAX_TEXT_BYTES) return null;\n    let value;\n    try {\n      value = JSON.parse(text);\n    } catch {\n      return null;\n    }\n    const ok = value && typeof value === "object" && !Array.isArray(value) && typeof value.t === "string" && value.t.length <= 32;\n    return ok ? value : null;\n  }\n\n  // src/net/queues.js\n  var QueueReader = class {\n    constructor(buffer, loopback, base, { consume = false } = {}) {\n      this.i32 = new Int32Array(buffer);\n      this.u8 = new Uint8Array(buffer);\n      this.lb = loopback;\n      this.base = base;\n      this.readIndex = base + loopback.offGet >> 2;\n      this.writeIndex = base + loopback.offSend >> 2;\n      this.consume = consume;\n      this.cursor = Atomics.load(this.i32, this.writeIndex);\n      this.lost = 0;\n    }\n    /** Forgets everything written so far. */\n    skip() {\n      this.cursor = Atomics.load(this.i32, this.writeIndex);\n      if (this.consume) Atomics.store(this.i32, this.readIndex, this.cursor);\n    }\n    /** New packets since the last call. Slots the engine overwrote before we got to them count as lost. */\n    poll(out = []) {\n      const { slots, slotSize, offLen, dataMax } = this.lb;\n      let written = Atomics.load(this.i32, this.writeIndex);\n      if (written - this.cursor > slots - 1) {\n        this.lost += written - (slots - 1) - this.cursor;\n        this.cursor = written - (slots - 1);\n      }\n      while (this.cursor < written) {\n        const slot = this.base + (this.cursor & slots - 1) * slotSize;\n        const length = this.i32[slot + offLen >> 2];\n        const packet = length > 0 && length <= dataMax ? this.u8.slice(slot, slot + length) : null;\n        written = Atomics.load(this.i32, this.writeIndex);\n        if (written - this.cursor > slots - 1) this.lost += 1;\n        else if (packet) out.push(packet);\n        this.cursor += 1;\n      }\n      if (this.consume) Atomics.store(this.i32, this.readIndex, this.cursor);\n      return out;\n    }\n  };\n  var QueueWriter = class {\n    constructor(buffer, loopback, base) {\n      this.i32 = new Int32Array(buffer);\n      this.u8 = new Uint8Array(buffer);\n      this.lb = loopback;\n      this.base = base;\n      this.readIndex = base + loopback.offGet >> 2;\n      this.writeIndex = base + loopback.offSend >> 2;\n    }\n    hasRoom() {\n      return Atomics.load(this.i32, this.writeIndex) - Atomics.load(this.i32, this.readIndex) < this.lb.slots - 1;\n    }\n    /** False, without writing, when the engine has not caught up yet; the caller retries later. */\n    push(packet, port) {\n      const { slots, slotSize, offLen, offPort, dataMax } = this.lb;\n      if (packet.byteLength === 0 || packet.byteLength > dataMax) return true;\n      if (!this.hasRoom()) return false;\n      const written = Atomics.load(this.i32, this.writeIndex);\n      const slot = this.base + (written & slots - 1) * slotSize;\n      this.u8.set(packet, slot);\n      Atomics.store(this.i32, slot + offLen >> 2, packet.byteLength);\n      Atomics.store(this.i32, slot + offPort >> 2, port);\n      Atomics.add(this.i32, this.writeIndex, 1);\n      return true;\n    }\n  };\n  function connectionlessCommand(packet) {\n    if (packet.byteLength < 5 || packet[0] !== 255 || packet[1] !== 255 || packet[2] !== 255 || packet[3] !== 255) return null;\n    let end = 4;\n    while (end < packet.byteLength && end < 64 && packet[end] !== 0 && packet[end] !== 32 && packet[end] !== 10) end += 1;\n    return String.fromCharCode(...packet.subarray(4, end));\n  }\n\n  // src/net/pump-worker.js\n  var POLL_MS = 1;\n  var FLUSH_MS = 4;\n  var INBOX_LIMIT = 512;\n  var PING_MS = 2e3;\n  var state = {\n    role: null,\n    url: null,\n    socket: null,\n    closed: false,\n    retries: 0,\n    readers: [],\n    writer: null,\n    ports: {},\n    reading: false,\n    injecting: false,\n    dropUntilConnect: false,\n    dropCommands: [],\n    inbox: [],\n    outbox: [],\n    lastFlush: 0,\n    looping: false,\n    stats: { packetsOut: 0, packetsIn: 0, bytesOut: 0, bytesIn: 0, framesOut: 0, framesIn: 0, dropped: 0, lost: 0, rtt: null, rtts: {} }\n  };\n  var hosting = () => state.role === "host";\n  var post = (message) => self.postMessage(message);\n  self.onmessage = ({ data: message }) => {\n    switch (message.type) {\n      case "connect":\n        state.role = message.role;\n        state.url = relaySocketUrl(message.relay, message.room, message.role, message.guestId);\n        open();\n        loop();\n        break;\n      case "attach":\n        state.readers = message.reads.map(({ seat, base }) => ({ seat, queue: new QueueReader(message.buffer, message.loopback, base, { consume: true }) }));\n        state.writer = new QueueWriter(message.buffer, message.loopback, message.writeBase);\n        state.ports = message.ports;\n        state.reading = Boolean(message.reading);\n        state.injecting = Boolean(message.injecting);\n        state.dropCommands = message.dropCommands ?? [];\n        break;\n      case "read":\n        for (const { queue } of state.readers) queue.skip();\n        state.dropUntilConnect = Boolean(message.dropUntilConnect);\n        state.reading = true;\n        break;\n      case "inject":\n        state.injecting = Boolean(message.on);\n        if (message.clearInbox) state.inbox.length = 0;\n        break;\n      case "send":\n        sendText(message.message);\n        break;\n      case "close":\n        state.closed = true;\n        try {\n          state.socket?.close(1e3, "bye");\n        } catch {\n        }\n        break;\n    }\n  };\n  function open() {\n    if (state.closed) return;\n    let socket;\n    try {\n      socket = new WebSocket(state.url);\n    } catch (error) {\n      post({ type: "socket", state: "error", reason: String(error?.message ?? error) });\n      retry();\n      return;\n    }\n    socket.binaryType = "arraybuffer";\n    state.socket = socket;\n    post({ type: "socket", state: "connecting" });\n    socket.onopen = () => {\n      state.retries = 0;\n      post({ type: "socket", state: "open" });\n    };\n    socket.onmessage = ({ data }) => typeof data === "string" ? onText(data) : onBinary(data);\n    socket.onclose = (event) => {\n      if (state.socket === socket) state.socket = null;\n      post({ type: "socket", state: "closed", code: event.code, reason: event.reason });\n      if (event.code === 4001 || event.code === 4004) state.closed = true;\n      else if (event.code === 4005) setTimeout(open, 6e4);\n      else retry();\n    };\n    socket.onerror = () => {\n    };\n  }\n  function retry() {\n    if (state.closed) return;\n    setTimeout(open, Math.min(5e3, 250 * 2 ** state.retries));\n    state.retries += 1;\n  }\n  function onBinary(data) {\n    const items = hosting() ? decodeSeatPackets(data) : decodePackets(data)?.map((packet) => ({ seat: 0, packet }));\n    if (!items) return;\n    state.stats.framesIn += 1;\n    for (const item of items) {\n      state.stats.packetsIn += 1;\n      state.stats.bytesIn += item.packet.byteLength;\n      const command = connectionlessCommand(item.packet);\n      if (command && state.dropCommands.includes(command)) continue;\n      state.inbox.push(item);\n    }\n    if (state.inbox.length > INBOX_LIMIT) {\n      state.stats.dropped += state.inbox.length - INBOX_LIMIT;\n      state.inbox.splice(0, state.inbox.length - INBOX_LIMIT);\n    }\n    pump();\n  }\n  function onText(text) {\n    const message = parseControl(text);\n    if (!message) return;\n    if (message.t === "ping") {\n      sendText(hosting() ? { t: "pong", ts: message.ts, to: message.from } : { t: "pong", ts: message.ts });\n    } else if (message.t === "pong") {\n      if (typeof message.ts !== "number") return;\n      const rtt = Math.max(0, performance.now() - message.ts);\n      if (hosting()) {\n        if (Number.isInteger(message.from)) state.stats.rtts[message.from] = rtt;\n        state.stats.rtt = Math.max(0, ...Object.values(state.stats.rtts));\n      } else {\n        state.stats.rtt = rtt;\n      }\n    } else {\n      post({ type: "control", message });\n    }\n  }\n  function sendText(message) {\n    if (state.socket?.readyState !== WebSocket.OPEN) return false;\n    state.socket.send(JSON.stringify(message));\n    return true;\n  }\n  function flush(now) {\n    if (!state.outbox.length) return;\n    const socket = state.socket;\n    if (socket?.readyState !== WebSocket.OPEN) {\n      state.stats.dropped += state.outbox.length;\n    } else {\n      const seats = hosting();\n      const perPacket = seats ? 3 : 2;\n      let batch = [];\n      let size = 4;\n      const send = () => {\n        if (!batch.length) return;\n        socket.send(seats ? encodeSeatPackets(batch) : encodePackets(batch.map((item) => item.packet)));\n        state.stats.framesOut += 1;\n        batch = [];\n        size = 4;\n      };\n      for (const item of state.outbox) {\n        const bytes = perPacket + item.packet.byteLength;\n        if (size + bytes > MAX_BINARY_BYTES) send();\n        batch.push(item);\n        size += bytes;\n        state.stats.packetsOut += 1;\n        state.stats.bytesOut += item.packet.byteLength;\n      }\n      send();\n    }\n    state.outbox.length = 0;\n    state.lastFlush = now;\n  }\n  function pump() {\n    const now = performance.now();\n    if (state.reading) {\n      let lost = 0;\n      for (const { seat, queue } of state.readers) {\n        let packets = queue.poll([]);\n        lost += queue.lost;\n        if (state.dropUntilConnect && packets.length) {\n          const first = packets.findIndex((packet) => connectionlessCommand(packet) === "connect");\n          packets = first < 0 ? [] : packets.slice(first);\n          if (first >= 0) state.dropUntilConnect = false;\n        }\n        for (const packet of packets) state.outbox.push({ seat, packet });\n      }\n      state.stats.lost = lost;\n    }\n    if (state.outbox.length && now - state.lastFlush >= FLUSH_MS) flush(now);\n    if (state.writer && state.injecting) {\n      while (state.inbox.length && state.writer.push(state.inbox[0].packet, state.ports[state.inbox[0].seat] ?? 0)) state.inbox.shift();\n    }\n  }\n  async function loop() {\n    if (state.looping) return;\n    state.looping = true;\n    const tick = new Int32Array(new SharedArrayBuffer(4));\n    let lastPing = 0;\n    let lastStats = 0;\n    while (!state.closed) {\n      pump();\n      const now = performance.now();\n      if (now - lastPing >= PING_MS) {\n        lastPing = now;\n        sendText({ t: "ping", ts: now });\n      }\n      if (now - lastStats >= 1e3) {\n        lastStats = now;\n        post({ type: "stats", stats: { ...state.stats, rtts: { ...state.stats.rtts }, inbox: state.inbox.length } });\n      }\n      const wait = Atomics.waitAsync ? Atomics.waitAsync(tick, 0, 0, POLL_MS) : null;\n      if (wait?.async) await wait.value;\n      else await new Promise((resolve) => setTimeout(resolve, POLL_MS));\n    }\n  }\n})();\n'], { type: "text/javascript" }));
+    const url = URL.createObjectURL(new Blob(['(() => {\n  // relay/src/protocol.js\n  var PROTOCOL_VERSION = 3;\n  var ROLES = Object.freeze(["host", "guest"]);\n  var RELAY_MESSAGE_TYPES = Object.freeze(["welcome", "peer", "error"]);\n  var MAX_GUESTS = 3;\n  var MAX_TEXT_BYTES = 4096;\n  var MAX_BINARY_BYTES = 65536;\n  var MAX_PACKET_BYTES = 1264;\n  function relaySocketUrl(relayBase, room, role, guestId) {\n    const url = new URL(relayBase);\n    url.protocol = url.protocol === "http:" || url.protocol === "ws:" ? "ws:" : "wss:";\n    url.pathname = `/v1/rooms/${encodeURIComponent(room)}`;\n    url.search = `?role=${role}&v=${PROTOCOL_VERSION}${role === "guest" ? `&id=${guestId}` : ""}`;\n    return url.toString();\n  }\n  var BATCH_VERSION = 1;\n  var KIND_PACKETS = 1;\n  var KIND_SEAT_PACKETS = 2;\n  function writeBatch(kind, items, seatOf, packetOf) {\n    const header = kind === KIND_SEAT_PACKETS ? 3 : 2;\n    let size = 4;\n    for (const item of items) size += header + packetOf(item).byteLength;\n    if (items.length > 65535 || size > MAX_BINARY_BYTES) throw new RangeError("packet batch too large");\n    const out = new Uint8Array(size);\n    const view = new DataView(out.buffer);\n    out[0] = BATCH_VERSION;\n    out[1] = kind;\n    view.setUint16(2, items.length, true);\n    let at = 4;\n    for (const item of items) {\n      const packet = packetOf(item);\n      if (packet.byteLength > MAX_PACKET_BYTES) throw new RangeError("packet too large");\n      if (kind === KIND_SEAT_PACKETS) out[at++] = seatOf(item);\n      view.setUint16(at, packet.byteLength, true);\n      out.set(packet, at + 2);\n      at += 2 + packet.byteLength;\n    }\n    return out;\n  }\n  function readBatch(kind, data) {\n    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);\n    if (bytes.byteLength < 4 || bytes[0] !== BATCH_VERSION || bytes[1] !== kind) return null;\n    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);\n    const count = view.getUint16(2, true);\n    const items = [];\n    let at = 4;\n    for (let i = 0; i < count; i += 1) {\n      let seat = 0;\n      if (kind === KIND_SEAT_PACKETS) {\n        if (at + 1 > bytes.byteLength) return null;\n        seat = bytes[at++];\n        if (seat < 1 || seat > MAX_GUESTS) return null;\n      }\n      if (at + 2 > bytes.byteLength) return null;\n      const length = view.getUint16(at, true);\n      at += 2;\n      if (length > MAX_PACKET_BYTES || at + length > bytes.byteLength) return null;\n      items.push({ seat, packet: bytes.subarray(at, at + length) });\n      at += length;\n    }\n    return at === bytes.byteLength ? items : null;\n  }\n  var encodePackets = (packets) => writeBatch(KIND_PACKETS, packets, null, (p) => p);\n  var decodePackets = (data) => readBatch(KIND_PACKETS, data)?.map((item) => item.packet) ?? null;\n  var encodeSeatPackets = (items) => writeBatch(KIND_SEAT_PACKETS, items, (i) => i.seat, (i) => i.packet);\n  var decodeSeatPackets = (data) => readBatch(KIND_SEAT_PACKETS, data);\n  function parseControl(text) {\n    if (typeof text !== "string" || text.length > MAX_TEXT_BYTES) return null;\n    let value;\n    try {\n      value = JSON.parse(text);\n    } catch {\n      return null;\n    }\n    const ok = value && typeof value === "object" && !Array.isArray(value) && typeof value.t === "string" && value.t.length <= 32;\n    return ok ? value : null;\n  }\n\n  // src/net/queues.js\n  var QueueReader = class {\n    constructor(buffer, loopback, base, { consume = false } = {}) {\n      this.i32 = new Int32Array(buffer);\n      this.u8 = new Uint8Array(buffer);\n      this.lb = loopback;\n      this.base = base;\n      this.readIndex = base + loopback.offGet >> 2;\n      this.writeIndex = base + loopback.offSend >> 2;\n      this.consume = consume;\n      this.cursor = Atomics.load(this.i32, this.writeIndex);\n      this.lost = 0;\n    }\n    /** Forgets everything written so far. */\n    skip() {\n      this.cursor = Atomics.load(this.i32, this.writeIndex);\n      if (this.consume) Atomics.store(this.i32, this.readIndex, this.cursor);\n    }\n    /** New packets since the last call. Slots the engine overwrote before we got to them count as lost. */\n    poll(out = []) {\n      const { slots, slotSize, offLen, dataMax } = this.lb;\n      let written = Atomics.load(this.i32, this.writeIndex);\n      if (written - this.cursor > slots - 1) {\n        this.lost += written - (slots - 1) - this.cursor;\n        this.cursor = written - (slots - 1);\n      }\n      while (this.cursor < written) {\n        const slot = this.base + (this.cursor & slots - 1) * slotSize;\n        const length = this.i32[slot + offLen >> 2];\n        const packet = length > 0 && length <= dataMax ? this.u8.slice(slot, slot + length) : null;\n        written = Atomics.load(this.i32, this.writeIndex);\n        if (written - this.cursor > slots - 1) this.lost += 1;\n        else if (packet) out.push(packet);\n        this.cursor += 1;\n      }\n      if (this.consume) Atomics.store(this.i32, this.readIndex, this.cursor);\n      return out;\n    }\n  };\n  var QueueWriter = class {\n    constructor(buffer, loopback, base) {\n      this.i32 = new Int32Array(buffer);\n      this.u8 = new Uint8Array(buffer);\n      this.lb = loopback;\n      this.base = base;\n      this.readIndex = base + loopback.offGet >> 2;\n      this.writeIndex = base + loopback.offSend >> 2;\n    }\n    hasRoom() {\n      return Atomics.load(this.i32, this.writeIndex) - Atomics.load(this.i32, this.readIndex) < this.lb.slots - 1;\n    }\n    /** False, without writing, when the engine has not caught up yet; the caller retries later. */\n    push(packet, port) {\n      const { slots, slotSize, offLen, offPort, dataMax } = this.lb;\n      if (packet.byteLength === 0 || packet.byteLength > dataMax) return true;\n      if (!this.hasRoom()) return false;\n      const written = Atomics.load(this.i32, this.writeIndex);\n      const slot = this.base + (written & slots - 1) * slotSize;\n      this.u8.set(packet, slot);\n      Atomics.store(this.i32, slot + offLen >> 2, packet.byteLength);\n      Atomics.store(this.i32, slot + offPort >> 2, port);\n      Atomics.add(this.i32, this.writeIndex, 1);\n      return true;\n    }\n  };\n  function connectionlessCommand(packet) {\n    if (packet.byteLength < 5 || packet[0] !== 255 || packet[1] !== 255 || packet[2] !== 255 || packet[3] !== 255) return null;\n    let end = 4;\n    while (end < packet.byteLength && end < 64 && packet[end] !== 0 && packet[end] !== 32 && packet[end] !== 10) end += 1;\n    return String.fromCharCode(...packet.subarray(4, end));\n  }\n\n  // src/net/pump-worker.js\n  var POLL_MS = 1;\n  var FLUSH_MS = 4;\n  var INBOX_LIMIT = 512;\n  var PING_MS = 2e3;\n  var state = {\n    role: null,\n    url: null,\n    socket: null,\n    closed: false,\n    retries: 0,\n    readers: [],\n    writer: null,\n    ports: {},\n    reading: false,\n    injecting: false,\n    dropUntilConnect: false,\n    dropCommands: [],\n    inbox: [],\n    outbox: [],\n    lastFlush: 0,\n    lastPeerAt: 0,\n    // performance.now() of the last frame (text or binary) the other side sent us; 0 before the first\n    looping: false,\n    stats: { packetsOut: 0, packetsIn: 0, bytesOut: 0, bytesIn: 0, framesOut: 0, framesIn: 0, dropped: 0, lost: 0, rtt: null, rtts: {} }\n  };\n  var hosting = () => state.role === "host";\n  var post = (message) => self.postMessage(message);\n  self.onmessage = ({ data: message }) => {\n    switch (message.type) {\n      case "connect":\n        state.role = message.role;\n        state.url = relaySocketUrl(message.relay, message.room, message.role, message.guestId);\n        open();\n        loop();\n        break;\n      case "attach":\n        state.readers = message.reads.map(({ seat, base }) => ({ seat, queue: new QueueReader(message.buffer, message.loopback, base, { consume: true }) }));\n        state.writer = new QueueWriter(message.buffer, message.loopback, message.writeBase);\n        state.ports = message.ports;\n        state.reading = Boolean(message.reading);\n        state.injecting = Boolean(message.injecting);\n        state.dropCommands = message.dropCommands ?? [];\n        break;\n      case "read":\n        for (const { queue } of state.readers) queue.skip();\n        state.dropUntilConnect = Boolean(message.dropUntilConnect);\n        state.reading = true;\n        break;\n      case "inject":\n        state.injecting = Boolean(message.on);\n        if (message.clearInbox) state.inbox.length = 0;\n        break;\n      case "detach":\n        state.readers = [];\n        state.writer = null;\n        state.ports = {};\n        state.reading = false;\n        state.injecting = false;\n        state.dropUntilConnect = false;\n        state.inbox.length = 0;\n        state.outbox.length = 0;\n        break;\n      case "send":\n        sendText(message.message);\n        break;\n      case "close":\n        state.closed = true;\n        try {\n          state.socket?.close(1e3, "bye");\n        } catch {\n        }\n        break;\n    }\n  };\n  function open() {\n    if (state.closed) return;\n    let socket;\n    try {\n      socket = new WebSocket(state.url);\n    } catch (error) {\n      post({ type: "socket", state: "error", reason: String(error?.message ?? error) });\n      retry();\n      return;\n    }\n    socket.binaryType = "arraybuffer";\n    state.socket = socket;\n    post({ type: "socket", state: "connecting" });\n    socket.onopen = () => {\n      state.retries = 0;\n      post({ type: "socket", state: "open" });\n    };\n    socket.onmessage = ({ data }) => typeof data === "string" ? onText(data) : onBinary(data);\n    socket.onclose = (event) => {\n      if (state.socket === socket) state.socket = null;\n      post({ type: "socket", state: "closed", code: event.code, reason: event.reason });\n      if (event.code === 4001 || event.code === 4004) state.closed = true;\n      else if (event.code === 4005) setTimeout(open, 6e4);\n      else retry();\n    };\n    socket.onerror = () => {\n    };\n  }\n  function retry() {\n    if (state.closed) return;\n    setTimeout(open, Math.min(5e3, 250 * 2 ** state.retries));\n    state.retries += 1;\n  }\n  function onBinary(data) {\n    state.lastPeerAt = performance.now();\n    const items = hosting() ? decodeSeatPackets(data) : decodePackets(data)?.map((packet) => ({ seat: 0, packet }));\n    if (!items) return;\n    state.stats.framesIn += 1;\n    for (const item of items) {\n      state.stats.packetsIn += 1;\n      state.stats.bytesIn += item.packet.byteLength;\n      const command = connectionlessCommand(item.packet);\n      if (command && state.dropCommands.includes(command)) continue;\n      state.inbox.push(item);\n    }\n    if (state.inbox.length > INBOX_LIMIT) {\n      state.stats.dropped += state.inbox.length - INBOX_LIMIT;\n      state.inbox.splice(0, state.inbox.length - INBOX_LIMIT);\n    }\n    pump();\n  }\n  function onText(text) {\n    state.lastPeerAt = performance.now();\n    const message = parseControl(text);\n    if (!message) return;\n    if (message.t === "ping") {\n      sendText(hosting() ? { t: "pong", ts: message.ts, to: message.from } : { t: "pong", ts: message.ts });\n    } else if (message.t === "pong") {\n      if (typeof message.ts !== "number") return;\n      const rtt = Math.max(0, performance.now() - message.ts);\n      if (hosting()) {\n        if (Number.isInteger(message.from)) state.stats.rtts[message.from] = rtt;\n        state.stats.rtt = Math.max(0, ...Object.values(state.stats.rtts));\n      } else {\n        state.stats.rtt = rtt;\n      }\n    } else {\n      post({ type: "control", message });\n    }\n  }\n  function sendText(message) {\n    if (state.socket?.readyState !== WebSocket.OPEN) return false;\n    state.socket.send(JSON.stringify(message));\n    return true;\n  }\n  function flush(now) {\n    if (!state.outbox.length) return;\n    const socket = state.socket;\n    if (socket?.readyState !== WebSocket.OPEN) {\n      state.stats.dropped += state.outbox.length;\n    } else {\n      const seats = hosting();\n      const perPacket = seats ? 3 : 2;\n      let batch = [];\n      let size = 4;\n      const send = () => {\n        if (!batch.length) return;\n        socket.send(seats ? encodeSeatPackets(batch) : encodePackets(batch.map((item) => item.packet)));\n        state.stats.framesOut += 1;\n        batch = [];\n        size = 4;\n      };\n      for (const item of state.outbox) {\n        const bytes = perPacket + item.packet.byteLength;\n        if (size + bytes > MAX_BINARY_BYTES) send();\n        batch.push(item);\n        size += bytes;\n        state.stats.packetsOut += 1;\n        state.stats.bytesOut += item.packet.byteLength;\n      }\n      send();\n    }\n    state.outbox.length = 0;\n    state.lastFlush = now;\n  }\n  function pump() {\n    const now = performance.now();\n    if (state.reading) {\n      let lost = 0;\n      for (const { seat, queue } of state.readers) {\n        let packets = queue.poll([]);\n        lost += queue.lost;\n        if (state.dropUntilConnect && packets.length) {\n          const first = packets.findIndex((packet) => connectionlessCommand(packet) === "connect");\n          packets = first < 0 ? [] : packets.slice(first);\n          if (first >= 0) state.dropUntilConnect = false;\n        }\n        for (const packet of packets) state.outbox.push({ seat, packet });\n      }\n      state.stats.lost = lost;\n    }\n    if (state.outbox.length && now - state.lastFlush >= FLUSH_MS) flush(now);\n    if (state.writer && state.injecting) {\n      while (state.inbox.length && state.writer.push(state.inbox[0].packet, state.ports[state.inbox[0].seat] ?? 0)) state.inbox.shift();\n    }\n  }\n  async function loop() {\n    if (state.looping) return;\n    state.looping = true;\n    const tick = new Int32Array(new SharedArrayBuffer(4));\n    let lastPing = 0;\n    let lastStats = 0;\n    while (!state.closed) {\n      pump();\n      const now = performance.now();\n      if (now - lastPing >= PING_MS) {\n        lastPing = now;\n        sendText({ t: "ping", ts: now });\n      }\n      if (now - lastStats >= 1e3) {\n        lastStats = now;\n        const peerAgeMs = state.lastPeerAt ? now - state.lastPeerAt : null;\n        post({ type: "stats", stats: { ...state.stats, rtts: { ...state.stats.rtts }, inbox: state.inbox.length, peerAgeMs } });\n      }\n      const wait = Atomics.waitAsync ? Atomics.waitAsync(tick, 0, 0, POLL_MS) : null;\n      if (wait?.async) await wait.value;\n      else await new Promise((resolve) => setTimeout(resolve, POLL_MS));\n    }\n  }\n})();\n'], { type: "text/javascript" }));
     const worker = new Worker(url, { name: "bo1-coop-pump" });
     worker.onmessage = ({ data: message }) => {
       if (message.type === "socket") session.onSocket(message);
@@ -804,6 +804,9 @@
       clickToPlay: "You are in. Click the game to play.",
       lateJoin: "The host had already started: you watch until the next round, then spawn.",
       ended: "Disconnected from the host. You can rejoin while the host keeps playing.",
+      interrupted: "The host's session stopped. World updates are no longer arriving; reconnect when the host is back.",
+      reconnecting: "Reconnecting to the host…",
+      reconnect: "Reconnect",
       failed: "Could not join. Try again.",
       rejoin: "Rejoin",
       goToHost: "Go to the host",
@@ -920,6 +923,9 @@
       clickToPlay: "Você entrou. Clique no jogo para jogar.",
       lateJoin: "O host já tinha começado: você assiste até a próxima rodada e então nasce.",
       ended: "Desconectado do host. Você pode voltar enquanto o host continuar jogando.",
+      interrupted: "A sessão do host parou. As atualizações do mundo pararam de chegar; reconecte quando o host voltar.",
+      reconnecting: "Reconectando ao host…",
+      reconnect: "Reconectar",
       failed: "Não deu para entrar. Tente de novo.",
       rejoin: "Voltar para a partida",
       goToHost: "Ir até o host",
@@ -1255,6 +1261,7 @@
 
   // src/session/guest.js
   var HOST_GONE_MS = 1e4;
+  var HOST_SILENT_MS = 1e4;
   var STATE_REPEAT_MS = 2e3;
   var SPAWN_JUMP = 400;
   var NEAR_HOST = 300;
@@ -1315,7 +1322,7 @@
   function guestTick(session) {
     const screen2 = screen();
     const engine = session.engine;
-    if (screen2 === "error" && !["ended", "failed"].includes(session.phase)) {
+    if (screen2 === "error" && !["ended", "failed", "interrupted"].includes(session.phase)) {
       session.phase = "ended";
       session.note("engine stopped");
     }
@@ -1326,8 +1333,67 @@
     }
     if (session.peer && (session.phase !== session.sentPhase || Date.now() - (session.sentPhaseAt ?? 0) > STATE_REPEAT_MS)) introduce(session);
     if (!session.peer) session.sentPhase = null;
+    if (engine && SESSION_PHASES.has(session.phase) && hostWentSilent(session)) interruptSession(session);
     const step2 = STEPS[session.phase];
     if (step2) step2(session, engine, screen2);
+  }
+  var SESSION_PHASES = /* @__PURE__ */ new Set(["waiting-host", "freezing", "connect", "challenging", "joining", "connected"]);
+  function hostWentSilent(session) {
+    const age = session.stats?.peerAgeMs;
+    return age != null && age > HOST_SILENT_MS;
+  }
+  function interruptSession(session, why = "host silent") {
+    if (session.phase === "interrupted") return;
+    session.phase = "interrupted";
+    session.reconnecting = false;
+    session.fail("hostLeft");
+    session.note(`session interrupted: ${why}`);
+    session.pump?.postMessage({ type: "detach" });
+    const engine = session.engine;
+    if (engine) {
+      engine.command("disconnect");
+      if (engine.dvar("svPaused")) engine.setDvar("svPaused", 0);
+      if (engine.dvar("clPaused")) engine.setDvar("clPaused", 0);
+    }
+    session.paused = false;
+    session.menuOpen = false;
+    session.remotePause = false;
+    session.hostState = null;
+    session.hostPos = null;
+    session.hostTrail = [];
+    session.connectWaitAt = null;
+    session.connectAt = 0;
+    session.introReleased = false;
+  }
+  function reconnectSession(session) {
+    if (session.phase !== "interrupted" || session.reconnecting) return false;
+    const engine = session.engine;
+    if (!engine || !session.pump) return false;
+    session.reconnecting = true;
+    session.error = null;
+    session.note("reconnecting to the host");
+    session.pump.postMessage({
+      type: "attach",
+      buffer: engine.buffer,
+      loopback: session.build.loopback,
+      reads: [{ seat: 0, base: engine.queueAt(1) }],
+      writeBase: engine.queueAt(0),
+      ports: { 0: 0 },
+      reading: false,
+      injecting: false
+    });
+    engine.command("disconnect");
+    if (engine.dvar("svPaused")) engine.setDvar("svPaused", 0);
+    if (engine.dvar("clPaused")) engine.setDvar("clPaused", 0);
+    session.paused = false;
+    session.menuOpen = false;
+    session.remotePause = false;
+    session.connectWaitAt = null;
+    session.connectAt = 0;
+    session.hostState = null;
+    session.phase = "waiting-host";
+    introduce(session);
+    return true;
   }
   var STEPS = {
     loading(session, engine, screen2) {
@@ -1371,30 +1437,26 @@
         session.phase = "joining";
         session.note("handshake started, passing the host's packets in");
       } else if (Date.now() - session.connectAt > 15e3) {
-        session.fail("connectFailed");
-        session.phase = "failed";
+        joinAttemptFailed(session, "connectFailed");
       }
     },
     joining(session, engine) {
       if (engine.clientServerPort() !== 0) engine.pointClientAt(0);
       if (engine.connectionState() === CONNECTION.active) {
+        session.reconnecting = false;
         session.phase = "connected";
         session.lastViewOrigin = null;
         session.spawn ??= { tries: 0, sentAt: 0 };
         session.note("connected to the host");
       } else if (Date.now() - session.connectAt > 9e4) {
-        session.fail("notLetIn");
-        session.phase = "failed";
+        joinAttemptFailed(session, "notLetIn");
       }
     },
     connected(session, engine, screen2) {
       if (engine.connectionState() < CONNECTION.challenging) {
-        session.phase = "ended";
-        session.note("disconnected");
+        interruptSession(session, "the engine dropped the connection");
       } else if (!session.peer && session.hostLeftAt && Date.now() - session.hostLeftAt > HOST_GONE_MS) {
-        session.phase = "ended";
-        session.fail("hostLeft");
-        engine.command("disconnect");
+        interruptSession(session, "the host left the room");
       } else {
         syncGuestPause(session, engine, screen2);
         if (session.hostState?.screen !== "playing") engine.keepClientAlive();
@@ -1403,6 +1465,15 @@
       }
     }
   };
+  function joinAttemptFailed(session, key) {
+    if (session.reconnecting) {
+      session.reconnecting = false;
+      interruptSession(session, `reconnect failed (${key})`);
+    } else {
+      session.fail(key);
+      session.phase = "failed";
+    }
+  }
   var SLOW_AFTER_HOST_MS = 1500;
   function restoreSpeed(session, engine) {
     if (!session.hostState?.normalSpeed || engine.codeTimeScale() >= NORMAL_SPEED) {
@@ -1881,6 +1952,7 @@
   function ownStatus(session) {
     const phase = session.phase;
     if (phase === "connected") return session.lobby?.playing || session.hostState?.screen === "playing" ? ["ingame", "ok"] : ["ready", "ok"];
+    if (phase === "interrupted") return ["reconnecting", "wait"];
     if (["ended", "failed"].includes(phase)) return ["disconnected", "bad"];
     if (CONNECTING.includes(phase)) return ["joining", "wait"];
     if (phase === "waiting-host" && session.hostState?.ready && !session.hostState.turn) return ["turn", "wait"];
@@ -3014,15 +3086,15 @@ button.act.tiny { padding: 5px 6px; font-size: 11.5px; font-weight: 600; }
     if (session.paused) return { text: T.chip.paused, tone: "wait" };
     return screen2 === "playing" ? { text: T.chip.ingame, tone: "ok live" } : { text: T.chip.hosting, tone: "wait live" };
   }
-  var GUEST_STEP = { "joining-room": 0, following: 1, loading: 2, "waiting-host": 3, freezing: 3, connect: 3, challenging: 3, joining: 3, connected: 4 };
+  var GUEST_STEP = { "joining-room": 0, following: 1, loading: 2, "waiting-host": 3, freezing: 3, connect: 3, challenging: 3, joining: 3, connected: 4, interrupted: 4 };
   function guestSection(session, blocks, screen2) {
     const phase = session.phase;
-    const failed = ["ended", "failed"].includes(phase);
+    const failed = ["ended", "failed", "interrupted"].includes(phase);
     const slug = session.lobby?.slug ?? session.hostInfo?.slug ?? null;
     const mapName = slug ? MAP_NAMES[slug] : null;
     let step2 = GUEST_STEP[phase] ?? session.lastStep ?? 0;
     if (phase === "joining-room" && session.hostInfo?.slug) step2 = 1;
-    if (!failed) session.lastStep = step2;
+    if (!["ended", "failed"].includes(phase)) session.lastStep = step2;
     if (session.inviteRelay && session.inviteRelay !== session.relay) {
       blocks.push({ kind: "callout", tone: "wait", text: T.otherRelay(new URL(session.inviteRelay).hostname), buttons: [{ act: "useInviteRelay", label: T.useRelay, style: "primary" }] });
     }
@@ -3032,7 +3104,10 @@ button.act.tiny { padding: 5px 6px; font-size: 11.5px; font-weight: 600; }
       blocks.push({ kind: "callout", tone: "wait", title: "⌨", text: T.pressKey });
     } else {
       const text = guestMessage(session, phase, mapName, screen2);
-      if (text) blocks.push({ kind: "callout", tone: failed ? "bad" : phase === "connected" ? "ok" : "info", text, buttons: failed ? [{ act: "rejoin", label: T.rejoin, style: "primary" }] : [] });
+      if (text) {
+        const buttons = phase === "interrupted" ? [{ act: "reconnect", label: T.reconnect, style: "primary", disabled: Boolean(session.reconnecting) }] : failed ? [{ act: "rejoin", label: T.rejoin, style: "primary" }] : [];
+        blocks.push({ kind: "callout", tone: failed ? "bad" : phase === "connected" ? "ok" : "info", text, buttons });
+      }
     }
     if (session.joinedLate && ["joining", "connected"].includes(phase)) blocks.push({ kind: "callout", tone: "info", text: T.lateJoin });
     if (phase === "connected" && session.paused) blocks.push({ kind: "callout", tone: "wait", text: session.menuOpen ? T.pausedYou : T.pausedBy });
@@ -3052,17 +3127,20 @@ button.act.tiny { padding: 5px 6px; font-size: 11.5px; font-weight: 600; }
       case "loading":
         return T.loadingMap;
       case "waiting-host":
+        if (session.reconnecting) return T.reconnecting;
         if (session.hostState?.ready && !session.hostState.turn) return T.nextInLine;
         return session.peer ? T.hostLoading : T.waitingHost;
       case "freezing":
       case "connect":
       case "challenging":
-        return T.connecting;
+        return session.reconnecting ? T.reconnecting : T.connecting;
       case "joining":
-        return T.joiningGame;
+        return session.reconnecting ? T.reconnecting : T.joiningGame;
       case "connected":
         if (screen2 === "playing") return null;
         return session.hostState?.screen === "playing" || screen2 === "ready" && session.lobby?.playing ? T.clickToPlay : T.waitingStart;
+      case "interrupted":
+        return session.reconnecting ? T.reconnecting : T.interrupted;
       case "ended":
         return T.ended;
       case "failed":
@@ -3263,6 +3341,9 @@ button.act.tiny { padding: 5px 6px; font-size: 11.5px; font-weight: 600; }
       },
       startNow: () => session.startAlone = true,
       rejoin: () => location.reload(),
+      // In-session reconnect after the host dropped: a single attempt at a time (reconnectSession no-ops while one is
+      // in flight); a failed attempt lands back in the same interrupted state with this button available again.
+      reconnect: () => reconnectSession(session),
       openUpdate: () => window.open(session.update?.url, "_blank", "noopener"),
       openRelayGuide: () => window.open(`${RELAY_GUIDE.replace("#", LANG_QUERY)}`, "_blank", "noopener"),
       goToHost: () => moveToHost(session, "button"),

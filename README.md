@@ -203,6 +203,7 @@ npm run build              # src/ -> extension/coop.js
 npm run check              # lint + build + engine patch test
 npm run relay:dev          # relay on http://127.0.0.1:8787
 npm run test:relay         # routing test against it
+npm run test:reconnect     # host-drop/interrupt, queue detach and reconnect tests with a simulated engine
 node test/e2e.mjs 2 kino   # two real browsers playing through the local relay
 LITE=1 node test/e2e.mjs 3 kino   # same, light: one shared browser and pack cache, low quality, 30 fps
 npm run preview            # screenshots of every card state (no game loaded)

@@ -102,6 +102,7 @@ assert.equal(left.seat, g[2].seat);
 const late = client("guest", createGuestId());
 await late.ready;
 const w3 = await late.take((m) => m.t === "welcome");
+late.seat = w3.seat;
 assert.equal(w3.seat, g[2].seat);
 console.log("ok  freed seat reused", w3.seat);
 
@@ -109,5 +110,19 @@ console.log("ok  freed seat reused", w3.seat);
 host.ws.close();
 for (const c of [again, g[1], late]) await c.take((m) => m.t === "peer" && m.present === false);
 console.log("ok  host leave announced");
+
+// host reopening the same room: the guests are still there, keep their seats, and learn the host is back
+const survivingSeats = [seat0, g[1].seat, late.seat];
+const host2 = client("host");
+await host2.ready;
+const welcome = await host2.take((m) => m.t === "welcome");
+assert.deepEqual(welcome.guests.sort(), survivingSeats.sort(), "the new host sees every surviving seat");
+for (const c of [again, g[1], late]) await c.take((m) => m.t === "peer" && m.present === true);
+console.log("ok  host reopens the room and guests keep their seats", welcome.guests);
+// a guest's reconnect still routes to the new host
+again.ws.send(JSON.stringify({ t: "state", phase: "waiting-host" }));
+await host2.take((m) => m.t === "state" && m.from === seat0);
+console.log("ok  guest control messages reach the reopened host");
 for (const c of [again, g[1], late]) c.ws.close();
+host2.ws.close();
 console.log("relay: all passed");

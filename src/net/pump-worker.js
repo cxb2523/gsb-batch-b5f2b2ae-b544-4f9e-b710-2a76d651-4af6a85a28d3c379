@@ -29,6 +29,7 @@ const state = {
   inbox: [],
   outbox: [],
   lastFlush: 0,
+  lastPeerAt: 0, // performance.now() of the last frame (text or binary) the other side sent us; 0 before the first
   looping: false,
   stats: { packetsOut: 0, packetsIn: 0, bytesOut: 0, bytesIn: 0, framesOut: 0, framesIn: 0, dropped: 0, lost: 0, rtt: null, rtts: {} },
 };
@@ -59,6 +60,18 @@ self.onmessage = ({ data: message }) => {
     case "inject":
       state.injecting = Boolean(message.on);
       if (message.clearInbox) state.inbox.length = 0;
+      break;
+    case "detach":
+      // Session interrupted: drop every old queue and everything still in flight. Nothing attached afterwards may
+      // read or inject the old engine queues until a fresh "read"/"inject" turns them back on.
+      state.readers = [];
+      state.writer = null;
+      state.ports = {};
+      state.reading = false;
+      state.injecting = false;
+      state.dropUntilConnect = false;
+      state.inbox.length = 0;
+      state.outbox.length = 0;
       break;
     case "send":
       sendText(message.message);
@@ -111,6 +124,7 @@ function retry() {
 }
 
 function onBinary(data) {
+  state.lastPeerAt = performance.now();
   const items = hosting() ? decodeSeatPackets(data) : decodePackets(data)?.map((packet) => ({ seat: 0, packet }));
   if (!items) return;
   state.stats.framesIn += 1;
@@ -129,6 +143,7 @@ function onBinary(data) {
 }
 
 function onText(text) {
+  state.lastPeerAt = performance.now();
   const message = parseControl(text);
   if (!message) return;
   if (message.t === "ping") {
@@ -223,7 +238,9 @@ async function loop() {
     }
     if (now - lastStats >= 1000) {
       lastStats = now;
-      post({ type: "stats", stats: { ...state.stats, rtts: { ...state.stats.rtts }, inbox: state.inbox.length } });
+      // null until the first frame from the other side; afterwards, how long it has been silent.
+      const peerAgeMs = state.lastPeerAt ? now - state.lastPeerAt : null;
+      post({ type: "stats", stats: { ...state.stats, rtts: { ...state.stats.rtts }, inbox: state.inbox.length, peerAgeMs } });
     }
     // Atomics.waitAsync gives ~1 ms sleeps where setTimeout would be clamped.
     const wait = Atomics.waitAsync ? Atomics.waitAsync(tick, 0, 0, POLL_MS) : null;
