@@ -119,7 +119,7 @@ the root of this repository is what GitHub Pages serves.
 | `src/audio/` | the synthesiser, the ambience, the instruments and the written score |
 | `src/ui/` | HUD, cauldron, book, menus |
 | `dev/` | development pages: model viewer, world viewer, interface and audio benches |
-| `tools/` | dev server, release build, scripted play on a real GPU (`tools/play.mjs`), checks of the sound, the score and the mouse look that need no ears or hands, and a recorder that films scripted play frame by frame with the game's own sound (`tools/film.mjs`) |
+| `tools/` | dev server, release build, scripted play on a real GPU (`tools/play.mjs`), checks of the sound, the score and the mouse look that need no ears or hands, a check that a quality switch moves shadows, water and post together (`tools/quality-check.mjs`), and a recorder that films scripted play frame by frame with the game's own sound (`tools/film.mjs`) |
 | `docs/` | the design and the module contracts |
 
 The scripted play tools need a copy of `playwright-core` and a Chromium; see `tools/pw.mjs`. The

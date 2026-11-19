@@ -143,7 +143,20 @@ function hooks(game) {
     },
     stats() {
       const e = game.engine;
-      return { ...e.stats, w: e.w, h: e.h, gpu: e.gpu, quality: e.quality };
+      const L = e.lighting.csm;
+      const w = game.world && game.world.water;
+      return {
+        ...e.stats,
+        w: e.w,
+        h: e.h,
+        gpu: e.gpu,
+        quality: e.quality,
+        // what the current tier should have produced, for reading against the live objects
+        shadow: { size: L.shadowMapSize, far: L.maxFar, cascades: L.cascades, maps: L.lights.map((l) => (l.shadow.map ? l.shadow.map.width : null)) },
+        post: { w: e.post.w, h: e.post.h, volumetric: e.post.volumetric, vol: [e.post.vol[0].width, e.post.vol[0].height], down: e.post.down.map((r) => r.width), ldr: [e.post.ldr.width, e.post.ldr.height] },
+        water: w ? { reflect: !!w.reflRT, refl: w.reflRT ? [w.reflRT.width, w.reflRT.height] : null, on: w.uniforms.uReflOn.value } : null,
+        mem: { ...e.renderer.info.memory, programs: e.renderer.info.programs.length },
+      };
     },
   };
 }

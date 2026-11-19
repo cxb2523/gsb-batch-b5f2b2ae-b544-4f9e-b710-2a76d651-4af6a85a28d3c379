@@ -357,6 +357,9 @@ export class Water {
     const scene = engine.scene;
     this.ripple = makeWaterNormalTexture(256);
     this.reflRT = null;
+    // a 1px stand-in, so the sampler is never left pointing at a disposed texture
+    this._nullRefl = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
+    this._nullRefl.needsUpdate = true;
     this.virtual = new THREE.PerspectiveCamera();
     this.virtual.layers.set(0);
 
@@ -366,7 +369,7 @@ export class Water {
       uRipple: { value: this.ripple },
       uDeep: { value: new THREE.Color(0.006, 0.016, 0.02) },
       uShallow: { value: new THREE.Color(0.03, 0.058, 0.052) },
-      uReflTex: { value: null },
+      uReflTex: { value: this._nullRefl },
       uReflMat: { value: new THREE.Matrix4() },
       uReflOn: { value: 0 },
     }));
@@ -403,6 +406,7 @@ export class Water {
     this._buildRiver(scene);
     this._buildLava(scene);
     engine.hooks.reflect = (r, sc, cam) => this._renderReflection(r, sc, cam);
+    engine.hooks.quality.push(() => this.syncReflection());
   }
 
   _buildRiver(scene) {
@@ -484,21 +488,64 @@ export class Water {
       c = this.cell;
     this.uniforms.uOrigin.value.set(Math.round(cam.x / c) * c, 0, Math.round(cam.z / c) * c);
     this.uniforms.uSea.value = 0.5 + 1.1 * shared.uWind.value.z;
-    this.uniforms.uReflOn.value = e.q.reflect && cam.y > 0.05 ? 1 : 0;
+    this.syncReflection();
     this.river.visible = cam.y < 140;
+  }
+
+  /** The size the mirror is drawn at: half the drawing buffer. */
+  get reflSize() {
+    const e = this.engine;
+    return [Math.max(2, e.w >> 1), Math.max(2, e.h >> 1)];
+  }
+
+  /**
+   * Bring the reflection in line with the current tier: the mirror switch and the target's size.
+   * A tier without reflections releases the target (no stale full-resolution mirror kept on the
+   * GPU); a size change rebuilds it and disposes the old one. This is what a quality switch calls,
+   * so `uReflOn` and the target are already right on the frame after the switch, not one later.
+   */
+  syncReflection() {
+    const e = this.engine,
+      cam = e.camera.position;
+    if (!e.q.reflect) {
+      this.uniforms.uReflOn.value = 0;
+      this.releaseReflection();
+      return;
+    }
+    if (cam.y > 0.05) {
+      this.uniforms.uReflOn.value = 1;
+      this._ensureReflectionTarget();
+      return;
+    }
+    // the eye is under the surface: nothing mirrors, and a target left at another tier's size
+    // is released rather than kept around (it is rebuilt when the eye comes back up)
+    this.uniforms.uReflOn.value = 0;
+    const [w, h] = this.reflSize;
+    if (this.reflRT && (this.reflRT.width !== w || this.reflRT.height !== h)) this.releaseReflection();
+  }
+
+  /** Allocate the mirror if missing, or rebuild it at the current size, disposing the old one. */
+  _ensureReflectionTarget() {
+    const [w, h] = this.reflSize;
+    if (this.reflRT && this.reflRT.width === w && this.reflRT.height === h) return;
+    this.releaseReflection();
+    this.reflRT = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: true, stencilBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false });
+    this.uniforms.uReflTex.value = this.reflRT.texture;
+  }
+
+  /** Give the mirror's GPU memory back and stop sampling it. */
+  releaseReflection() {
+    if (!this.reflRT) return;
+    this.reflRT.dispose();
+    this.reflRT = null;
+    // keep a texture bound (the shader declares one); the 1px stand-in costs nothing
+    this.uniforms.uReflTex.value = this._nullRefl;
   }
 
   /** Mirror the camera in the water plane and draw the world (layer 0) into the reflection target. */
   _renderReflection(renderer, scene, camera) {
-    if (camera.position.y <= 0.05) return;
-    const e = this.engine;
-    const w = Math.max(2, e.w >> 1),
-      h = Math.max(2, e.h >> 1);
-    if (!this.reflRT || this.reflRT.width !== w || this.reflRT.height !== h) {
-      if (this.reflRT) this.reflRT.dispose();
-      this.reflRT = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: true, stencilBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false });
-      this.uniforms.uReflTex.value = this.reflRT.texture;
-    }
+    if (!this.engine.q.reflect || camera.position.y <= 0.05) return;
+    this._ensureReflectionTarget();
     const v = this.virtual;
     _n.set(0, 1, 0);
     // mirrored eye, target and up

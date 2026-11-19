@@ -237,3 +237,29 @@ Loops: `fire` (param = heat 0..1) `bubble` (param = heat) `stir` (param = speed)
 
 Everything is synthesised with the Web Audio API. Keep headroom: a limiter on the master bus, no
 clipping with twenty voices at once. Unknown names must warn once and do nothing.
+
+## 7. Contract: quality switching (`src/gfx/engine.js`)
+
+```js
+engine.setQuality(name);   // 'low' | 'medium' | 'high' | 'ultra'
+engine.resize(force);      // the canvas' CSS size changed (or the render scale did)
+```
+
+A quality switch is one atomic step, whichever path asks for it: the settings menu
+(`game.actions.setSetting('quality', ...)`) and the automatic downgrade in `game.frame` both go
+through `game._setSetting` → `engine.setQuality`. From the next frame on:
+
+- the cascades use the tier's `shadow` size and `shadowFar` distance; a size change disposes every
+  old shadow map before the next shadow pass;
+- the water's mirror follows `reflect` (off releases the target; on allocates it at half the
+  drawing buffer) and its size tracks any drawing-buffer change;
+- the post chain (volumetric shafts at half size, depth of field, the bloom ladder, LDR) is sized
+  to the new drawing buffer, with the old targets disposed — `Post.setSize` reallocates only what
+  changes size;
+- a switch that reallocates the drawing buffer repaints at once, so the cleared canvas is never
+  what the player sees (the automatic downgrade runs after the frame, when it would otherwise show
+  black until the next animation frame).
+
+Subsystems that own a render target of their own subscribe to `engine.hooks.quality`; the water
+does. `?dev=1` exposes `TP.stats()` (live shadow/post/water state) and `TP.engine` for reading a
+switch back. `tools/quality-check.mjs` checks all of the above on the real GPU.

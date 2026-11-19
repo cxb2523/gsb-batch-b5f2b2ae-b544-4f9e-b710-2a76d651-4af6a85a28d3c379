@@ -393,13 +393,18 @@ export class Game {
   _applyGrade() {
     this.engine.post.grade.grain = this.settings.grain ? this._grain : 0;
   }
+  /**
+   * The single entry point for every setting, manual (the menu, `byHand`) or automatic (the
+   * slow-frame downgrade). A quality change is applied through `engine.setQuality`, which moves
+   * shadows, water and post together — the two paths cannot drift apart.
+   */
   _setSetting(key, value, byHand) {
     const s = this.settings;
     if (!(key in DEFAULTS)) return;
+    if (key === 'quality' && QUALITY_ORDER.indexOf(value) < 0) return;
     s[key] = value;
     const e = this.engine;
     if (key === 'quality') {
-      if (QUALITY_ORDER.indexOf(value) < 0) return;
       if (byHand) s.autoQuality = false;
       if (e) e.setQuality(value);
     } else if (key === 'renderScale') {

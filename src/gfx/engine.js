@@ -68,34 +68,44 @@ export class Engine {
     this.want = { overcast: 0.6, fog: 0.4, tint: new THREE.Color(1, 1, 1), lift: 0, dim: 1, wind: 0.35 };
     this.brightness = 1;
     this.time = 0;
-    this.hooks = { before: [], reflect: null };
+    this.hooks = { before: [], reflect: null, quality: [] };
+    this.onQualityChange = null;
     this.stats = { fps: 0, ms: 0, calls: 0, tris: 0 };
     this._acc = 0;
     this._frames = 0;
+    this._presented = false;
+    this._inRender = false;
+    this._lastDt = 1 / 60;
     this.w = 2;
     this.h = 2;
     this.resize();
   }
 
+  /**
+   * Move to another tier in one step: shadow size and distance, MSAA, the volumetric and
+   * reflection switches, the drawing buffer and every post target all follow, and the GPU
+   * resources of the old tier are released. The manual path (the settings menu) and the
+   * automatic downgrade both come through here, so they converge on the same state.
+   *
+   * The order matters: the new sizes are applied first, then the parts of the world that own
+   * render targets of their own (the water's mirror) move to them, and only then is the picture
+   * drawn again — so the very first frame after the switch already uses the new tier throughout.
+   */
   setQuality(name) {
     if (!QUALITY[name]) return;
     const old = this.q;
+    const next = { ...QUALITY[name] };
     this.quality = name;
-    this.q = { ...QUALITY[name] };
-    this.post.volumetric = this.q.vol;
-    if (old.shadow !== this.q.shadow || old.shadowFar !== this.q.shadowFar) {
-      this.lighting.csm.maxFar = this.q.shadowFar;
-      for (const l of this.lighting.csm.lights) {
-        l.shadow.mapSize.set(this.q.shadow, this.q.shadow);
-        if (l.shadow.map) {
-          l.shadow.map.dispose();
-          l.shadow.map = null;
-        }
-      }
-      this.lighting.csm.shadowMapSize = this.q.shadow;
-      this.lighting.refresh();
-    }
-    this.resize(true);
+    this.q = next;
+    this.post.volumetric = next.vol;
+    this.lighting.setQuality({ shadowSize: next.shadow, shadowFar: next.shadowFar });
+    // drawing buffer (scale, pixel cap, MSAA) and the whole post chain, old targets released
+    const rebuilt = this._resizeCore(true);
+    // the rest of the world (water reflection target and switch) catches up in the same step
+    for (const fn of this.hooks.quality) fn(next, old);
+    if (this.onQualityChange) this.onQualityChange(name, old);
+    // the canvas was cleared by the resize: draw again instead of showing a black frame
+    if (rebuilt) this._repaint();
   }
 
   setFov(fov) {
@@ -104,8 +114,22 @@ export class Engine {
     this.lighting.refresh();
   }
 
-  /** Match the drawing buffer to the canvas' CSS size times the render scale. */
+  /**
+   * Match the drawing buffer to the canvas' CSS size times the render scale. Returns true when
+   * the buffer was reallocated. Everything that keeps render targets of its own and derives their
+   * size from the drawing buffer (the water's mirror) is told to catch up before the repaint, so
+   * no frame is ever drawn with two different tiers in it.
+   */
   resize(force = false) {
+    const rebuilt = this._resizeCore(force);
+    if (!rebuilt) return false;
+    for (const fn of this.hooks.quality) fn(this.q, this.q);
+    this._repaint();
+    return true;
+  }
+
+  /** Sequenced by the caller: work out the new sizes, rebuild the targets, dispose the old. */
+  _resizeCore(force = false) {
     const cw = Math.max(2, this.canvas.clientWidth || this.canvas.width),
       ch = Math.max(2, this.canvas.clientHeight || this.canvas.height);
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -114,29 +138,50 @@ export class Engine {
     if (this.q.pixels && px > this.q.pixels) s *= Math.sqrt(this.q.pixels / px);
     const w = Math.max(2, Math.round(cw * s)),
       h = Math.max(2, Math.round(ch * s));
-    if (!force && w === this.w && h === this.h) return;
+    const samples = this.q.msaa;
+    const sameSize = w === this.w && h === this.h;
+    if (!force && sameSize) return false;
+    if (sameSize && this.main && this.main.samples === samples) return false; // nothing to move
+    const moved = !sameSize;
     this.w = w;
     this.h = h;
-    this.renderer.setSize(w, h, false);
-    if (this.main) {
-      this.main.depthTexture.dispose();
-      this.main.dispose();
+    if (moved) this.renderer.setSize(w, h, false);
+    if (!this.main || moved || this.main.samples !== samples) {
+      this._disposeMain();
+      this.main = new THREE.WebGLRenderTarget(w, h, {
+        type: THREE.HalfFloatType,
+        format: THREE.RGBAFormat,
+        samples,
+        depthBuffer: true,
+        stencilBuffer: false,
+        depthTexture: new THREE.DepthTexture(w, h, THREE.UnsignedIntType),
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        generateMipmaps: false,
+      });
     }
-    this.main = new THREE.WebGLRenderTarget(w, h, {
-      type: THREE.HalfFloatType,
-      format: THREE.RGBAFormat,
-      samples: this.q.msaa,
-      depthBuffer: true,
-      stencilBuffer: false,
-      depthTexture: new THREE.DepthTexture(w, h, THREE.UnsignedIntType),
-      minFilter: THREE.LinearFilter,
-      magFilter: THREE.LinearFilter,
-      generateMipmaps: false,
-    });
     this.post.setSize(w, h);
     this.camera.aspect = cw / ch;
     this.camera.updateProjectionMatrix();
     this.lighting.refresh();
+    return true;
+  }
+
+  /**
+   * Draw once more into the freshly allocated targets. A drawing-buffer size change clears the
+   * canvas, and the automatic downgrade fires after the frame has been drawn; without this the
+   * player would see black until the next animation frame (or longer, when frames are stepped).
+   */
+  _repaint() {
+    if (this._presented && !this._inRender && this.main) this.render(this._lastDt);
+  }
+
+  /** Release the HDR target (and the depth texture three keeps with it). */
+  _disposeMain() {
+    const m = this.main;
+    if (!m) return;
+    m.dispose(); // three disposes the colour texture and the attached depth texture with it
+    this.main = null;
   }
 
   /** Advance sky, weather and lights. Call once per frame before render(). */
@@ -179,21 +224,30 @@ export class Engine {
   render(dt) {
     const r = this.renderer,
       cam = this.camera;
-    cam.updateMatrixWorld();
-    shared.uCamPos.value.copy(cam.position);
-    this.lighting.update(cam.position);
-    this.sky.updateEnvironment(this.scene);
-    for (const fn of this.hooks.before) fn(dt);
-    r.info.reset();
-    r.shadowMap.needsUpdate = true;
-    if (this.hooks.reflect && this.q.reflect) this.hooks.reflect(r, this.scene, cam);
-    r.setRenderTarget(this.main);
-    r.setClearColor(0x000000, 1);
-    r.clear(true, true, false);
-    r.render(this.scene, cam);
-    this.stats.calls = r.info.render.calls;
-    this.stats.tris = r.info.render.triangles;
-    this.post.render(this.main, cam, this.lighting, dt);
+    if (!this.main) return;
+    this._lastDt = dt;
+    this._inRender = true;
+    this._presented = true;
+    try {
+      cam.updateMatrixWorld();
+      shared.uCamPos.value.copy(cam.position);
+      this.lighting.update(cam.position);
+      this.sky.updateEnvironment(this.scene);
+      for (const fn of this.hooks.before) fn(dt);
+      r.info.reset();
+      r.shadowMap.needsUpdate = true;
+      if (this.hooks.reflect && this.q.reflect) this.hooks.reflect(r, this.scene, cam);
+      r.setRenderTarget(this.main);
+      r.setClearColor(0x000000, 1);
+      r.clear(true, true, false);
+      r.render(this.scene, cam);
+      this.stats.calls = r.info.render.calls;
+      this.stats.tris = r.info.render.triangles;
+      this.post.render(this.main, cam, this.lighting, dt);
+    } finally {
+      // a failure must not leave the guard set: the next resize would then never repaint
+      this._inRender = false;
+    }
     this._acc += dt;
     this._frames++;
     if (this._acc >= 0.5) {

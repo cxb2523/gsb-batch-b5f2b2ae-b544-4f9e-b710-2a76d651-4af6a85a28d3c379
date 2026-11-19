@@ -420,22 +420,37 @@ export class Post {
     this.mFxaa = pass(FXAA, { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } });
     this.mCopy = pass(COPY, { tSrc: { value: null } });
     this._m = new THREE.Matrix4();
+    // 1px opaque depth, bound to the shaft pass until real cascade maps exist
+    this._nullDepth = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    this._nullDepth.needsUpdate = true;
   }
 
+  /**
+   * Move every target to a new drawing-buffer size. Volumetric shafts are half resolution, the
+   * bloom chain halves again per level; depth of field, LDR and the canvas-sized passes stay at
+   * full size. Any target whose size actually changes is disposed of its old GPU memory and a
+   * fresh one takes its place, so a quality switch leaves nothing of the old tier behind and
+   * every live target is exactly the new size.
+   */
   setSize(w, h) {
     this.w = w;
     this.h = h;
     const hw = Math.max(2, w >> 1),
       hh = Math.max(2, h >> 1);
-    this.vol[0].setSize(hw, hh);
-    this.vol[1].setSize(hw, hh);
-    this.dofRT.setSize(w, h);
-    this.ldr.setSize(w, h);
+    const fit = (rt, nw, nh, type = THREE.HalfFloatType) => {
+      if (rt && rt.width === nw && rt.height === nh) return rt;
+      if (rt) rt.dispose(); // three deletes the framebuffer and its texture
+      return this.mk(nw, nh, type);
+    };
+    this.vol[0] = fit(this.vol[0], hw, hh);
+    this.vol[1] = fit(this.vol[1], hw, hh);
+    this.dofRT = fit(this.dofRT, w, h);
+    this.ldr = fit(this.ldr, w, h, THREE.UnsignedByteType);
     let dw = hw,
       dh = hh;
     for (let i = 0; i < this.levels; i++) {
-      this.down[i].setSize(dw, dh);
-      this.up[i].setSize(dw, dh);
+      this.down[i] = fit(this.down[i], dw, dh);
+      this.up[i] = fit(this.up[i], dw, dh);
       dw = Math.max(2, dw >> 1);
       dh = Math.max(2, dh >> 1);
     }
@@ -454,20 +469,24 @@ export class Post {
     const depth = main.depthTexture;
     let color = main.texture;
 
-    // light shafts
+    // light shafts. A null cascade map (the first frame after a tier change reallocated them)
+    // samples as unshadowed rather than reading a disposed texture, and the 1px stand-in keeps
+    // the bound unit coherent. The cascade range is kept current even when the pass is off, so a
+    // tier change never leaves a stale value behind in the uniforms.
+    const u = this.mVol.uniforms;
+    u.uShadowRange.value = shared.shadowFar.value - shared.cameraNear.value;
     const volOn = this.volumetric && shared.uFogSunColor.value.r + shared.uFogSunColor.value.g + shared.uFogSunColor.value.b > 0.002;
     if (volOn) {
-      const u = this.mVol.uniforms;
       u.tDepth.value = depth;
       this._m.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
       u.uInvViewProj.value.copy(this._m).invert();
       u.uViewMat.value.copy(camera.matrixWorldInverse);
       const L = lighting.csm.lights;
       for (let i = 0; i < 3; i++) {
-        u['uShadow' + i].value = L[i].shadow.map ? L[i].shadow.map.texture : null;
+        const map = L[i].shadow.map;
+        u['uShadow' + i].value = map ? map.texture : this._nullDepth;
         u['uShadowMat' + i].value.copy(L[i].shadow.matrix);
       }
-      u.uShadowRange.value = shared.shadowFar.value - shared.cameraNear.value;
       u.uFrame.value = this.frame % 8;
       this.draw(this.mVol, this.vol[0]);
       const b = this.mVolBlur.uniforms;

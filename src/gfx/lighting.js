@@ -53,6 +53,33 @@ export class Lighting {
     shared.shadowFar.value = Math.min(this.camera.far, this.csm.maxFar);
   }
 
+  /**
+   * Move the cascades to a new shadow distance and/or map size. A map size change reallocates
+   * every cascade's map: the old targets are disposed here, so nothing is left on the GPU, and
+   * the next shadow pass builds new ones at the size the CSM now believes it has.
+   */
+  setQuality({ shadowSize, shadowFar } = {}) {
+    const csm = this.csm;
+    let moved = false;
+    if (shadowFar !== undefined && shadowFar !== csm.maxFar) {
+      csm.maxFar = shadowFar;
+      moved = true;
+    }
+    if (shadowSize !== undefined && shadowSize !== csm.shadowMapSize) {
+      csm.shadowMapSize = shadowSize;
+      for (const l of csm.lights) {
+        l.shadow.mapSize.set(shadowSize, shadowSize);
+        if (l.shadow.map) {
+          l.shadow.map.dispose();
+          l.shadow.map = null;
+        }
+      }
+      moved = true;
+    }
+    if (moved) this.refresh();
+    return moved;
+  }
+
   /** dir points toward the light. */
   setSun(dir, color, intensity) {
     this.csm.lightDirection.set(-dir.x, -dir.y, -dir.z);
