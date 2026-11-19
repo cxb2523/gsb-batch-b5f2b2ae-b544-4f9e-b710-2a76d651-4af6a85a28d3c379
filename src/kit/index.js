@@ -27,9 +27,33 @@ const SCENE_BUDGET = 64 * 1024 * 1024;  // per scene-prefix soft limit (warned)
 let total = 0;
 const state = { inPass: false, scenePrefix: '' };
 
+// Retention: scenes whose bakes are in use by the frame being prepared/rendered.
+// A prefix may be retained by several holders at once (the current frame plus an
+// in-flight tile bake), so each retention carries a token with a ref count.
+const retained = new Map();              // prefix → token count
+const prefixOf = (key) => key.split(':')[0];
+const isRetained = (prefix) => (retained.get(prefix) || 0) > 0;
+
+/** Keep every bake of `prefix` alive (eviction and dropBakes skip it). */
+function retainBakes(prefix) {
+  if (!prefix) return;
+  retained.set(prefix, (retained.get(prefix) || 0) + 1);
+}
+
+/** Release one retention previously taken with retainBakes(). */
+function releaseBakes(prefix) {
+  const n = retained.get(prefix) || 0;
+  if (n <= 1) retained.delete(prefix);
+  else retained.set(prefix, n - 1);
+}
+
 function evict() {
-  while (total > BUDGET && bakes.size > 1) {
-    const [k, v] = bakes.entries().next().value;
+  // Never remove a bake whose scene is retained (it is being rendered this frame)
+  // or one used by an in-progress render pass (its texture may be bound now).
+  // LRU order still decides which *unretained* scene pays for an over-budget bake.
+  for (const [k, v] of bakes) {
+    if (total <= BUDGET) break;
+    if (isRetained(prefixOf(k)) || state.inPass) continue;
     bakes.delete(k);
     total -= v.bytes;
     try { v.fb.remove(); } catch {}
@@ -61,16 +85,22 @@ function bake(key, w, h, paint) {
   const bytes = w * h * 4;
   bakes.set(key, { fb, bytes });
   total += bytes;
-  const prefix = key.split(':')[0];
+  const prefix = prefixOf(key);
   let sum = 0;
-  for (const [k, v] of bakes) if (k.split(':')[0] === prefix) sum += v.bytes;
+  for (const [k, v] of bakes) if (prefixOf(k) === prefix) sum += v.bytes;
   if (sum > SCENE_BUDGET) console.warn(`[kit] bakes for "${prefix}" use ${(sum / 1048576).toFixed(0)} MB (> 64 MB budget)`);
   evict();
   return fb;
 }
 
-/** Drop all bakes whose key starts with prefix + ':' (scene unload). */
+/**
+ * Drop all bakes whose key starts with prefix + ':' (scene unload).
+ * Bakes of a retained prefix (a scene being rendered/prepared this frame, or an
+ * in-progress render pass) are kept: the caller must try again once the frame is
+ * done. A bake that survives here is rebuilt on demand when its scene re-inits.
+ */
 function dropBakes(prefix) {
+  if (!prefix || isRetained(prefix) || state.inPass) return;
   for (const [k, v] of [...bakes]) {
     if (k.startsWith(prefix + ':')) { bakes.delete(k); total -= v.bytes; try { v.fb.remove(); } catch {} }
   }
@@ -98,12 +128,19 @@ export const K = {
   ...M,
   brush, flush, seed, stats, resetStats, resetBrush,
   bake, dropBakes, layer,
+  retainBakes, releaseBakes,
   text: drawText, textSprite,
   paper, frames,
   rig: { ...rigMod, drawPen, parts: rigParts, BIRD_FILL_ROLES },
   TL,
   _state: state,
   bakeBytes: () => total,
+  bakeCount: () => bakes.size,
+  bakeRetained: (prefix) => isRetained(prefix),
+  hasBakePrefix: (prefix) => {
+    for (const k of bakes.keys()) if (prefixOf(k) === prefix) return true;
+    return false;
+  },
 };
 
 export default K;

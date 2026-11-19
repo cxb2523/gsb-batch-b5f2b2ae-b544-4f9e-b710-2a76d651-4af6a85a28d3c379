@@ -20,9 +20,10 @@ export class Film {
   constructor(scenes) {
     this.scenes = scenes;
     this.inited = new Set();
-    this.tiles = new Map();          // j → { 1024: fb, 512: fb, 256: fb }
+    this.tiles = new Map();          // j → { 1024: fb, 512: fb, 256: fb, 128: fb }
     this.errors = new Map();
     this.debug = false;
+    this.retained = [];              // bake prefixes held for the frame in flight
   }
 
   setup() {
@@ -34,6 +35,27 @@ export class Film {
   leftOf(j) { return j < 0 ? TL.introLeft() : TL.panelLeft(j); }
   widthOf(j) { return j < 0 ? TL.INTRO_W : TL.PANEL; }
   localTime(j, t) { return j < 0 ? t : t - TL.sceneStart(j); }
+
+  /** Bake-cache prefix (kit key namespace) owned by panel j. */
+  prefixOf(j) { return this.sceneOf(j).id; }
+
+  /** Retain the bake caches of every panel in `panels` for the current frame. */
+  retainPanels(panels) {
+    const seen = new Set();
+    for (const j of panels) {
+      const p = this.prefixOf(j);
+      if (seen.has(p)) continue;
+      seen.add(p);
+      K.retainBakes(p);
+      this.retained.push(p);
+    }
+  }
+
+  /** Release the retentions taken by the matching retainPanels() call. */
+  releaseRetained() {
+    for (const p of this.retained) K.releaseBakes(p);
+    this.retained.length = 0;
+  }
 
   camera(t) {
     if (t >= TL.OUTRO_START) return OUT.outroCamera(t, storyCamera(t, this.scenes));
@@ -87,15 +109,20 @@ export class Film {
     this.inited.add(j);
   }
 
-  unloadFar(center) {
+  /**
+   * Unload panels far from `center`. A panel is only dropped when it is both
+   * index-far AND absent from `keep` (the panels this frame is about to render,
+   * including overlay neighbours), so an in-use bake cache can never be released
+   * mid-frame. dropBakes() additionally refuses retained prefixes. A re-entered
+   * panel re-runs initScene() and rebuilds its bakes on the next prepare().
+   */
+  unloadFar(center, keep = new Set()) {
     for (const j of [...this.inited]) {
-      if (j < 0) continue;
-      if (Math.abs(j - center) > 3) {
-        const sc = this.sceneOf(j);
-        try { sc.dispose?.(K); } catch {}
-        K.dropBakes(sc.id);
-        this.inited.delete(j);
-      }
+      if (j < 0 || keep.has(j) || Math.abs(j - center) <= 3) continue;
+      const sc = this.sceneOf(j);
+      try { sc.dispose?.(K); } catch {}
+      K.dropBakes(sc.id);
+      this.inited.delete(j);
     }
   }
 
@@ -110,17 +137,49 @@ export class Film {
     return out;
   }
 
+  /**
+   * Every panel whose bake cache the frame at time t may touch: visible panels,
+   * the look-ahead panel initialised ahead of the camera, the active scene's
+   * overlay neighbours, and (in the outro) every scene panel. The press seat has
+   * no bakes and is rendered live, so it needs no retention.
+   */
+  framePanels(t, vis) {
+    const keep = new Set(vis);
+    for (const j of vis) if (j + 1 < TL.N_SCENES) keep.add(j + 1);
+    const ci = TL.sceneIndexAt(Math.min(t, TL.OUTRO_START - 0.01));
+    for (const j of [ci - 1, ci, ci + 1]) if (j >= 0 && j < TL.N_SCENES) keep.add(j);
+    // Outro: retain every scene panel's cache. The press seat (OUT.PRESS = N_SCENES)
+    // is drawn live by renderPress() and owns no bake prefix, so it is not included.
+    if (t >= TL.OUTRO_START - 1) for (let j = 0; j < TL.N_SCENES; j++) keep.add(j);
+    return keep;
+  }
+
   /** Async work that must happen before drawing frame t (scene init, outro tiles). */
   async prepare(t, opts = {}) {
-    if (opts.solo != null) { await this.initScene(opts.solo); return; }
+    this.releaseRetained();              // clear any frame whose draw() never ran
+    if (opts.solo != null) {
+      this.retainPanels([opts.solo]);
+      await this.initScene(opts.solo);
+      return;
+    }
     const cam = this.camera(Math.min(t, TL.OUTRO_START));
     const vis = this.visibleStory(cam);
     const want = new Set(vis);
     for (const j of vis) { if (j + 1 < TL.N_SCENES) want.add(j + 1); }
-    for (const j of want) await this.initScene(j);
-    const ci = TL.sceneIndexAt(Math.min(t, TL.OUTRO_START - 0.01));
-    if (t < TL.OUTRO_START - 1) this.unloadFar(Math.max(0, ci));
-    if (t >= TL.OUTRO_START - 0.5) await this.ensureTiles();
+    // Retain every cache this frame may use BEFORE any init/unload work: baking a
+    // new scene can trigger LRU eviction, which must never touch an in-use layer.
+    const keep = this.framePanels(t, vis);
+    this.retainPanels(keep);
+    try {
+      for (const j of want) await this.initScene(j);
+      const ci = TL.sceneIndexAt(Math.min(t, TL.OUTRO_START - 0.01));
+      if (t < TL.OUTRO_START - 1) this.unloadFar(Math.max(0, ci), keep);
+      if (t >= TL.OUTRO_START - 0.5) await this.ensureTiles();
+    } catch (e) {
+      // A failed prepare never reaches draw(); release its retentions immediately.
+      this.releaseRetained();
+      throw e;
+    }
   }
 
   // ------------------------------------------------------------ rendering
@@ -194,15 +253,20 @@ export class Film {
   /** Main entry: paint frame t (inside p5 draw, origin at canvas centre). */
   draw(t, opts = {}) {
     window.__lastError = null;
-    push();
-    translate(-W / 2, -H / 2);
-    background(WALL);
-    if (opts.solo != null) this.drawSolo(opts.solo, opts.u ?? 3, opts);
-    else if (t >= TL.OUTRO_START) this.drawOutro(t);
-    else this.drawStory(t);
-    if (this.debug || opts.debug) this.drawDebug(t, opts);
-    if (opts.label) this.drawLabel(opts.label, opts.labelSize || 40);
-    pop();
+    try {
+      push();
+      translate(-W / 2, -H / 2);
+      background(WALL);
+      if (opts.solo != null) this.drawSolo(opts.solo, opts.u ?? 3, opts);
+      else if (t >= TL.OUTRO_START) this.drawOutro(t);
+      else this.drawStory(t);
+      if (this.debug || opts.debug) this.drawDebug(t, opts);
+      if (opts.label) this.drawLabel(opts.label, opts.labelSize || 40);
+      pop();
+    } finally {
+      // The frame is painted: its bake caches may be evicted/unloaded again.
+      this.releaseRetained();
+    }
   }
 
   /** Burned-in label (contact sheets): dark box, top-left. */
@@ -329,10 +393,20 @@ export class Film {
   // ------------------------------------------------------------ outro tiles
   async ensureTiles() {
     initPress(K);
-    for (let j = 0; j < TL.N_SCENES; j++) {
-      if (this.tiles.has(j)) continue;
-      await this.initScene(j);
-      this.bakeTile(j);
+    // Every scene is baked into a tile in turn: retain their bakes for the whole
+    // pass so an over-budget LRU eviction cannot remove a layer another scene — or
+    // the frame itself — still needs. The retention is released in finally().
+    const held = [];
+    for (let j = 0; j < TL.N_SCENES; j++) held.push(this.scenes[j].id);
+    held.forEach((id) => K.retainBakes(id));
+    try {
+      for (let j = 0; j < TL.N_SCENES; j++) {
+        if (this.tiles.has(j)) continue;
+        await this.initScene(j);
+        this.bakeTile(j);
+      }
+    } finally {
+      held.forEach((id) => K.releaseBakes(id));
     }
   }
 

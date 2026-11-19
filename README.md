@@ -100,6 +100,7 @@ node tools/render.mjs --draft && node tools/encode.mjs --draft   # 之后在预�
 | `node tools/encode.mjs [--draft]` | 帧 + 音频 → `out/*.mp4` |
 | `node tools/cover.mjs [--aspect 4:3]` | 生成封面 → `out/pelican-test_cover.png` 或 `out/pelican-test_cover_4x3.png` |
 | `node tools/check.mjs` | 检查禁用 API、骑行与接缝约定、过框节拍表，以及确定性（同一帧两次渲染逐像素一致） |
+| `node tools/lifecycle.mjs [--quick]` | 场景生命周期与烘焙缓存同步：相邻切换不空白、远处跳走再跳回可逐像素重建、渲染中的缓存不被卸载/淘汰、长播放内存不无限增长 |
 
 完整成片：`node tools/render.mjs && node tools/audio.mjs && node tools/encode.mjs` → `out/pelican-test_1080p60.mp4`。
 
