@@ -51,6 +51,17 @@ const userSocketMap = new Map();
 // same game, and addPlayerToLobby/startGame don't add spectators to the
 // player list.
 //
+// Membership invariants (enforced by every room-changing handler below):
+//   1. A user belongs to at most one room at a time, in at most one role —
+//      player or spectator, never both.
+//   2. Any path that establishes a new room membership (join_game, spectate,
+//      lobby:join) first calls removeSpectatorFromAllGames() so a stale
+//      spectator registration in a previously visited room can never
+//      survive the switch.
+//   3. A spectator leaving or disconnecting only touches the spectator map —
+//      player connection flags and turn-skip timers are never modified,
+//      because the user isn't a player.
+//
 // Map<gameId, Map<userId, { username, joinedAt, socketId }>>
 const gameSpectators = new Map();
 
@@ -68,12 +79,23 @@ function addSpectator(gameId, userId, username, socketId) {
   spectators.set(userId, { username, joinedAt: Date.now(), socketId });
 }
 
-function removeSpectator(gameId, userId) {
-  const spectators = gameSpectators.get(gameId);
-  if (!spectators) return false;
-  const removed = spectators.delete(userId);
-  if (spectators.size === 0) gameSpectators.delete(gameId);
-  return removed;
+/**
+ * Remove the user's spectator registration from EVERY game, returning the
+ * game ids that previously held one.  This is the single enforcement point
+ * for the "one room, one role" invariant: whenever a user establishes a new
+ * membership anywhere, any spectator entry left behind by an earlier join
+ * (same socket or a previous, already-gone socket) is purged before the new
+ * membership takes effect.  A spectator entry in a different room would
+ * otherwise make reconnecting players look like spectators and leave
+ * ghost watchers on rooms the user left.
+ */
+function removeSpectatorFromAllGames(userId) {
+  const purgedFrom = [];
+  for (const [gameId, spectators] of gameSpectators) {
+    if (spectators.delete(userId)) purgedFrom.push(gameId);
+    if (spectators.size === 0) gameSpectators.delete(gameId);
+  }
+  return purgedFrom;
 }
 
 /**
@@ -224,6 +246,16 @@ function clearTurnTimeout(key) {
   }
 }
 
+/**
+ * Whether a disconnect auto-skip timer is currently armed for the player.
+ * The timer map is module-private; integration tests use this to prove a
+ * player's timer is scheduled on disconnect and cancelled on reconnect
+ * without waiting the full TURN_TIMEOUT_MS.
+ */
+function hasPendingTurnTimeout(gameId, userId) {
+  return turnTimers.has(`${gameId}:${userId}`);
+}
+
 // Stored io reference so REST routes can trigger lobby broadcasts
 let _io = null;
 
@@ -271,7 +303,16 @@ function registerHandlers(io) {
         return ack?.({ error: 'Game not found' });
       }
 
-      // Leave any previously joined game room
+      // Establishing a PLAYER membership makes the user a player again —
+      // purge any spectator registration they still hold in ANY room (a
+      // stale entry from a previous socket would otherwise keep treating
+      // the reconnecting player as a watch-only spectator and ghost them
+      // on the old room's spectator list).
+      removeSpectatorFromAllGames(currentUser.sub);
+
+      // Leave any previously joined game room (player or spectator).  The
+      // spectator sweep above already handled the map entry; here the socket
+      // just leaves the Socket.io room so it physically belongs to one room.
       const prevGame = socketGameMap.get(socket.id);
       if (prevGame && prevGame !== gameId) {
         socket.leave(prevGame);
@@ -348,12 +389,13 @@ function registerHandlers(io) {
         return ack?.({ error: 'You are already a player in this game' });
       }
 
-      // Leave any previously joined game room (spectator or player).
+      // Leave any previously joined game room (spectator or player).  The
+      // global spectator sweep removes the user from every other room's
+      // spectator list — including registrations owned by an earlier socket
+      // — so switching rooms can never leave a ghost watcher behind.
       const prevGame = socketGameMap.get(socket.id);
+      removeSpectatorFromAllGames(currentUser.sub);
       if (prevGame && prevGame !== gameId) {
-        if (isSpectator(prevGame, currentUser.sub)) {
-          removeSpectator(prevGame, currentUser.sub);
-        }
         socket.leave(prevGame);
         socketGameMap.delete(socket.id);
       }
@@ -406,7 +448,10 @@ function registerHandlers(io) {
       if (!gameId) return;
       if (!isSpectator(gameId, currentUser.sub)) return;
 
-      removeSpectator(gameId, currentUser.sub);
+      // Sweep globally rather than only this game: the invariant says a
+      // spectator holds at most one registration, so this removes the one
+      // entry while also healing any entry that drifted onto another room.
+      removeSpectatorFromAllGames(currentUser.sub);
       socket.leave(gameId);
       socketGameMap.delete(socket.id);
 
@@ -423,6 +468,19 @@ function registerHandlers(io) {
 
       socket.leave(gameId);
       socketGameMap.delete(socket.id);
+
+      // Spectator leave: ONLY the watcher list is touched.  Spectators are
+      // not players, so setPlayerConnected / turn timers must not be invoked
+      // (the user could simultaneously be a connected player elsewhere, and
+      // even in this room the player flags describe a different roster).
+      // The leave is silent — no spectator:left event, no PLAYER_DISCONNECTED
+      // game:update; the next state push carries the refreshed spectator list.
+      if (isSpectator(gameId, currentUser.sub)) {
+        removeSpectatorFromAllGames(currentUser.sub);
+        broadcastLobbyUpdate();
+        return;
+      }
+
       clearTurnTimeout(`${gameId}:${currentUser.sub}`);
       await gameManager.setPlayerConnected(gameId, currentUser.sub, false);
 
@@ -454,9 +512,11 @@ function registerHandlers(io) {
 
         // Spectator disconnects clean up silently (no spectator:left
         // broadcast, no setPlayerConnected — they aren't players).  The
-        // lobby refresh keeps spectator counts in sync.
+        // global sweep removes every spectator registration the user holds
+        // (normally just this room) and never touches player connection
+        // flags or turn timers, which belong to the player roster only.
         if (isSpectator(gameId, currentUser.sub)) {
-          removeSpectator(gameId, currentUser.sub);
+          removeSpectatorFromAllGames(currentUser.sub);
           broadcastLobbyUpdate();
           return;
         }
@@ -510,6 +570,13 @@ function registerHandlers(io) {
         username: currentUser.username,
       });
       if (result.error) return ack?.({ error: result.error });
+
+      // Becoming a lobby player supersedes any spectator membership — purge
+      // stale watcher registrations (in this or another room) before joining
+      // so the one-room / one-role invariant holds on this path too.
+      removeSpectatorFromAllGames(currentUser.sub);
+      const prevGame = socketGameMap.get(socket.id);
+      if (prevGame && prevGame !== gameId) socket.leave(prevGame);
 
       socket.join(gameId);
       socketGameMap.set(socket.id, gameId);
@@ -623,4 +690,7 @@ module.exports = {
   broadcastLobbyUpdate,
   // Exported for REST routes that want to render a spectator count.
   spectatorsForWire,
+  // Exported for integration tests asserting disconnect auto-skip timer
+  // scheduling/cancellation without waiting the full timeout.
+  hasPendingTurnTimeout,
 };
