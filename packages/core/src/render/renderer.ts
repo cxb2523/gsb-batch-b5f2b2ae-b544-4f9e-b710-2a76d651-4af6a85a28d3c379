@@ -24,7 +24,12 @@ import {
 } from '../ink'
 import type { NodeTypeDef, RenderEnv } from '../node-types'
 import { coalesceEraseRects, inflateRect, nodeAABB } from '../spatial'
-import { type CanvasStore, type InteractionState, isMoving as isMovingState } from '../store'
+import {
+  type CanvasStore,
+  type InteractionMode,
+  type InteractionState,
+  isMoving as isMovingState,
+} from '../store'
 import {
   DEFAULT_HIGHLIGHT_COLOR,
   DEFAULT_TEXT_COLOR,
@@ -207,6 +212,19 @@ export type Renderer = {
    */
   getLastDrawPath(): StaticDrawPath
   /**
+   * Zoom the offscreen scene cache was last rasterized at. Test
+   * instrumentation — after a `full` draw path this must equal the live
+   * camera's zoom; a stale pre-gesture (scaled-blit) cache reports the
+   * older zoom it still holds pixels for.
+   */
+  getCacheZoom(): number
+  /**
+   * True when the scene cache content is currently flagged stale, i.e. the
+   * next static paint must re-rasterize rather than present / scale-blit.
+   * Test instrumentation for invalidation (`'change'`, zoom end, resize).
+   */
+  isCacheStale(): boolean
+  /**
    * World rects the most recent eraser-preview patch cleared+repainted — one
    * per coalesced group of pending erasures, `[]` when not erasing. Test
    * instrumentation: lets browser tests assert scattered erasures stay
@@ -260,6 +278,13 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
   // anything but a pure pan). Pan leaves it false so `paintStatic` can
   // present by blitting alone. `renderFullCache` clears it.
   let cacheStale = true
+  // Viewport the cache was most recently rasterized/extended for, in
+  // device pixels. `sizeSurface` reallocates the backing stores on resize
+  // and the cache surface is lazily reallocated by `ensureCacheSurface`,
+  // but a stale raster must never be scale-blitted across a size change.
+  // The length-based check below is the belt to `setSize`'s suspenders.
+  let cacheViewportW = 0
+  let cacheViewportH = 0
 
   /**
    * Lazily allocates / resizes the offscreen cache to `viewport + 2·margin`
@@ -287,8 +312,42 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       cacheSurface.dpr = dpr
       cacheSurface.canvas.width = Math.max(1, Math.round(cssW * dpr))
       cacheSurface.canvas.height = Math.max(1, Math.round(cssH * dpr))
+      // Resizing the backing store wipes its pixels. Any reuse tier must
+      // now re-rasterize rather than blit an empty/garbage surface — the
+      // same guarantee `setSize` gives, enforced at the point the
+      // allocation actually happens so no future resize path can miss it.
+      cacheStale = true
+      cacheViewportW = 0
+      cacheViewportH = 0
     }
     return cacheSurface
+  }
+
+  /**
+   * True when the cache surface and the viewport it was rasterized for
+   * still match the live static surface. A viewport/dpr change between
+   * the last rasterization and this paint means the cache holds pixels of
+   * the wrong size — the scaled-blit source rect would be computed against
+   * a stale frame, so every reuse tier (present / extend / scaled /
+   * scaled-extend) must fall through to a full re-render.
+   */
+  const cacheMatchesViewport = (): boolean => {
+    if (!cacheSurface) return false
+    const dpr = staticSurface.dpr
+    const expectedW = Math.max(
+      1,
+      Math.round((staticSurface.cssWidth + 2 * SCENE_CACHE_MARGIN_PX) * dpr),
+    )
+    const expectedH = Math.max(
+      1,
+      Math.round((staticSurface.cssHeight + 2 * SCENE_CACHE_MARGIN_PX) * dpr),
+    )
+    return (
+      cacheSurface.canvas.width === expectedW &&
+      cacheSurface.canvas.height === expectedH &&
+      cacheViewportW === staticSurface.canvas.width &&
+      cacheViewportH === staticSurface.canvas.height
+    )
   }
 
   // Sorted-by-(z, id) caches of ALL scene nodes / edges. Rebuilt
@@ -679,6 +738,8 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     cacheCamX = camera.x
     cacheCamY = camera.y
     cacheCamZ = camera.z
+    cacheViewportW = staticSurface.canvas.width
+    cacheViewportH = staticSurface.canvas.height
     cacheStale = false
   }
 
@@ -1044,7 +1105,12 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
    */
   const paintStatic = (): void => {
     const camera = store.getCamera()
-    if (!cacheStale && camera.z === cacheCamZ) {
+    // A cache that no longer matches the live viewport size (a `setSize`
+    // between rasterization and this paint) can serve no reuse tier — the
+    // blit / strip / scaled-blit math would all read a stale frame. Fall
+    // straight through to a full re-render at the current size.
+    const sizeMatches = cacheMatchesViewport()
+    if (!cacheStale && sizeMatches && camera.z === cacheCamZ) {
       if (viewportFitsInCache(camera)) {
         presentStatic(camera)
         paintEraserPreviewPatch(camera)
@@ -1066,6 +1132,7 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     // center pixels are still usable via scale-blit.
     if (
       !cacheStale &&
+      sizeMatches &&
       camera.z !== cacheCamZ &&
       store.getInteractionState().mode === 'zooming' &&
       cacheSurface
@@ -1591,6 +1658,15 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     loop.requestFrame()
   }
   let eraserPreviewKey = ''
+  // Mode the interaction atom last reported, so the `zooming -> anything`
+  // edge can be detected: the per-mode branches below can't see where the
+  // previous event came from, and only 'idle'/pan/drag modes stale the
+  // cache on their own. `zooming` itself deliberately does NOT stale (see
+  // the branch below), so leaving it must be handled explicitly or the
+  // scaled-blit raster is never superseded. Edge-triggered on purpose —
+  // re-staling per interaction event would re-rasterize on every pointer
+  // move (pointer-info writes fire at input rate). See ADR R-RENDER-001.
+  let prevInteractionMode: InteractionMode = store.getInteractionState().mode
   const onInteractionChange = (state: InteractionState): void => {
     interactiveDirty = true
     // Mode transitions that affect what the static surface paints:
@@ -1606,6 +1682,8 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
         : ''
     const eraserPreviewChanged = nextEraserPreviewKey !== eraserPreviewKey
     eraserPreviewKey = nextEraserPreviewKey
+    const prevMode = prevInteractionMode
+    prevInteractionMode = state.mode
     if (
       state.mode === 'dragging' ||
       state.mode === 'resizing' ||
@@ -1629,6 +1707,20 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
       // the scaled-blit was added to avoid. Just request a frame; the
       // paint dispatch decides whether tier 2.5 fires or tier 3.
       staticDirty = true
+    }
+    if (prevMode === 'zooming' && state.mode !== 'zooming') {
+      // Leaving 'zooming' for ANY mode ends the zoom gesture, including
+      // the ones no branch above touches (marqueeing, editing,
+      // creating-*, reconnecting-edge, erasing-ink without a draft
+      // change, ...). Without this the static layer would keep
+      // presenting the mid-gesture scaled-blit raster: the cache stays
+      // at the pre-gesture zoom (blurry), and a later pan-extend would
+      // bake that blur into a strip-seamed bitmap. Re-rasterize at the
+      // live zoom on the next paint so the cache zoom converges to the
+      // camera zoom. Independent of the branches above so it can't be
+      // shadowed by one of them.
+      staticDirty = true
+      cacheStale = true
     }
     loop.requestFrame()
   }
@@ -1700,6 +1792,8 @@ export const createRenderer = (opts: RendererOptions): Renderer => {
     stats: () => loop.stats(),
     lastDrawCount: () => lastDrawn,
     getLastDrawPath: () => lastDrawPath,
+    getCacheZoom: () => cacheCamZ,
+    isCacheStale: () => cacheStale,
     getLastEraserPatchRects: () => [...lastEraserPatchRects],
     getOverlaySet: () => [...overlaySet],
     getAssetCache: () => assetCache,

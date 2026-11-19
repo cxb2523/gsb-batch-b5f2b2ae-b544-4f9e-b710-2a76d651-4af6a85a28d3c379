@@ -27,6 +27,13 @@ regenerate every element on a zoom. See `docs/rendering-scene-cache.md` for the 
   drives the *interactive* surface and, at most, `staticDirty` (a re-present, not a re-raster).
 - LOD mode transitions (motion fast-path, rough auto-disable) may selectively stale the cache **at the
   transition boundary only** (`onInteractionChange`), never per frame.
+- The cache is camera-independent *during* a gesture, not forever: the boundary where a zoom gesture
+  ends (any transition out of `zooming`, not only to `idle`) stales it, so the cache zoom converges to
+  the live camera zoom on the next paint. That is one re-raster per gesture, not per frame — it does
+  not weaken the rule above. A viewport/DPR change (`setSize`) stales it for the same reason: a
+  rasterized frame of the old size cannot serve a blit of the new one. `paintStatic` enforces the
+  size half structurally via `cacheMatchesViewport()`, so no future resize path can reintroduce a
+  stale-size scaled blit.
 
 ## Rejected alternatives
 - **Invalidate the cache on `'camera'`** — simplest to reason about, but re-rasterizes the whole scene
@@ -41,3 +48,13 @@ awk '/const onCameraChange/{f=1} f&&/^  }/{print;exit} f' \
   packages/core/src/render/renderer.ts | grep -q cacheStale && echo VIOLATION || echo OK
 ```
 Expected: `OK`.
+
+Zoom-settle convergence (the gesture *boundary*, not the frame) is covered by
+`packages/core/tests/scene-cache-convergence.browser.test.ts`:
+- `zooming -> zoom -> idle` (and `-> marqueeing`) must end on `full` with `getCacheZoom() === camera.z`;
+- `setSize` mid-`zooming` must not scale-blit the old-size raster (next paint is `full`);
+- a `'change'` committed mid-`zooming` must leave `isCacheStale()` true so the next zoom tick reuses
+  the rebuilt raster, not the pre-edit one.
+
+The three instrumentation accessors (`getLastDrawPath`, `getCacheZoom`, `isCacheStale`) are public on
+`Renderer` for exactly this.

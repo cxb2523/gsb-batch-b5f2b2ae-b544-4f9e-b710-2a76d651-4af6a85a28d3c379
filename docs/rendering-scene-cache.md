@@ -33,10 +33,19 @@ if (interactiveDirty) { paintInteractive(); interactiveDirty = false }
 | `'change'` (document edit) | **yes** | yes | re-rasterize the scene (+ invalidate the sorted-id cache) |
 | `'camera'` (pan / zoom) | **no** | yes | **re-blit only — never re-rasterize** |
 | `'selection'` / most interaction | no | interactive only | chrome moves, scene untouched |
+| entering `zooming` | no | yes | keep the existing raster for the scaled-blit tiers |
+| **leaving `zooming`** (any target mode) | **yes** | yes | re-rasterize at the live zoom — the settle boundary |
+| `setSize` / DPR change | **yes** | yes | cache geometry no longer matches; re-rasterize |
 | some mode transitions | selective | selective | LOD boundaries (motion fast-path, rough gate) |
 
 The load-bearing line is the **no** on `camera`: **pan and zoom never re-rasterize the scene.** They
 only change how the existing bitmap is presented. This invariant is ADR `R-RENDER-001`.
+The counterparts are the two **yes** lines that make the cache *converge*: `'change'` and every
+transition out of `zooming` (not just to `idle` — marquee/editing/create all end the gesture too)
+re-rasterize, and `paintStatic` additionally refuses every reuse tier when the cache surface no
+longer matches the live viewport size (`cacheMatchesViewport`). Without that pairing the scaled-blit
+tiers could leave the cache stuck at a pre-gesture zoom — a blurry frame, or a strip-seamed one once
+a later pan extends it.
 
 ## 3. The offscreen cache is bigger than the screen
 
@@ -61,6 +70,13 @@ new view:
 Tiers 2.5 / 2.7 are gated on `mode === 'zooming'` (`:964`). So a zoom gesture is **N cheap
 scaled-blits during the drag, then exactly one `full` re-render when it settles** (crisp), not N full
 repaints.
+
+Every reuse tier (1, 2, 2.5, 2.7) additionally requires `cacheMatchesViewport()` — the cache surface
+and the viewport it was rasterized for must still equal the live static surface's size (a `setSize`
+or DPR change mid-gesture fails it). A size mismatch means the blit / strip / scaled-blit source rect
+would be computed against a stale frame, so `paintStatic` falls straight through to tier 3 and
+re-rasterizes at the new size. The ratio caps above are unchanged by this gate: it can only *reject*
+additional reuse, never widen it.
 
 ## 5. The cache math
 
