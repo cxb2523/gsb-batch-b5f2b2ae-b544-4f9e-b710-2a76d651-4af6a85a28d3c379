@@ -6,6 +6,8 @@ import {pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {DEFAULTS} from '../dist/physics.js';
 import {pads,groundHeight} from '../dist/terrain.js';
+import {Vector3,Quaternion} from '../dist/vendor/three.module.js';
+import {launchRound} from '../dist/weapons.js';
 test('main menu, view switching and crash reset work without opening a crash menu',async t=>{
 const base=new URL('../dist/',import.meta.url);
 t.mock.method(globalThis,'setTimeout',()=>0);
@@ -67,6 +69,9 @@ elements.get('fly').click();await Promise.resolve();assert.equal(elements.get('s
 elements.get('scene').emit('mousedown',{button:0});renderFrame(performance.now()+220);assert.ok(weapons.shots>0,'LMB fires after mouse capture');
 document.emit('mouseup',{button:0});assert.equal(controls.frame(1/60).fire,false);
 elements.get('gun-zero').value='50';elements.get('gun-zero').emit('change');assert.equal(weapons.zero,50);
+const mounts=module.aircraft.group.getObjectByName('Twin miniguns'),level={position:new Vector3(),orientation:new Quaternion(),velocity:new Vector3()};
+for(let side=0;side<2;side++)assert.ok(new Vector3(0,0,-1).applyQuaternion(mounts.children[side].quaternion).distanceTo(launchRound(level,side,50).velocity.normalize())<1e-9,'gun barrels follow the selected zero');
+assert.equal(saved.gunZero,50,'zero persists through the single weapons state');
 key('KeyC');renderFrame(performance.now()+250);key('KeyC');renderFrame(performance.now()+300);
 const step=heli.step;heli.step=()=>heli.crash('Hard landing',{sink:9,speed:30,tilt:75});
 renderFrame(performance.now()+400);heli.step=step;
