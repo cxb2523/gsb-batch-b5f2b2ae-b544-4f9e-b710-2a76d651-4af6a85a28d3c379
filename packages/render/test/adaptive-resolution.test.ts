@@ -88,3 +88,54 @@ test('bogus samples (<=0ms or >2000ms) are ignored, not counted', () => {
   assert.equal(gov.resolution, 2);
   assert.equal(gov.downgrades, 0);
 });
+
+// reset() exists for discontinuous context changes -- a new match
+// starting, or the tab coming back from the background (a sub-2000ms
+// background gap is not bogus-filtered and would otherwise sit in the
+// window as one giant frame). The new context must be measured fresh:
+// last match's jank must not pre-emptively downshift this one's opening.
+test('reset() discards the sampling window and restores the device initial resolution', () => {
+  const gov = new AdaptiveResolutionGovernor(2);
+  feed(gov, 60, 120);
+  assert.equal(gov.resolution, 1.5);
+  gov.reset();
+  assert.equal(gov.resolution, 2);
+  // The old slow frames are gone: a whole fresh window must fill before
+  // any downgrade -- 119 slow frames alone are not enough.
+  feed(gov, 60, 119);
+  assert.equal(gov.resolution, 2);
+  gov.sample(60);
+  assert.equal(gov.resolution, 1.5);
+});
+
+test('reset() restarts the downgrade/upgrade counters and cooldowns', () => {
+  const gov = new AdaptiveResolutionGovernor(2);
+  feed(gov, 60, 120);
+  feed(gov, 60, 180);
+  feed(gov, 60, 120);
+  assert.equal(gov.resolution, 1);
+  assert.equal(gov.downgrades, 2);
+  gov.reset();
+  assert.equal(gov.downgrades, 0);
+  assert.equal(gov.upgrades, 0);
+  // A fresh governor would downgrade here -- and so does the reset one.
+  feed(gov, 60, 120);
+  assert.equal(gov.resolution, 1.5);
+  assert.equal(gov.downgrades, 1);
+});
+
+test('an upgrade re-arms the downgrade cooldown, so the governor cannot seesaw', () => {
+  const gov = new AdaptiveResolutionGovernor(2);
+  feed(gov, 60, 120); // -> 1.5
+  feed(gov, 10, 240); // -> 2 (upgrade)
+  assert.equal(gov.resolution, 2);
+  // Frames go slow again right after the upgrade: without the re-armed
+  // cooldown this would downshift back within 120 frames of the upgrade,
+  // which is exactly the down-up-down flicker this guards against.
+  feed(gov, 60, 120);
+  assert.equal(gov.resolution, 2);
+  assert.equal(gov.downgrades, 1);
+  // Once the cooldown has fully elapsed the governor may still react.
+  feed(gov, 60, 180);
+  assert.equal(gov.resolution, 1.5);
+});

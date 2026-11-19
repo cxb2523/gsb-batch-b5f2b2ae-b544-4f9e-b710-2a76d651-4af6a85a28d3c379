@@ -34,13 +34,27 @@ export class SpectatorController {
   private followIndex: number | null = null;
   private readonly camera: SmoothedCamera;
   private active = false;
+  private readonly adapter: MatchAdapter;
+  private readonly localIndex: number;
+  /** Set whenever the camera's subject changes discontinuously -- entering
+   * spectate, TAB-cycling to a different survivor, toggling overview, or
+   * the tab coming back from the background. The next update() snaps
+   * straight onto the new target instead of gliding over from the old
+   * one (a long, wrong slide across the arena). */
+  private snapNextFrame = false;
 
+  // Not a TS parameter-property constructor: this class is imported
+  // directly (not through vite) by plain `node --test` regression tests,
+  // and Node's built-in type-stripping loader does not support parameter
+  // properties (same constraint net-match.ts documents).
   constructor(
-    private readonly adapter: MatchAdapter,
+    adapter: MatchAdapter,
     /** The local slot spectating (excluded from follow/cycle targets). */
-    private readonly localIndex: number,
+    localIndex: number,
     initialView: CameraView,
   ) {
+    this.adapter = adapter;
+    this.localIndex = localIndex;
     this.camera = new SmoothedCamera(initialView);
   }
 
@@ -62,6 +76,11 @@ export class SpectatorController {
     this.active = true;
     this.mode = 'follow';
     this.followIndex = this.pickInitialTarget();
+    // The camera was constructed at match start (its initial view is a
+    // static arena-centre guess) and has been idle all match -- gliding
+    // from that stale spot to the first follow target would be a long,
+    // wrong slide. Land on the target instead.
+    this.snapNextFrame = true;
   }
 
   deactivate(): void {
@@ -74,6 +93,9 @@ export class SpectatorController {
     if (this.mode === 'follow' && this.followIndex === null) {
       this.followIndex = this.pickInitialTarget();
     }
+    // Overview <-> follow is a cut between two different framings, not a
+    // move within one.
+    this.snapNextFrame = true;
   }
 
   /** Cycle to the next surviving fighter (wraps around). */
@@ -86,7 +108,19 @@ export class SpectatorController {
     this.mode = 'follow';
     const currentPos = this.followIndex === null ? -1 : survivors.indexOf(this.followIndex);
     const next = survivors[(currentPos + 1 + survivors.length) % survivors.length];
+    const changed = next !== this.followIndex;
     this.followIndex = next ?? null;
+    // TAB retargets whom we watch: the camera (and, on a narrow screen,
+    // the min-fighter-size follow framing derived from it) must land on
+    // the new survivor, not ease over from the previous one.
+    if (changed) this.snapNextFrame = true;
+  }
+
+  /** External "the world changed discontinuously" signal (e.g. the tab
+   * came back from the background): snap to the current target on the
+   * next update instead of easing across the gap. */
+  snapToNextTarget(): void {
+    this.snapNextFrame = true;
   }
 
   private pickInitialTarget(): number | null {
@@ -124,6 +158,11 @@ export class SpectatorController {
         OVERVIEW_MAX_SCALE,
         OVERVIEW_PADDING,
       );
+    }
+    if (this.snapNextFrame) {
+      this.snapNextFrame = false;
+      this.camera.snapTo(target);
+      return this.camera.current;
     }
     return this.camera.update(target, input.dtSeconds);
   }

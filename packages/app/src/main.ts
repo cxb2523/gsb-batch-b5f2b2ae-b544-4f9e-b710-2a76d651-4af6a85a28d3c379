@@ -493,6 +493,14 @@ function refreshAttractMode(): void {
 }
 
 document.addEventListener('visibilitychange', refreshAttractMode);
+// Back from the background mid-spectate: the spectator camera must
+// re-land on whoever it is following, not glide over from wherever the
+// fight was when the tab was hidden. (The renderer's own camera/resolution
+// state resets itself -- see Renderer.resetViewState; this covers the
+// app-layer SmoothedCamera that drives cameraOverride while spectating.)
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) spectator?.snapToNextTarget();
+});
 window.addEventListener('resize', refreshAttractMode);
 // Fires once at boot too, since startScreenActive starts true and the
 // start screen is the first thing shown.

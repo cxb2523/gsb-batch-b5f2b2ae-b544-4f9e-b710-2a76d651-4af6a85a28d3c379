@@ -46,13 +46,16 @@ export function computeOverviewCamera(
  * rate, so it's equally smooth on a stuttering machine or a 240Hz one. */
 export class SmoothedCamera {
   current: CameraView;
+  /** Higher = snappier. ~6-10 feels like a deliberate glide; much
+   *  higher starts to feel like a snap again. */
+  private readonly rate: number;
 
-  constructor(
-    initial: CameraView,
-    /** Higher = snappier. ~6-10 feels like a deliberate glide; much
-     * higher starts to feel like a snap again. */
-    private readonly rate = 7,
-  ) {
+  // Not a TS parameter-property constructor: packages/app's spectator
+  // controller tests import this module directly under node --test's
+  // type-stripping loader, which does not support parameter properties
+  // (same constraint net-match.ts documents).
+  constructor(initial: CameraView, rate = 7) {
+    this.rate = rate;
     this.current = { ...initial };
   }
 

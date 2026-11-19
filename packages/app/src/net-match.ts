@@ -26,6 +26,7 @@ import {
   Renderer,
   arenaDataToStageBounds,
   computeEdgeDangerFrac,
+  resetCameraSmoothing,
   type RenderFighterState,
   type RenderItemState,
   type RenderHazardState,
@@ -748,6 +749,13 @@ export class NetMatch {
       case 'eliminated':
         if (msg.slot === this.mySlot && !this.spectating) {
           this.spectating = true;
+          // Play -> spectate is a camera-subject cut: the next frame's
+          // localPlayerIndex is undefined, so the camera (and on a narrow
+          // screen the min-fighter-size follow framing) recentres from
+          // "my fighter" to the living centroid. Drop the remembered
+          // smoothed position so it lands there directly instead of
+          // gliding over from where our own fighter just died.
+          resetCameraSmoothing();
           // Once we're eliminated there is nothing left for *this* seat to
           // resume into -- the match plays on for everyone else, but our
           // token now only reclaims a spectator view of a match we're about
@@ -857,6 +865,12 @@ export class NetMatch {
     // The server always builds matches via createMatchSim too (see
     // server/src/*), so this.localSim.getArena() is the arena actually
     // being played on -- feed the renderer that, not a default guess.
+    // A new match on this connection (first match, a requeue, or a resume
+    // into a fresh one): the camera must land on the new fight, not glide
+    // in from the last match's final frame, and the resolution governor
+    // must not carry the previous match's frame-time history forward.
+    // Harmless when the renderer is already fresh (init reset it too).
+    this.renderer.resetViewState();
     this.renderer.setStageBounds(arenaDataToStageBounds(this.localSim.getArena()));
     this.localTick = 0;
     this.inputHistory.clear();

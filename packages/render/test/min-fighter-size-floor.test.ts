@@ -9,6 +9,7 @@ import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  computeCamera,
   computeRawCamera,
   computeFitEveryoneCamera,
   resetCameraSmoothing,
@@ -121,8 +122,48 @@ test('spectating (no local player) centres the min-size follow on the living cen
   }
 });
 
-// Source-level pin (no jsdom in this repo): the floor is useless if the
-// renderer never tells the camera which fighter is ours -- it would then
+// Play -> spectate is a camera-subject cut: the min-size follow stops
+// tracking the (now dead) local fighter and starts tracking the living
+// centroid. The app layer resets camera smoothing on that transition
+// (net-match.ts's 'eliminated' handler); these two tests pin both halves
+// of that contract -- that a reset lands the follow on the new subject
+// immediately, and that without it the camera would glide over from the
+// old one.
+test('play -> spectate with a smoothing reset lands the min-size follow on the living centroid at once', () => {
+  const c = cfg({ viewWidth: 390, viewHeight: 844 });
+  const positions = spreadPositions(20, -300, 300);
+  const local = positions[0]!;
+  // A few frames as a live player: the floor follows the local fighter.
+  computeCamera(positions, c, 16.7, local);
+  const playing = computeCamera(positions, c, 16.7, local);
+  assert.ok(playing.minSizeFollow);
+  assert.ok(Math.abs(playing.centerX - local.x) < 1e-6);
+  // Eliminated: the very next frame must sit exactly on the raw spectate
+  // target, not somewhere between it and where the local fighter died.
+  resetCameraSmoothing();
+  const raw = computeRawCamera(positions, c, null);
+  const spectating = computeCamera(positions, c, 16.7, null);
+  assert.ok(spectating.minSizeFollow);
+  assert.equal(spectating.centerX, raw.centerX);
+  assert.equal(spectating.centerY, raw.centerY);
+  assert.equal(spectating.scale, raw.scale);
+});
+
+test('play -> spectate without a smoothing reset would glide from the dead fighter (why the reset exists)', () => {
+  const c = cfg({ viewWidth: 390, viewHeight: 844 });
+  const positions = spreadPositions(20, -300, 300);
+  const local = positions[0]!;
+  computeCamera(positions, c, 16.7, local);
+  const raw = computeRawCamera(positions, c, null);
+  const notReset = computeCamera(positions, c, 16.7, null);
+  assert.ok(notReset.minSizeFollow);
+  assert.ok(
+    Math.abs(notReset.centerX - raw.centerX) > 1,
+    'without a reset the first spectate frame still sits near the old subject',
+  );
+});
+
+// Source-level pin (no jsdom in this repo): the floor is useless if the// renderer never tells the camera which fighter is ours -- it would then
 // centre on the living centroid even for a player who is alive, i.e.
 // follow nobody. 2026-09-19: the first implementation did exactly that.
 test('the renderer passes the local living fighter to computeCamera', () => {

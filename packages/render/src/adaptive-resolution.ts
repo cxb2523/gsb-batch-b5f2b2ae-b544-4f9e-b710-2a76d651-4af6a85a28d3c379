@@ -50,7 +50,12 @@ export class AdaptiveResolutionGovernor {
   private stepIndex: number;
   private readonly recent: number[] = [];
   private samplesSeen = 0;
-  private lastDowngradeAtSample = -Infinity;
+  /** Sample index of the most recent step in EITHER direction. The
+   *  downgrade cooldown keys off this (not just off downgrades) so a
+   *  downgrade cannot follow an upgrade within the cooldown window --
+   *  without that, a device hovering near the p95 thresholds could
+   *  seesaw down-up-down within a few seconds. */
+  private lastStepChangeAtSample = -Infinity;
   downgrades = 0;
   upgrades = 0;
 
@@ -65,6 +70,23 @@ export class AdaptiveResolutionGovernor {
 
   get resolution(): ResolutionStep {
     return STEPS[this.stepIndex]!;
+  }
+
+  /** Forget every sampled frame and every decision derived from them,
+   *  returning to the device's initial (already clamped) resolution --
+   *  exactly the state a freshly constructed governor would be in. Call
+   *  this when the measurement context changes discontinuously: a new
+   *  match starting (last match's jank must not pre-emptively downshift
+   *  the new one's opening seconds) or the tab coming back to the
+   *  foreground (a background gap shorter than the 2000ms bogus-sample
+   *  cutoff would otherwise sit in the window as one giant "frame"). */
+  reset(): void {
+    this.recent.length = 0;
+    this.samplesSeen = 0;
+    this.lastStepChangeAtSample = -Infinity;
+    this.stepIndex = this.maxStepIndex;
+    this.downgrades = 0;
+    this.upgrades = 0;
   }
 
   /** Feed one frame duration in milliseconds. Returns the resolution the
@@ -88,13 +110,13 @@ export class AdaptiveResolutionGovernor {
 
   private maybeDowngrade(): void {
     if (this.stepIndex >= STEPS.length - 1) return; // already at floor
-    if (this.samplesSeen - this.lastDowngradeAtSample < DOWNGRADE_COOLDOWN_SAMPLES) return;
+    if (this.samplesSeen - this.lastStepChangeAtSample < DOWNGRADE_COOLDOWN_SAMPLES) return;
     const window = this.recent.slice(-DOWNGRADE_WINDOW);
     if (window.length < DOWNGRADE_WINDOW) return;
     if (p95(window) > DOWNGRADE_P95_THRESHOLD_MS) {
       this.stepIndex++;
       this.downgrades++;
-      this.lastDowngradeAtSample = this.samplesSeen;
+      this.lastStepChangeAtSample = this.samplesSeen;
     }
   }
 
@@ -105,6 +127,9 @@ export class AdaptiveResolutionGovernor {
     if (p95(this.recent) < UPGRADE_P95_THRESHOLD_MS) {
       this.stepIndex--;
       this.upgrades++;
+      // A step change in either direction re-arms the downgrade cooldown:
+      // the governor must never seesaw down-up-down within seconds.
+      this.lastStepChangeAtSample = this.samplesSeen;
     }
   }
 }

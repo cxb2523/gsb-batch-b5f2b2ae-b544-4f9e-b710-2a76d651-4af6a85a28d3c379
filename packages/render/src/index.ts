@@ -460,6 +460,13 @@ export class Renderer {
   // caller disables it via disableAdaptiveResolution().
   private adaptiveResolution: AdaptiveResolutionGovernor | null = null;
   private adaptiveResolutionDisabled = false;
+  /** Tab came back to the foreground: both kinds of cross-context residue
+   *  this renderer carries -- the module-level camera smoothing and the
+   *  governor's frame-time window -- describe a world that no longer
+   *  exists, so the next frame must start fresh (see resetViewState). */
+  private readonly visibilityResetHandler = (): void => {
+    if (typeof document !== 'undefined' && !document.hidden) this.resetViewState();
+  };
   // Slow-frame attribution counters (2026-09-15, see
   // docs/MEASUREMENT.md "Slow-frame attribution"): recomputed every
   // render() call from data already being iterated for sprite placement
@@ -634,8 +641,15 @@ export class Renderer {
     };
     syncToParent();
     // A fresh renderer means a fresh match: the camera must start framed
-    // on the action, not glide in from wherever the previous one left off.
-    resetCameraSmoothing();
+    // on the action, not glide in from wherever the previous one left off,
+    // and the resolution governor must not carry last match's jank forward.
+    this.resetViewState();
+    // Same reset when the tab comes back from the background: the camera
+    // should re-land on its subject, and a sub-2000ms background gap must
+    // not sit in the governor's window as one giant "frame".
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.visibilityResetHandler);
+    }
     if (typeof ResizeObserver !== 'undefined') {
       this.parentResizeObserver = new ResizeObserver(() => {
         syncToParent();
@@ -1064,6 +1078,37 @@ export class Renderer {
     };
   }
 
+  /** Forget every cross-context residue this renderer accumulates over
+   *  time, so the next frame behaves like the first frame of a fresh
+   *  session:
+   *
+   *  - Camera smoothing (module-level in camera.ts, shared across
+   *    renderers) drops its remembered position -- the next computeCamera
+   *    lands exactly on its target instead of easing in from wherever a
+   *    previous match / the pre-background world left it.
+   *  - The adaptive-resolution governor discards its frame-time window
+   *    and returns to the device's initial resolution, so a new match
+   *    (or a just-foregrounded tab) is not pre-emptively downshifted by
+   *    jank that belonged to a previous match / a background gap.
+   *  - The frame-delta clock restarts, so the gap itself is never
+   *    measured as one giant frame by either of the above.
+   *
+   *  Called from init() (every new match constructs a new renderer) and
+   *  from the visibilitychange handler; also safe to call directly from
+   *  the app layer on any other discontinuous transition. */
+  resetViewState(): void {
+    resetCameraSmoothing();
+    this.lastFrameTimeMs = null;
+    if (!this.adaptiveResolution) return;
+    this.adaptiveResolution.reset();
+    const wanted = this.adaptiveResolution.resolution;
+    if (this.app.renderer && this.desiredResolution !== wanted) {
+      this.desiredResolution = wanted;
+      // Same resize()-carries-resolution rule as the render() path below.
+      this.app.renderer.resize(this.app.renderer.width, this.app.renderer.height, wanted);
+    }
+  }
+
   /** Dev/QA-only: force a render resolution and keep it through resizes,
    *  so the adaptive path can be verified on a machine whose own DPR is 1. */
   setDevResolution(value: number): void {
@@ -1478,6 +1523,9 @@ export class Renderer {
   destroy(): void {
     this.parentResizeObserver?.disconnect();
     this.parentResizeObserver = null;
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.visibilityResetHandler);
+    }
     // Hand the WebGL context back to the browser *now*, explicitly.
     //
     // A browser grants a page only a handful of live contexts (roughly a
