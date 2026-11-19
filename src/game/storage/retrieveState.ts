@@ -28,6 +28,9 @@ export const retrieveState = (currentState: RootState): TResult<RootState, strin
       isAnyTokenMoving: false,
       isGameEnded: false,
       playerFinishOrder: [],
+      // A hydrated game always starts waiting for the current player to
+      // roll, so no turn is active until they do.
+      isTurnActive: false,
     },
     session: {
       ...data.session,

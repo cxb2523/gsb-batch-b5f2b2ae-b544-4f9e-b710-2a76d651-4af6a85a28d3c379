@@ -84,7 +84,7 @@ export default function Game({ initData }: Props) {
       .players.players.find((p) => p.colour === currentPlayerColour);
     if (currentPlayer?.isBot) {
       rollDice(currentPlayerColour)
-        .then((diceNumber) => executeBotMove(currentPlayerColour, diceNumber))
+        .then((rollResult) => executeBotMove(currentPlayerColour, rollResult))
         .catch(logError('Game.botTurnEffect'));
     }
   }, [currentPlayerColour, executeBotMove, rollDice, store, players.length]);

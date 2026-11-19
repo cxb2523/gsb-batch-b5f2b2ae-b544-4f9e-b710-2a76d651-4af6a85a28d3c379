@@ -1,7 +1,7 @@
 import type { RootState } from '../../state/store';
 import type { TSequenceCalculationResult, TToken } from '../../types';
 import playersReducer, {
-  changeTurn,
+  endTurn,
   deactivateAllTokens,
   lockToken,
   markTokenAsReachedHome,
@@ -12,7 +12,7 @@ import { areCoordsEqual } from '../coords/logic';
 import { defaultTokenAlignmentData } from '../tokens/alignment';
 import { TOKEN_SAFE_COORDINATES } from '../tokens/constants';
 import { tokenPaths } from '../tokens/paths';
-import { getNextPlayer } from '../players/logic';
+import { shouldEndTurn } from '../turn/turnResolution';
 
 export const calculateSequence = (
   state: RootState,
@@ -86,14 +86,18 @@ export const calculateSequence = (
   const hasPlayerWon = updatedPlayer
     ? updatedPlayer.tokens.every((t) => t.hasTokenReachedHome)
     : false;
-  if (hasPlayerWon || (captureData.length === 0 && !hasTokenReachedHome && diceNumber !== 6)) {
-    const nextPlayer = getNextPlayer(
-      nextState.players.playerSequence,
-      nextState.players.playerFinishOrder,
-      nextState.players.currentPlayerColour
-    );
-    if (nextPlayer) nextState.players = playersReducer(nextState.players, changeTurn(nextPlayer));
-  }
+
+  // The persisted snapshot converges on the exact same turn-ending
+  // predicate used by the live hooks, so a save never records a turn state
+  // that diverges from what the UI will converge on.
+  const turnEnds = shouldEndTurn({
+    diceNumber,
+    hasPlayerWon,
+    isCaptured: captureData.length !== 0,
+    hasTokenReachedHome,
+    numberOfConsecutiveSix: updatedPlayer?.numberOfConsecutiveSix ?? 0,
+  });
+  if (turnEnds) nextState.players = playersReducer(nextState.players, endTurn());
 
   return { nextState, moveSequence, captureData };
 };

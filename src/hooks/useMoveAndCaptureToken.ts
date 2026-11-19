@@ -1,9 +1,5 @@
 import { useDispatch, useStore } from 'react-redux';
-import {
-  deactivateAllTokens,
-  getToken,
-  markTokenAsReachedHome,
-} from '../state/slices/playersSlice';
+import { deactivateAllTokens, getToken, markTokenAsReachedHome } from '../state/slices/playersSlice';
 import { type TToken } from '../types';
 import { useCaptureTokenInSameCoord } from './useCaptureTokenInSameCoord';
 import { useMoveTokenForward } from './useMoveTokenForward';
@@ -13,9 +9,18 @@ import { useCallback } from 'react';
 import { calculateSequence } from '../game/movement/calculateSequence';
 import { type RootState } from '../state/store';
 import { ERRORS } from '../utils/errors';
-import { saveState } from '../game/storage/saveState';
 import { deleteSaveFromStorage } from '../game/storage/storage';
 
+/**
+ * Computes the next state via the pure calculateSequence, plays the move /
+ * capture animations against the live store, then reports the move outcome.
+ *
+ * Deliberately does NOT save: the snapshot may already contain a turn
+ * transition (endTurn) that the live store only converges on once the
+ * caller runs the shared changeTurn logic. Persisting here would write an
+ * intermediate, half-converged state. Callers save only after the turn
+ * state has been finalised (reroll settled or changeTurn dispatched).
+ */
 export function useMoveAndCaptureToken() {
   const moveToken = useMoveTokenForward();
   const captureToken = useCaptureTokenInSameCoord();
@@ -35,8 +40,6 @@ export function useMoveAndCaptureToken() {
       );
       if (nextState.players.isGameEnded) {
         deleteSaveFromStorage();
-      } else {
-        saveState(nextState);
       }
       await moveToken(moveSequence, token);
       if (moveSequence.length === 0) return null;

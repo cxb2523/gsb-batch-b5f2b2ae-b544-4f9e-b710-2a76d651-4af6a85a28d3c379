@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import playersReducer, {
   activateTokens,
   updateTokenCoordinatesAndDirection,
-  changeTurn,
   clearPlayersState,
   deactivateAllTokens,
+  endTurn,
   getPlayer,
   getToken,
   incrementNumberOfConsecutiveSix,
@@ -16,6 +16,7 @@ import playersReducer, {
   setIsAnyTokenMoving,
   setPlayerSequence,
   setTokenAlignmentData,
+  setTurnActive,
   unlockToken,
 } from '../../src/state/slices/playersSlice';
 import { DUMMY_PLAYERS } from '../fixtures/players.dummy';
@@ -58,13 +59,89 @@ describe('Test players slice reducers', () => {
       expect(token.direction).toEqual('forward');
     });
   });
-  describe('changeTurn', () => {
-    it('should update currentPlayerColour to the provided colour', () => {
-      const initData = structuredClone(initialState);
-      initData.playerSequence = playerSequences.four;
-      initData.currentPlayerColour = initData.playerSequence[0];
-      const newState = playersReducer(initData, changeTurn('green'));
-      expect(newState.currentPlayerColour).toBe('green');
+  describe('endTurn', () => {
+    const buildTurnState = () => {
+      const state = structuredClone(initialState);
+      state.players = structuredClone(DUMMY_PLAYERS);
+      state.playerSequence = playerSequences.four;
+      state.currentPlayerColour = 'blue';
+      state.isTurnActive = true;
+      return state;
+    };
+
+    it('hands the turn to the next player in the sequence', () => {
+      const newState = playersReducer(buildTurnState(), endTurn());
+      expect(newState.currentPlayerColour).toBe('red');
+    });
+
+    it('deactivates every token of the outgoing player so they stop being clickable', () => {
+      const state = buildTurnState();
+      getPlayer(state, 'blue').tokens.forEach((t) => (t.isActive = true));
+
+      const newState = playersReducer(state, endTurn());
+
+      expect(getPlayer(newState, 'blue').tokens.every((t) => !t.isActive)).toBe(true);
+      expect(getPlayer(newState, 'red').tokens.every((t) => !t.isActive)).toBe(true);
+    });
+
+    it('resets the consecutive-six counter of the outgoing player', () => {
+      const state = buildTurnState();
+      getPlayer(state, 'blue').numberOfConsecutiveSix = 3;
+
+      const newState = playersReducer(state, endTurn());
+
+      expect(getPlayer(newState, 'blue').numberOfConsecutiveSix).toBe(0);
+    });
+
+    it('flips isTurnActive to false, disabling dice and tokens until the next roll', () => {
+      const newState = playersReducer(buildTurnState(), endTurn());
+      expect(newState.isTurnActive).toBe(false);
+    });
+
+    it('performs deactivation, counter reset, player switch and turn flag atomically in one dispatch', () => {
+      const state = buildTurnState();
+      getPlayer(state, 'blue').tokens[0].isActive = true;
+      getPlayer(state, 'blue').numberOfConsecutiveSix = 2;
+
+      const newState = playersReducer(state, endTurn());
+
+      expect(newState.currentPlayerColour).toBe('red');
+      expect(newState.isTurnActive).toBe(false);
+      expect(getPlayer(newState, 'blue').numberOfConsecutiveSix).toBe(0);
+      expect(getPlayer(newState, 'blue').tokens.every((t) => !t.isActive)).toBe(true);
+    });
+
+    it('wraps around to the first player after the last one in the sequence', () => {
+      const state = buildTurnState();
+      state.playerSequence = playerSequences.two;
+      state.currentPlayerColour = 'green';
+
+      const newState = playersReducer(state, endTurn());
+
+      expect(newState.currentPlayerColour).toBe('blue');
+    });
+
+    it('is a no-op while no players are registered', () => {
+      const state = structuredClone(initialState);
+      const newState = playersReducer(state, endTurn());
+      expect(newState).toEqual(initialState);
+    });
+
+    it('is a no-op once the game has ended', () => {
+      const state = buildTurnState();
+      state.isGameEnded = true;
+      const newState = playersReducer(state, endTurn());
+      expect(newState.currentPlayerColour).toBe('blue');
+      expect(newState.isTurnActive).toBe(true);
+    });
+  });
+
+  describe('setTurnActive', () => {
+    it('sets the isTurnActive flag to the provided value', () => {
+      const state = structuredClone(initialState);
+      state.players = structuredClone(DUMMY_PLAYERS);
+      expect(playersReducer(state, setTurnActive(true)).isTurnActive).toBe(true);
+      expect(playersReducer(state, setTurnActive(false)).isTurnActive).toBe(false);
     });
   });
   describe('setPlayerSequence', () => {
@@ -78,6 +155,18 @@ describe('Test players slice reducers', () => {
     );
   });
   describe('activateTokens', () => {
+    it('flips isTurnActive to true so dice display and token clickability refresh together', () => {
+      const initState = structuredClone(initialState);
+      initState.players = structuredClone(DUMMY_PLAYERS);
+      initState.isTurnActive = false;
+
+      const newState = playersReducer(
+        initState,
+        activateTokens({ all: false, colour: 'blue', diceNumber: 5 })
+      );
+
+      expect(newState.isTurnActive).toBe(true);
+    });
     it("should activate all eligible tokens when 'all' is true and movement is possible", () => {
       const initState = structuredClone(initialState);
       initState.players = structuredClone(DUMMY_PLAYERS);

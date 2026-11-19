@@ -5,11 +5,12 @@ import { saveState } from '../game/storage/saveState';
 import { type RootState } from '../state/store';
 import { useStore } from 'react-redux';
 import { useMoveAndCaptureToken } from './useMoveAndCaptureToken';
-import { useRollDice } from './useRollDice';
+import { useRollDice, type TRollDiceResult } from './useRollDice';
 import { useUnlockAndAlignTokens } from './useUnlockAndAlignTokens';
 import { useChangeTurn } from './useChangeTurn';
 import { sleep } from '../utils/sleep';
 import { logError } from '../utils/logError';
+import { shouldEndTurn } from '../game/turn/turnResolution';
 
 export const useExecuteBotMove = () => {
   const store = useStore<RootState>();
@@ -19,9 +20,16 @@ export const useExecuteBotMove = () => {
   const changeTurnFn = useChangeTurn();
 
   return useCallback(
-    async function executeBotMove(colour: TPlayerColour, diceNumber: number) {
+    async function executeBotMove(
+      colour: TPlayerColour,
+      rollResult: TRollDiceResult
+    ): Promise<void> {
+      const { diceNumber, isConsecutiveSixLimitReached } = rollResult;
       try {
-        if (diceNumber === -1) return changeTurnFn();
+        // Triple six: no piece may move, hand the turn over through the
+        // same converged entry as every other turn-ending path.
+        if (isConsecutiveSixLimitReached) return changeTurnFn();
+
         const allTokens = store.getState().players.players.flatMap((p) => p.tokens);
         const bestToken = selectBestTokenForBot(colour, diceNumber, allTokens);
         if (!bestToken) return changeTurnFn();
@@ -30,22 +38,27 @@ export const useExecuteBotMove = () => {
           unlockAndAlignTokens({ colour, id: bestToken.id });
           saveState(store.getState());
           await sleep(500);
+          // Six grants a bonus roll; the counter for the run lives in the
+          // roll hook, never reset here.
           return executeBotMove(colour, await rollDice(colour));
         }
         const moveData = await moveAndCapture(bestToken, diceNumber);
         if (!moveData) return changeTurnFn();
         const { hasTokenReachedHome, isCaptured, hasPlayerWon } = moveData;
-        if (hasPlayerWon) {
-          await sleep(500);
-          return changeTurnFn();
-        }
-        if (!isCaptured && !hasTokenReachedHome && diceNumber !== 6) {
-          await sleep(500);
-          return changeTurnFn();
-        } else {
-          await sleep(500);
-          return executeBotMove(colour, await rollDice(colour));
-        }
+
+        const freshPlayer = store.getState().players.players.find((p) => p.colour === colour)!;
+        const turnEnds = shouldEndTurn({
+          diceNumber,
+          hasPlayerWon,
+          isCaptured,
+          hasTokenReachedHome,
+          numberOfConsecutiveSix: freshPlayer.numberOfConsecutiveSix,
+        });
+
+        await sleep(500);
+        if (turnEnds) return changeTurnFn();
+        // Bonus roll after a six / capture / home arrival.
+        return executeBotMove(colour, await rollDice(colour));
       } catch (e) {
         logError('useExecuteBotMove')(e);
         changeTurnFn();

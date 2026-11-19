@@ -3,6 +3,7 @@ import {
   deactivateAllTokens,
   getToken,
   setIsAnyTokenMoving,
+  setTurnActive,
 } from '../../../../state/slices/playersSlice';
 import { type TPlayer, type TPlayerColour, type TTokenClickData } from '../../../../types';
 import { type TToken } from '../../../../types';
@@ -26,6 +27,7 @@ import { saveState } from '../../../../game/storage/saveState';
 import { animate, motion, useMotionValue } from 'framer-motion';
 import { tokenMotionRegistry } from '../../../../game/movement/tokenMotionRegistry';
 import { logError } from '../../../../utils/logError';
+import { shouldEndTurn } from '../../../../game/turn/turnResolution';
 
 type Props = {
   colour: TPlayerColour;
@@ -36,7 +38,9 @@ type Props = {
 export default function Token({ colour, id, tokenClickData }: Props) {
   const dispatch = useDispatch<AppDispatch>();
   const { tokenHeight, tokenWidth } = useSelector((state: RootState) => state.board);
-  const { players } = useSelector((state: RootState) => state.players);
+  const { players, isTurnActive, currentPlayerColour } = useSelector(
+    (state: RootState) => state.players
+  );
   const tokenClickDataRef = useRef(tokenClickData);
   const [isCurrentlyFocused, setIsCurrentlyFocused] = useState(false);
   const tokenElRef = useRef<HTMLButtonElement | null>(null);
@@ -44,7 +48,7 @@ export default function Token({ colour, id, tokenClickData }: Props) {
   const unlockAndAlignTokens = useUnlockAndAlignTokens();
   const store = useStore<RootState>();
   const isExternallyAnimating = useRef(false);
-  const { numberOfConsecutiveSix, tokens: playerTokens } = useMemo(
+  const { tokens: playerTokens } = useMemo(
     () => players.find((v) => v.colour === colour),
     [players, colour]
   ) as TPlayer;
@@ -112,6 +116,10 @@ export default function Token({ colour, id, tokenClickData }: Props) {
       });
       entry.setExternallyAnimating(false);
       dispatch(setIsAnyTokenMoving(false));
+      // The unlock consumed this roll. Resetting the turn flag re-enables the
+      // dice so the player can take their bonus six-roll, while every token
+      // stays deactivated until that next roll activates them again.
+      dispatch(setTurnActive(false));
       saveState(store.getState());
     } catch (e) {
       logError('Token.unlock')(e);
@@ -120,29 +128,46 @@ export default function Token({ colour, id, tokenClickData }: Props) {
 
   const executeTokenMove = useCallback(async () => {
     try {
-      if (!isActive || diceNumber === -1 || !diceNumber || isLocked) return;
+      // The turn-status field is the single gate: once the turn has ended
+      // (triple six, no legal move, normal pass-over), no token of the
+      // outgoing player is clickable even before React re-renders.
+      if (!isTurnActive || currentPlayerColour !== colour) return;
+      if (!isActive || !diceNumber || isLocked) return;
       const moveData = await moveAndCapture(token, diceNumber);
       if (!moveData) return;
       const { hasTokenReachedHome, isCaptured, hasPlayerWon } = moveData;
-      if (hasPlayerWon) return changeTurnFn();
-      if (
-        (diceNumber !== 6 || numberOfConsecutiveSix >= 3) &&
-        !isCaptured &&
-        !hasTokenReachedHome
-      ) {
+
+      // Read the freshest player state (the move just dispatched updates).
+      const freshPlayer = store
+        .getState()
+        .players.players.find((p) => p.colour === token.colour)!;
+      const turnEnds = shouldEndTurn({
+        diceNumber,
+        hasPlayerWon,
+        isCaptured,
+        hasTokenReachedHome,
+        numberOfConsecutiveSix: freshPlayer.numberOfConsecutiveSix,
+      });
+
+      if (turnEnds) {
+        // changeTurn deactivates tokens, resets the six counter, switches
+        // currentPlayerColour and saves the final state in one convergence.
         return changeTurnFn();
       }
+      // Bonus roll retained (six / capture / home): save the settled state.
       saveState(store.getState());
     } catch (e) {
       logError('Token.executeTokenMove')(e);
     }
   }, [
     changeTurnFn,
+    currentPlayerColour,
+    colour,
     diceNumber,
     isActive,
     isLocked,
+    isTurnActive,
     moveAndCapture,
-    numberOfConsecutiveSix,
     store,
     token,
   ]);
@@ -159,7 +184,7 @@ export default function Token({ colour, id, tokenClickData }: Props) {
 
   const handleTokenClick: React.MouseEventHandler<HTMLButtonElement> = (e) => {
     if (e.detail === 0) e.stopPropagation();
-    if (isLocked && isActive && diceNumber !== -1 && diceNumber) void unlock();
+    if (isTurnActive && isLocked && isActive && diceNumber) void unlock();
     tokenElRef.current?.blur?.();
     void executeTokenMove();
   };

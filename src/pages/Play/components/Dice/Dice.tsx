@@ -19,7 +19,6 @@ import { useHandlePostDiceRoll } from '../../../../hooks/useHandlePostDiceRoll';
 import { useChangeTurn } from '../../../../hooks/useChangeTurn';
 import { logError } from '../../../../utils/logError';
 import { saveState } from '../../../../game/storage/saveState';
-
 type Props = {
   colour: TPlayerColour;
   playerName: string;
@@ -50,6 +49,7 @@ export default function Dice({ colour, playerName }: Props) {
     isGameEnded,
     currentPlayerColour: currentPlayer,
     players,
+    isTurnActive,
   } = useSelector((state: RootState) => state.players);
   const { diceNumber, isPlaceholderShowing } =
     useSelector((state: RootState) => state.dice.dice.find((d) => d.colour === colour)) ?? {};
@@ -64,8 +64,12 @@ export default function Dice({ colour, playerName }: Props) {
   const store = useStore<RootState>();
   const isBot = players.find((p) => p.colour === colour)?.isBot;
   const isCurrentPlayer = currentPlayer === colour;
+  // isTurnActive is the shared turn gate. It becomes true on every roll
+  // (tokens are activated in the same dispatch) and false again once the
+  // turn finalises, so the dice and token clickability always agree.
   const isDiceDisabled =
     !isCurrentPlayer ||
+    isTurnActive ||
     anyTokenActive ||
     isAnyTokenMoving ||
     isGameEnded ||
@@ -74,11 +78,17 @@ export default function Dice({ colour, playerName }: Props) {
 
   const handleDiceClick = useCallback(async () => {
     if (isDiceDisabled) return;
-    const diceNumber = await rollDice(colour);
-    const res = await handlePostDiceRoll(colour, diceNumber);
+    const { diceNumber, isConsecutiveSixLimitReached } = await rollDice(colour);
+    const res = await handlePostDiceRoll(colour, diceNumber, isConsecutiveSixLimitReached);
     if (store.getState().players.isGameEnded) return;
-    saveState(store.getState());
-    if (res?.shouldChangeTurn) changeTurnFn();
+    if (res?.shouldChangeTurn) {
+      // changeTurn persists the final, fully-converged state itself.
+      changeTurnFn();
+    } else {
+      // Turn continues (bonus roll or waiting on a token click): persist
+      // only the settled state, never an in-between one.
+      saveState(store.getState());
+    }
   }, [isDiceDisabled, rollDice, colour, handlePostDiceRoll, store, changeTurnFn]);
 
   useEffect(() => {

@@ -13,6 +13,7 @@ import type {
 } from '../../types';
 import type { TToken, TTokenColourAndId, TTokenAlignmentData } from '../../types';
 import { playerSequences } from '../../game/players/constants';
+import { resolveNextPlayerColour } from '../../game/turn/turnResolution';
 
 type TPlayerState = {
   players: TPlayer[];
@@ -21,6 +22,13 @@ type TPlayerState = {
   isAnyTokenMoving: boolean;
   isGameEnded: boolean;
   playerFinishOrder: TPlayerNameAndColour[];
+  /**
+   * Whether the current player still owns an actionable turn.
+   * Single source of truth consulted by the dice and token UI: while false,
+   * the current player cannot roll and none of their tokens can be clicked.
+   * Flipped only through the converged turn logic (activateTokens / endTurn).
+   */
+  isTurnActive: boolean;
 };
 
 export const initialState: TPlayerState = {
@@ -30,6 +38,7 @@ export const initialState: TPlayerState = {
   isAnyTokenMoving: false,
   isGameEnded: false,
   playerFinishOrder: [],
+  isTurnActive: false,
 };
 
 export function getPlayer(state: TPlayerState, colour: TPlayerColour) {
@@ -82,8 +91,35 @@ const reducers = {
     token.direction = action.payload.direction;
   },
 
-  changeTurn: (state: TPlayerState, action: PayloadAction<TPlayerColour>) => {
-    state.currentPlayerColour = action.payload;
+  /**
+   * Converged turn transition. This is the ONLY reducer that hands the turn
+   * to the next player. It:
+   *  1. deactivates every token of the outgoing player (their pieces stop
+   *     being clickable immediately),
+   *  2. clears the consecutive-6 counter (a fresh turn starts at zero),
+   *  3. moves currentPlayerColour to the next eligible player,
+   *  4. flips isTurnActive so the UI and dice state refresh together.
+   */
+  endTurn: (state: TPlayerState) => {
+    if (state.isGameEnded || state.players.length === 0) return;
+    const nextPlayerColour = resolveNextPlayerColour(
+      state.playerSequence,
+      state.playerFinishOrder,
+      state.currentPlayerColour
+    );
+    const outgoingPlayer = state.players.find((p) => p.colour === state.currentPlayerColour);
+    outgoingPlayer?.tokens.forEach((t) => (t.isActive = false));
+    if (outgoingPlayer) outgoingPlayer.numberOfConsecutiveSix = 0;
+    if (!nextPlayerColour) {
+      state.isTurnActive = false;
+      return;
+    }
+    state.currentPlayerColour = nextPlayerColour;
+    state.isTurnActive = false;
+  },
+
+  setTurnActive: (state: TPlayerState, action: PayloadAction<boolean>) => {
+    state.isTurnActive = action.payload;
   },
 
   setPlayerSequence: (
@@ -99,17 +135,21 @@ const reducers = {
   ) => {
     const player = getPlayer(state, action.payload.colour);
     if (action.payload.all) {
-      return player.tokens.forEach((t) => {
+      player.tokens.forEach((t) => {
         if (
           (!t.hasTokenReachedHome && t.isLocked) ||
           (!t.isLocked && getAvailableSteps(t) >= action.payload.diceNumber)
         )
           t.isActive = true;
       });
+    } else {
+      player.tokens.forEach((t) => {
+        if (isTokenMovable(t, action.payload.diceNumber)) t.isActive = true;
+      });
     }
-    player.tokens.forEach((t) => {
-      if (isTokenMovable(t, action.payload.diceNumber)) t.isActive = true;
-    });
+    // Rolling produced an actionable turn: token availability and the
+    // isTurnActive flag are refreshed in the same dispatch.
+    state.isTurnActive = true;
   },
 
   deactivateAllTokens: (state: TPlayerState, action: PayloadAction<TPlayerColour>) => {
@@ -191,7 +231,8 @@ export const {
   registerNewPlayer,
   updateTokenCoordinatesAndDirection,
   setPlayerSequence,
-  changeTurn,
+  endTurn,
+  setTurnActive,
   activateTokens,
   deactivateAllTokens,
   unlockToken,
