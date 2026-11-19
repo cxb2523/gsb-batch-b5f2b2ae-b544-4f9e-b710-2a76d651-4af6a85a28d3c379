@@ -1,13 +1,40 @@
 // 이펙트: Kenney Particle Pack(CC0) 텍스처를 틴트해서 사용
+// 모든 임시 오브젝트(스프라이트/텍스트/잔상)를 추적해 일괄 정리 가능하게 한다.
 import Phaser from 'phaser';
 import { S } from '../core/state';
 
 export class FX {
+  // 일시정지 중에는 새 이펙트를 만들지 않는다 (기존 것은 씬 트윈 정지로 멈춤)
+  paused = false;
+  private pool = new Set<Phaser.GameObjects.GameObject>();
+  private dmgPool = new Set<Phaser.GameObjects.GameObject>();
+
   constructor(public sc: Phaser.Scene) {}
   get photo() { return S?.settings.photosensitive; }
 
+  setPaused(p: boolean) { this.paused = p; }
+
+  private track<T extends Phaser.GameObjects.GameObject>(o: T, dmg = false): T {
+    this.pool.add(o);
+    if (dmg) this.dmgPool.add(o);
+    o.once('destroy', () => { this.pool.delete(o); this.dmgPool.delete(o); });
+    return o;
+  }
+
+  // 모든 임시 오브젝트 정리 — 멱등(반복 호출해도 안전)
+  clearAll() {
+    for (const o of [...this.pool]) { try { this.sc.tweens.killTweensOf(o); o.destroy(); } catch { /* 이미 정리됨 */ } }
+    this.pool.clear(); this.dmgPool.clear();
+  }
+  // 피해 숫자만 정리 — 설정에서 끄는 순간 잔여 숫자 제거 (멱등)
+  clearDmg() {
+    for (const o of [...this.dmgPool]) { try { this.sc.tweens.killTweensOf(o); o.destroy(); } catch { /* 이미 정리됨 */ } }
+    this.dmgPool.clear();
+  }
+
   sprite(tex: string, x: number, y: number, o: { tint?: number; scale?: number; endScale?: number; alpha?: number; rot?: number; dur?: number; add?: boolean; depth?: number; spin?: number; dx?: number; dy?: number } = {}) {
-    const im = this.sc.add.image(x, y, tex).setTint(o.tint ?? 0xffffff).setScale(o.scale ?? 0.5).setAlpha(o.alpha ?? 1).setRotation(o.rot ?? 0);
+    if (this.paused) return null;
+    const im = this.track(this.sc.add.image(x, y, tex).setTint(o.tint ?? 0xffffff).setScale(o.scale ?? 0.5).setAlpha(o.alpha ?? 1).setRotation(o.rot ?? 0));
     if (o.add !== false) im.setBlendMode(Phaser.BlendModes.ADD);
     im.setDepth(o.depth ?? 100000);
     this.sc.tweens.add({ targets: im, alpha: 0, scale: o.endScale ?? (o.scale ?? 0.5) * 1.4, rotation: (o.rot ?? 0) + (o.spin ?? 0), x: x + (o.dx || 0), y: y + (o.dy || 0), duration: o.dur ?? 260, ease: 'Cubic.Out', onComplete: () => im.destroy() });
@@ -31,20 +58,22 @@ export class FX {
     for (let i = 0; i < n; i++) this.sprite('fx_smoke', x + (Math.random() - 0.5) * 20, y + (Math.random() - 0.5) * 10, { tint, scale: 0.2, endScale: 0.45, dur: 500, alpha: 0.5, add: false, dy: -20, depth: 99990 });
   }
   dmgText(x: number, y: number, txt: string, color: string, big = false) {
-    if (!S?.settings.dmgNumbers) return;
-    const t = this.sc.add.text(x + (Math.random() - 0.5) * 18, y - 20, txt, {
+    if (this.paused || !S?.settings.dmgNumbers) return;
+    const t = this.track(this.sc.add.text(x + (Math.random() - 0.5) * 18, y - 20, txt, {
       fontFamily: 'Galmuri11', fontSize: big ? '22px' : '15px', color, stroke: '#000', strokeThickness: 4, fontStyle: big ? 'bold' : 'normal',
-    }).setOrigin(0.5).setDepth(200000);
+    }).setOrigin(0.5).setDepth(200000), true);
     this.sc.tweens.add({ targets: t, y: y - (big ? 62 : 48), alpha: { from: 1, to: 0 }, scale: { from: big ? 1.4 : 1.1, to: 1 }, duration: big ? 900 : 700, ease: 'Cubic.Out', onComplete: () => t.destroy() });
   }
   label(x: number, y: number, txt: string, color = '#ffffff', size = 16, dur = 1100) {
-    const t = this.sc.add.text(x, y, txt, { fontFamily: 'Galmuri11', fontSize: size + 'px', color, stroke: '#000', strokeThickness: 4 }).setOrigin(0.5).setDepth(200001);
+    if (this.paused) return;
+    const t = this.track(this.sc.add.text(x, y, txt, { fontFamily: 'Galmuri11', fontSize: size + 'px', color, stroke: '#000', strokeThickness: 4 }).setOrigin(0.5).setDepth(200001));
     this.sc.tweens.add({ targets: t, y: y - 30, alpha: { from: 1, to: 0 }, duration: dur, ease: 'Quad.In', onComplete: () => t.destroy() });
   }
-  shake(dur = 90, int = 0.004) { if (S?.settings.shake && !this.photo) this.sc.cameras.main.shake(dur, int); }
-  flashScreen(color = 0xffffff, dur = 120) { if (this.photo) return; const c = Phaser.Display.Color.IntegerToColor(color); this.sc.cameras.main.flash(dur, c.red, c.green, c.blue); }
+  shake(dur = 90, int = 0.004) { if (!this.paused && S?.settings.shake && !this.photo) this.sc.cameras.main.shake(dur, int); }
+  flashScreen(color = 0xffffff, dur = 120) { if (this.paused || this.photo) return; const c = Phaser.Display.Color.IntegerToColor(color); this.sc.cameras.main.flash(dur, c.red, c.green, c.blue); }
   afterimage(src: Phaser.GameObjects.Image, tint = 0x88ccff) {
-    const im = this.sc.add.image(src.x, src.y, src.texture.key, src.frame.name).setScale(src.scaleX, src.scaleY).setFlipX(src.flipX).setTintFill(tint).setAlpha(0.5).setDepth(src.depth - 1).setRotation(src.rotation);
+    if (this.paused) return;
+    const im = this.track(this.sc.add.image(src.x, src.y, src.texture.key, src.frame.name).setScale(src.scaleX, src.scaleY).setFlipX(src.flipX).setTintFill(tint).setAlpha(0.5).setDepth(src.depth - 1).setRotation(src.rotation));
     this.sc.tweens.add({ targets: im, alpha: 0, duration: 260, onComplete: () => im.destroy() });
   }
 }

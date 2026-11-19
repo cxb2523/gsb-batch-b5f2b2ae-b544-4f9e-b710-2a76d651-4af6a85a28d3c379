@@ -43,7 +43,7 @@ registerSW(() => {
 // 개발용: ?debug 로 열면 콘솔/자동 테스트용 훅과 F9(레벨업)·F10(골드·정수) 단축키 제공
 if (new URLSearchParams(location.search).has('debug')) {
   import('./core/state').then((st) => {
-    (window as any).__dbg = { st, UI };
+    (window as any).__dbg = { st, UI, music };
     window.addEventListener('keydown', (e) => {
       if (!st.S) return;
       if (e.code === 'F9') st.debugLevelUp();

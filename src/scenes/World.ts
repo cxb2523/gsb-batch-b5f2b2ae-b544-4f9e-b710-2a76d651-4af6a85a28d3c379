@@ -17,7 +17,7 @@ import { SP, Spr } from '../data/sprites';
 import { RAR, makeItem, rollRarity, slotIcon, Item } from '../data/items';
 import { clamp, monsterXp, xpLevelMod, goldNormal, goldElite, goldChest, randi, pick } from '../data/formulas';
 import { S, bus, gainXp, persist, questProgress, mainQuest, addItem, randomSlotFor, grantBossLoot, pendingTraits, cls } from '../core/state';
-import { sfx, music } from '../audio/audio';
+import { sfx, music, resetSfxThrottle } from '../audio/audio';
 import { pvp, Match } from '../net/pvp';
 import { UI } from '../ui/ui';
 
@@ -43,7 +43,7 @@ export class World extends Phaser.Scene {
   puzzle: { plates: { x: number; y: number; n: number; on: boolean; img: Phaser.GameObjects.Image; txt: Phaser.GameObjects.Text }[]; next: number; done: boolean } | null = null;
   trapUntil = 0; trapT = 0; trapOwner: any = null; arrowTarget: { x: number; y: number } | null = null;
   rooms: DRoom[] = []; curRoom: DRoom | null = null; wavesLeft = 0; checkpointUsed = false;
-  ended = false; leaving = false; padPrev: Record<number, boolean> = {}; padActive = false; saveT = 0;
+  ended = false; leaving = false; padPrev: Record<number, boolean> = {}; padActive = false; saveT = 0; isPaused = false;
   objTargets: { x: number; y: number; alive: () => boolean }[] = [];
   dummyAttackT = 4;
   // PvP
@@ -55,6 +55,7 @@ export class World extends Phaser.Scene {
   create() {
     const d = this.d; this.mode = d.mode; this.ch = CHAPTERS[Math.max(1, Math.min(5, d.ch)) - 1]; if (d.mode !== 'pvp') S.chapter = this.ch.id;
     this.now = 0; this.enemies = []; this.boss = null; this.tokens = new Set(); this.pickups = []; this.interacts = []; this.frozen = false; this.ended = false; this.leaving = false;
+    this.isPaused = false; resetSfxThrottle(); // 씬 전환 시 음향 스로틀 초기화 — 새 씬 첫 타격 음 보장
     this.eventZone = null; this.puzzle = null; this.dummy = null; this.bossPatternName = ''; this.bossPhaseText = ''; this.objTargets = []; this.trapOwner = null; this.trapUntil = 0;
     this.dummyLog = []; this.acc = 0; this.hitstopUntil = 0; this.slowUntil = 0; this.pressed = []; this.rooms = []; this.curRoom = null; this.wavesLeft = 0; this.checkpointUsed = false;
     this.remote = null; this.match = null; this.countdownText = null;
@@ -75,7 +76,12 @@ export class World extends Phaser.Scene {
     cam.fadeIn(350, 0, 0, 0);
     const onLevel = (L: number) => this.onLevelUp(L); const onStats = () => this.player.refreshStats(); const onToast = (m: string, c?: string) => UI.toast(m, c);
     bus.on('levelup', onLevel); bus.on('stats', onStats); bus.on('toast', onToast);
-    this.events.once('shutdown', () => { bus.off('levelup', onLevel); bus.off('stats', onStats); bus.off('toast', onToast); this.combat.clearAll(); this.pvpOff?.(); this.pvpOff = null; });
+    this.events.once('shutdown', () => {
+      bus.off('levelup', onLevel); bus.off('stats', onStats); bus.off('toast', onToast);
+      this.combat.clearAll(); this.fx.clearAll(); this.pvpOff?.(); this.pvpOff = null;
+      // 정지된 채로 끝나는 경우를 대비해 시간/음악 상태 복구 (모두 멱등)
+      this.tweens.timeScale = 1; this.time.timeScale = 1; music.resume();
+    });
     if (!this.scene.isActive('Hud')) this.scene.launch('Hud');
     this.scene.bringToTop('Hud');
     const musicCh = this.mode === 'pvp' ? this.ch : this.ch;
@@ -665,11 +671,21 @@ export class World extends Phaser.Scene {
     return best;
   }
 
+  // 일시정지 전이: FX 생성 차단 + 씬 트윈/타이머 정지 + BGM 일시정지 (복귀 시 모두 재개, 멱등)
+  setPaused(p: boolean) {
+    if (this.isPaused === p) return;
+    this.isPaused = p;
+    this.fx.setPaused(p);
+    if (p) { this.tweens.timeScale = 0; this.time.timeScale = 0; music.pause(); }
+    else { this.tweens.timeScale = 1; this.time.timeScale = 1; music.resume(); }
+  }
+
   // ================= 업데이트 =================
   update(_t: number, deltaMs: number) {
     const real = this.time.now;
     this.pollPad();
-    if ((UI.isOpen() || this.frozen) && this.mode !== 'pvp') { this.pressed = []; this.drawUi(); return; }
+    if ((UI.isOpen() || this.frozen) && this.mode !== 'pvp') { this.setPaused(true); this.pressed = []; this.drawUi(); return; }
+    this.setPaused(false);
     let scale = 1;
     if (real < this.hitstopUntil) scale = 0.05; else if (real < this.slowUntil) scale = this.slowScale;
     this.ts = scale; this.tweens.timeScale = scale; this.time.timeScale = scale;

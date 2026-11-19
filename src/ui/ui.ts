@@ -286,6 +286,7 @@ function onInput(e: Event) {
   const st: any = S ? S.settings : null; if (!st) return;
   st[k] = t.type === 'checkbox' ? t.checked : parseFloat(t.value);
   if (k === 'bgm') music.setVolume(st.bgm);
+  if (k === 'dmgNumbers' && !st.dmgNumbers) world()?.fx?.clearDmg(); // 끄는 순간 잔여 피해 숫자 제거
   if (k === 'fps30') localStorage.setItem('eclipse_fps30', t.checked ? '1' : '0');
   persist();
 }
